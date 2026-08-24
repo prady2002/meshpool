@@ -1,0 +1,671 @@
+<div align="center">
+
+# 🕸️ MeshPool
+
+### Turn the machines you already own into one pooled computer.
+
+*Deploy web apps with automatic failover · Run batch jobs across every spare core ·
+Serve a model **too big for any single machine** by sharding it across several.*
+
+</div>
+
+---
+
+MeshPool takes the idle compute sitting around — a gaming PC, a couple of laptops, an old
+workstation — and pools it into **one resource you can deploy work onto**. It runs in two
+postures from the *same* build:
+
+- **Your own machines (LAN, zero-trust-needed).** Pool computers you own on one network.
+  Every node is yours, so instead of adversarial verification we use a lightweight
+  reputation + fair-share ledger and get out of your way. This is the default.
+- **The global mesh (anyone, anywhere).** Flip one switch (`scale=public`) and MeshPool
+  becomes a mesh **strangers can safely share**: each device has a cryptographic identity,
+  contributed work runs in a **locked-down sandbox**, results from low-trust nodes are
+  **verified against a local oracle**, and an **earn-to-spend credit ledger** with a
+  starter grant lets anyone donate spare compute or borrow the pool's — with no signup.
+  Agents reach the coordinator over an **outbound tunnel**, so they work behind home
+  routers and firewalls with nothing to port-forward.
+
+Three things it does today:
+
+| | Engine | What you get |
+|---|---|---|
+| 🌐 | **Hosting** | Deploy an app across N machines behind a load balancer. A machine sleeps → traffic re-routes automatically; **no requests dropped beyond those already in flight** (new requests transparently retry a survivor). |
+| ⚙️ | **Batch** | Submit a job of independent work units; it fans out across every machine's spare CPU. Kill a node mid-job → its units are **retried elsewhere.** |
+| 🧠 | **Inference** *(flagship)* | Run a language model whose layers **don't fit on any one machine**, sharded pipeline-parallel across several. Only tiny activation tensors cross the wire. Reports **real tokens/sec.** |
+
+> ### ✨ The magic trick: provable correctness
+> Every node reconstructs its slice of the model from the same checkpoint, so the
+> distributed pipeline produces logits that are **bit-for-bit identical** to running the
+> whole model on one machine — and stay identical **even after a node dies** and the
+> model auto-repartitions onto the survivors. Distributing the model changes *where* the
+> math happens, never *what it computes.* We prove this in an automated test.
+
+---
+
+## 🚀 Run MeshPool in one command (the shipped build)
+
+Got a MeshPool zip? **Unzip it and run one thing** — no IP, port, or token to type. It
+installs what it needs on first run, starts a control plane **and** contributes this
+machine, then opens the dashboard.
+
+```powershell
+# Windows — double-click start.cmd, or:
+.\start.ps1
+```
+```bash
+# macOS / Linux
+./start.sh
+```
+
+Your browser opens at `http://127.0.0.1:8080` with **Use · Contribute · Wallet · Explore**.
+Submit a batch job, deploy an app, or shard a model across your machine(s) — right away.
+Add more computers to *your* pool with the pairing command shown under **Contribute**.
+
+**Verify the install works end-to-end** (brings up the stack, runs a real job, tears down):
+
+```bash
+python -m meshpool.launcher self-test        # prints SELFTEST_OK
+```
+
+### 🌍 Contribute to (or use) a global mesh
+
+Point a machine at a **public coordinator** and it donates spare compute over an outbound
+tunnel — nothing to port-forward, works behind any home router:
+
+```powershell
+.\contribute.ps1 -Cloud https://your-coordinator.example   # Windows
+```
+```bash
+./contribute.sh --cloud https://your-coordinator.example   # macOS / Linux
+```
+
+Anyone reaching that coordinator's dashboard can **use** the pooled compute with a
+zero-signup local sign-in and a starter credit grant; every job debits the consumer and
+credits the machines that did the work. Run your own coordinator with
+`scale=public` (see [`docs/architecture.md`](docs/architecture.md)); a hosted
+**MeshPool Cloud** is the roadmap goal.
+
+> **Build a shareable zip** to hand to others: `powershell -File deploy\build_zip.ps1`
+> (or `./deploy/build_zip.sh`) → `dist/meshpool-<version>.zip`. It contains only what's
+> needed to run — never your device keys or local state.
+
+---
+
+## 🧪 Quickstart — simulate a whole cluster on one laptop (dev)
+
+**Requirements:** Python 3.11+ with `numpy fastapi uvicorn pydantic httpx typer rich pyyaml cryptography`
+(one `pip install -r requirements.txt`; all pure-Python + NumPy, no native toolchain). No Docker, no GPU, no cloud account.
+
+```bash
+# 1. Boot a whole cluster on your laptop: 1 control plane + 3 simulated machines
+#    (heterogeneous CPU/RAM/compute, so scheduling & sharding are non-trivial)
+python -m sim.harness --agents 3
+
+# 2. Open the dashboard
+#    → http://127.0.0.1:8080
+```
+
+You'll see three machines register live, with their capabilities, donation caps, health,
+trust and contribution stats. From here, drive it with the CLI (new terminal):
+
+```bash
+# point the CLI at the control plane — env var or the global --control-plane flag:
+set MESHPOOL_CONTROL_PLANE_URL=http://127.0.0.1:8080   # PowerShell: $env:MESHPOOL_...
+# or per-command: meshpool --control-plane http://127.0.0.1:8080 nodes
+
+meshpool nodes                       # list the live pool
+meshpool jobs submit --count 30      # batch job across all 3 machines
+meshpool deploy hello --replicas 2   # host an app with load-balancing + failover
+meshpool models deploy nano-gpt      # shard a model too big for one node
+meshpool chat "MeshPool lets you"    # talk to the distributed model, see tokens/sec
+```
+
+*(No install step? Run the CLI in-tree with `python -m meshpool.cli.main <cmd>`.)*
+
+Prefer to prove it end-to-end without touching anything? Run the acceptance scenarios —
+each one boots a real multi-process cluster and checks a hard invariant:
+
+```bash
+python -m sim.scenarios.verify_batch       # (d) distribute + retry-on-kill
+python -m sim.scenarios.verify_hosting      # (c) deploy + failover, no new requests dropped
+python -m sim.scenarios.verify_inference    # (e) shard + serve + bit-identical + survive-a-death
+python -m sim.scenarios.verify_lan          # real multi-address path: work reaches each node's advertised IP
+```
+
+---
+
+## 🌐 Run it live across your real machines
+
+The Quickstart above simulates a cluster on one laptop. To run MeshPool **for real** across
+several machines on the same network — host apps, run batch jobs, and serve a sharded model,
+live — copy this folder to each machine and run **one command per machine**.
+
+**1. On ONE machine — start the control plane** (hosts the dashboard, coordinates the pool):
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -File deploy\start-controlplane.ps1 -OpenFirewall
+```
+```bash
+# macOS / Linux
+bash deploy/start-controlplane.sh
+```
+
+It auto-detects this machine's LAN IP, then prints the dashboard URL and the **exact join
+command** to run on every other laptop, e.g.:
+
+```
+Dashboard   : http://192.168.1.20:8080
+Windows     : powershell -ExecutionPolicy Bypass -File deploy\join.ps1 -Server http://192.168.1.20:8080 -Token 3f9c...
+macOS/Linux : bash deploy/join.sh --server http://192.168.1.20:8080 --token 3f9c...
+```
+
+**2. On EACH other laptop — run that printed join command:**
+
+```powershell
+# Windows (donate 40% CPU, open the firewall port once)
+powershell -ExecutionPolicy Bypass -File deploy\join.ps1 -Server http://192.168.1.20:8080 -Token 3f9c... -Cpu 40 -OpenFirewall
+```
+```bash
+# macOS / Linux
+bash deploy/join.sh --server http://192.168.1.20:8080 --token 3f9c... --cpu 40
+```
+
+Each agent auto-detects its **own** LAN IP, probes its **real** hardware (CPU / RAM / GPU / FLOPS),
+sizes its RAM donation to the machine, and self-registers. Leave it running.
+
+**3. Open `http://<control-plane-IP>:8080`** — your real machines appear live. Deploy an app,
+submit a batch job, or shard a model across them from the dashboard or CLI, exactly like the
+Quickstart — except the work now runs on your actual hardware.
+
+> **Serving a real LLM across two machines?** If each machine runs [Ollama](https://ollama.com)
+> with the same model pulled (e.g. `ollama pull qwen2.5-coder:7b`), MeshPool pools them into one
+> endpoint that **load-balances and fails over** across both. Follow the step-by-step
+> **[two-machine test runbook](docs/two-machine-test.md)** — prerequisites, deploy, chat,
+> a throughput **benchmark**, and a **failover** demo. Ideal for handing to a second person with the zip.
+
+> **Firewall (Windows):** the control-plane and agent ports must be reachable across the LAN.
+> The launchers' `-OpenFirewall` flag adds the inbound rule for you (one elevated prompt);
+> otherwise pick **Allow** when Windows prompts, on **Private** networks. macOS/Linux home
+> firewalls usually allow LAN inbound already. Full troubleshooting → [`deploy/README.md`](deploy/README.md).
+
+This exact path — control plane and agents on **distinct addresses**, every job reaching each
+node at the address it **advertised** (never a hardcoded localhost) — is locked down by an
+automated acceptance test (`sim/scenarios/verify_lan.py`, wired into `tests/test_e2e.py`).
+
+---
+
+## 🎯 What "done" means (MVP acceptance criteria)
+
+A household with 3 machines (or the sim harness emulating them) can:
+
+| | Criterion | Proven by |
+|---|---|---|
+| (a) | Install the agent on all three in **< 5 min**, no manual networking | pairing-code onboarding + install scripts in [`/deploy`](deploy) |
+| (b) | See them **live in a dashboard** | `python -m sim.harness` → dashboard node list |
+| (c) | Deploy a web app that **survives a machine sleeping** | `verify_hosting.py` — kill a node mid-traffic, no new requests dropped during failover |
+| (d) | Run a batch job using **all three machines' spare CPU** | `verify_batch.py` — distribution + kill → retry elsewhere |
+| (e) | Query a model that **won't fit on any single machine** | `verify_inference.py` — shard, serve, measure tok/s |
+
+Criteria **(b)–(e) are automated, re-runnable tests** (`tests/test_e2e.py` → `sim/scenarios/*`),
+not screenshots; **(a)** is delivered by the one-command install scripts in [`/deploy`](deploy)
+(onboarding time is measured, not asserted in CI).
+
+---
+
+## 🏗️ Architecture
+
+```
+ [Node Agent]   [Node Agent]   [Node Agent]      one per machine
+      \              |              /             (capability probe, donation caps,
+       \--- LAN discovery + rendezvous ---/        sandboxed exec, kill-switch)
+                     |
+              [ Control Plane ]
+   node registry │ 3 schedulers │ trust + contribution ledger │ REST + SSE API
+                     |
+   ┌─────────────────┼──────────────────┬──────────────────┐
+   │                 │                  │                  │
+[Batch Engine]  [Hosting Engine]  [Inference Engine]   [Dashboard + CLI]
+ spread            bin-packing       topology-aware
+ dispatch         + load balancer   layer sharding
+```
+
+- **Node Agent** — probes CPU/RAM/GPU/bandwidth, enforces the owner's donation policy at
+  the OS/runtime level (the workload is *never* trusted to self-limit), heartbeats health,
+  and offers an **instant kill-switch** that reclaims the machine immediately.
+- **Control Plane** — node registry + three schedulers (batch **spread / worst-fit** for
+  even fan-out, hosting **bin-packing** with anti-affinity, inference **topology-aware
+  partitioning**) + the trust/contribution ledger.
+- **Three engines**, built in dependency order: Batch (the walking skeleton) → Hosting →
+  Inference (flagship).
+- **Trust** — Tier 0 (single-owner, full mutual trust) and **Tier 2 (global mesh:
+  device identity + sandbox + verification + earn-to-spend credits)** are both active;
+  Tier 1 (office/enterprise) sits between them. Switching posture is a **config flip
+  (`scale=home|office|enterprise|public`), not a rewrite.**
+
+See [`docs/architecture.md`](docs/architecture.md) for the full component tour, and
+[`proto/meshpool.proto`](proto/meshpool.proto) for the wire contracts.
+
+---
+
+## 🧠 How distributed inference works
+
+1. **Partition** — the topology-aware scheduler probes each node's usable memory and
+   compute, then greedily assigns each node a **contiguous block of decoder layers** (a
+   pipeline stage), leaving headroom for activations. More compute → more layers.
+2. **Load** — each node loads *only its slice* of the model. The first stage owns the token
+   embedding; the last stage owns the LM head.
+3. **Serve** — to generate a token, the control plane sends the prompt to stage 0, which
+   passes its **hidden-state activations** (a few KB) to stage 1, and so on. Only
+   activations cross the network — never weights or gradients — which is exactly why a LAN
+   is fast enough.
+4. **Heal** — if a node drops, the model **auto-repartitions** across the survivors (if the
+   remaining memory still fits it) and keeps serving. Output stays identical.
+
+The default engine is a compact from-scratch NumPy GPT (so it runs anywhere with zero
+downloads), sitting behind an **adapter interface** so a real Petals/exo/torch backend can
+be dropped in for genuinely large models. The M1 first-token gate also includes a
+Qwen2/Llama-class NumPy path (RMSNorm, RoPE, SwiGLU MLP and grouped-query attention)
+driven by a real downloaded HuggingFace `config.json` + `tokenizer.json`. Its weights are
+locally initialized because weight downloads are blocked in this environment; this
+validates the real-token distributed execution path, not pretrained model quality. It
+speaks an **OpenAI-compatible Chat Completions API**, so your existing tools work
+unchanged:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "nano-gpt",
+  "messages": [{"role": "user", "content": "MeshPool is"}],
+  "temperature": 0.7
+}'
+```
+
+Details: [`docs/inference.md`](docs/inference.md).
+
+M1 gate:
+
+```bash
+python sim\scenarios\verify_first_real_token.py
+```
+
+It starts three separate node processes, loads contiguous layer/head ranges, applies the
+WAN emulator, streams token ids, and asserts the sharded output is token-identical to the
+single-process NumPy model at temperature 0. The gate also prints the process IDs,
+per-stage timings, emulated-link bytes/latency, and a deliberate corruption check proving
+the equality assertion fails when a stage output is perturbed.
+
+---
+
+## 🖥️ CLI reference
+
+```
+meshpool [--control-plane URL]        global flag: overrides MESHPOOL_CONTROL_PLANE_URL env var
+
+meshpool nodes                     list live nodes + capabilities + health
+meshpool onboarding                show the pairing code / join instructions
+meshpool join <control-plane-url>  join this machine to a pool
+
+meshpool jobs submit [func]        run a batch job (--count N units)
+meshpool jobs list                 batch jobs + progress
+
+meshpool dag submit DAG.json       submit a JSON DAG with stage dependencies
+meshpool dag list                  DAG workflows + progress
+meshpool dag show <dag-id>         show one DAG's stage state
+
+meshpool deploy [app] --replicas N host an app across the pool
+meshpool deployments               deployments + placement + health
+
+meshpool models deploy [model]     shard a model across the pool
+meshpool models list               deployed models + pipeline stages
+meshpool chat "<prompt>"           chat with the distributed model (shows tok/s)
+
+meshpool ledger                    contribution ledger (donated vs consumed)
+meshpool fn deploy ./fn.wasm       upload your own code, get a wasm:<sha256> name
+meshpool fn run wasm:<sha> -p '{}' fan your function out over the pool and wait
+meshpool fn builtin                list the functions that ship with MeshPool
+meshpool storage put <file>        encrypt + replicate a file across the pool
+meshpool storage ls                list stored files (ciphertext blobs)
+meshpool storage get <id> <out>    download + decrypt a file
+meshpool storage rm <id>           delete a stored file from the pool
+meshpool secrets put NAME VALUE    store a scoped secret (value kept in memory)
+meshpool secrets list              list secret names (values never shown)
+meshpool secrets rm NAME           delete a stored secret
+meshpool reclaim <node-id>         kill-switch: drain + reclaim a machine now
+meshpool resume  <node-id>         bring a reclaimed machine back
+meshpool up --agents N             boot a local sim cluster (wraps sim.harness)
+```
+
+Or skip the CLI entirely with the one-command launcher (ships in the build):
+
+```
+python -m meshpool.launcher solo               run + use MeshPool on this machine
+python -m meshpool.launcher contribute --cloud <url>   donate compute to a mesh
+python -m meshpool.launcher self-test          verify the install works end-to-end
+```
+
+---
+
+## 🧩 Mesh Functions — run *your* code on the pool
+
+Anything that compiles to `wasm32-wasip1` runs on every machine in the mesh. The
+contract is deliberately tiny: **read a JSON payload from stdin, write a JSON result to
+stdout.**
+
+```rust
+// src/main.rs  —  cargo build --release --target wasm32-wasip1
+use std::io::{Read, Write};
+fn main() {
+    let mut s = String::new();
+    std::io::stdin().read_to_string(&mut s).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    let x = v["x"].as_i64().unwrap_or(0);
+    let out = serde_json::json!({ "tripled": x * 3 });
+    std::io::stdout().write_all(out.to_string().as_bytes()).unwrap();
+}
+```
+
+```bash
+# 1. Upload it. Validated here, while you are watching — not on a donor's laptop.
+meshpool fn deploy ./my_fn.wasm
+# -> wasm:fa47a02f...   (the SHA-256 of the bytes you uploaded)
+
+# 2. Fan it out over the whole pool and wait for the results.
+meshpool fn run wasm:fa47a02f... --payload '{"x":7}' --count 24
+```
+
+…or over raw HTTP, which is all the CLI and the console are doing:
+
+```bash
+curl -X POST --data-binary @my_fn.wasm http://127.0.0.1:8080/api/v1/functions
+# -> {"function":"wasm:fa47a02f...","abi":"wasi-command/json-stdio", ...}
+
+curl -X POST http://127.0.0.1:8080/api/v1/jobs -H 'content-type: application/json' \
+  -d '{"name":"triple","func":"wasm:fa47a02f...","payloads":[{"x":1},{"x":2},{"x":3}]}'
+```
+
+…or by dragging the `.wasm` onto **Functions** in the console (`/console`), which shows
+each unit's result next to the machine that produced it.
+
+What the pool guarantees while your code runs on someone else's machine:
+
+| Guarantee | How |
+| --- | --- |
+| It can't read their files | No directory is preopened — WASI is deny-by-default, `path_open` returns `EBADF` |
+| It can't reach the network | No sockets are linked in; a module importing anything outside WASI p1 is **rejected at upload** |
+| It can't hang their machine | Fuel budget + epoch-interrupt watchdog + memory ceiling |
+| It can't take the node down | Runs in a dedicated child process, so even a hard abort costs one unit, not the node |
+| It runs the code you uploaded | Content-addressed: every node re-verifies the module against its SHA-256 before executing |
+| Wrong answers don't get paid | Sampled units are re-run by the coordinator against its own copy of your module |
+
+Same fan-out, failover, credits and trust machinery as the built-in functions —
+`wasm:<sha256>` is just another function name.
+
+---
+
+## 🖼️ The console
+
+Two web surfaces ship, and they are independent on purpose:
+
+| Surface | What it is |
+| --- | --- |
+| `/` | The zero-dependency dashboard. Plain HTML/JS served by the control plane; always available, needs no Node toolchain. |
+| `/console` | The React console — playground-first, ⌘K palette, live mesh map, Functions upload-and-run, dark mode. Optional build artefact. |
+
+```bash
+npm --prefix web install
+npm --prefix web run build      # emits web/dist, which the control plane then serves
+npm --prefix web test           # component tests
+```
+
+The console lands you on a **prompt box against a pooled model**, not a dashboard and
+not a wizard. If `web/dist` has not been built, `/console` returns that build hint
+instead of a 404, and `/` keeps working untouched.
+
+---
+
+## 🧪 Testing
+
+```bash
+pip install pytest
+pytest                 # fast unit tests (model, sharding oracle, gradients, schedulers, trust, config)
+pytest -m slow         # end-to-end acceptance gates (boots real clusters — slower)
+pytest -m ""           # everything
+```
+
+The unit suite includes the **shard-equals-full-model correctness oracle** and a
+**float64 finite-difference gradient check** of the hand-written backprop. See
+[`docs/testing.md`](docs/testing.md).
+
+---
+
+## ⚖️ Honest constraints (we report real numbers, never invented ones)
+
+- **Single-machine training today; not *distributed* training.** Local **LoRA fine-tuning**
+  of the nano-GPT over a frozen base ships and is gradient-checked
+  (`python -m meshpool.inference.lora`); *distributed* training over the pool stays deferred —
+  it's bandwidth/latency-bound on heterogeneous consumer networks.
+- **Network latency is a hard floor.** Throughput-bound, decomposable work scales across a
+  pool; tightly-coupled sub-millisecond-shared-state work does not. Every feature is
+  designed with that table in view.
+- **CPU/Wi-Fi inference is modest by design** — the point is *"a model that wouldn't fit at
+  all now runs,"* not "faster than a datacenter GPU." The adapter seam is where real
+  GPUs/Petals/exo take over for scale.
+- **Distributed inference demo — honest scope.** `verify_first_real_token.py` runs a real
+  Qwen2-class architecture (RMSNorm, RoPE, SwiGLU, grouped-query attention), driven by a
+  real HuggingFace tokenizer and config downloaded at runtime, split across three genuinely
+  separate OS processes, producing output that is bit-identical to single-process execution.
+  What is limited: the model is `yujiepan/qwen2-tiny-random` with `d_model=8` and only 2
+  transformer layers, so the 3-way pipeline split degenerates — the last process holds zero
+  transformer layers and is head-only. Weights are locally initialized because HuggingFace
+  binary weight downloads are 503-blocked in this environment. Scaling to a real model is
+  currently blocked by the transport: shards receive weights as base64-encoded JSON in the
+  same request body, which is impractical for any realistic checkpoint. This validates the
+  distributed execution path, tokenization, sharding, and transport — not model quality or
+  practical scale.
+- **Client-side encryption — and its real limitation.** Encryption happens in the client
+  library before bytes leave the process. The server **cannot enforce it**: the raw
+  `POST /api/v1/blobs` API accepts plaintext unconditionally — a caller who bypasses the
+  client library gets no confidentiality guarantee. This is a genuine limitation, not a
+  footnote. Key hierarchy: a local user root key wraps per-bucket keys, which wrap
+  per-object data keys; all wrapping uses AES-256-GCM from `cryptography`. Verified by
+  `sim/scenarios/verify_client_side_encryption.py`, which proves (1) the marker is absent
+  from every agent disk and control-plane download after a client-encrypted store, and
+  (2) a caller who posts plaintext directly to the API can read it back unencrypted.
+- **Encrypted objects do not deduplicate.** Each object gets a fresh random data key and
+  nonce, so two uploads of the same file produce different ciphertext blobs. Convergent
+  encryption would preserve deduplication but would let the control plane or a node
+  operator confirm whether two users hold identical files (a confirmation-of-file attack).
+  Random keys were chosen: confidentiality by default, deduplication never.
+- **Mesh Functions are WASI preview 1, not a full OS.** A user module gets compute, its
+  JSON input and its JSON output — deliberately no filesystem, no sockets, no threads and
+  no host FFI. That is what makes it safe to run on a stranger's laptop, and it is also a
+  real limit: code needing native libraries or network access is a container workload, not
+  a WASM one. Metering note: fuel counts *guest* instructions, so byte-shuffling done
+  inside host calls is billed via output size and wall-clock rather than fuel.
+- **Speculative Pipeline Decoding is a *latency* amortiser, and it costs you when there
+  is no latency.** SPD verifies K+1 tokens in one pipeline traversal, so its ceiling is
+  exactly the traversal ratio and its benefit is a function of how much of a token's cost
+  is `(N−1)·RTT`. Measured on this machine (`verify_spd_equivalence`, 3-stage pipeline,
+  32 tokens, real weights, emulated links): **2.2×–2.5× across wide-area topologies —
+  and 0.87× with the link latency set to zero**, because the extra per-traversal compute
+  is pure loss when there is nothing to hide it behind. Output is token-identical to
+  ordinary decoding in every case. Anyone quoting only the good number is quoting half
+  the mechanism.
+- **Link measurement is real, and it is rate-limited.** Node placement uses measured
+  latency and bandwidth, never a number inferred from health-check payload sizes. The
+  probe endpoints are necessarily unauthenticated (an agent measures its link before it
+  has a credential), so the control plane enforces a per-IP byte budget — which is
+  *shared by every node behind one public address*. A node that trips the budget reports
+  `bandwidth_mbps: 0`, which means **"not measured"**, not "slow". Two bugs here were
+  found by measurement rather than by reading the code: the download ramp was unbounded
+  on fast links (401 requests / 3.3 GB from a single agent startup, exhausting the shared
+  budget and starving every co-located peer — exactly the CGNAT case the roadmap budgets
+  at 25–40% of the fleet), and `meshd` hardcoded `bandwidth_mbps: 0`, so every Go node
+  looked like a dial-up link to the scheduler forever. Both are fixed and pinned by
+  `tests/test_probe_bandwidth.py` and `agent-go/internal/probe/probe_bandwidth_test.go`.
+- **Capability probe fields are richer than the minimum.** Both the Python probe
+  (`meshpool/agent/probe.py`) and the Go probe (`agent-go/internal/probe/probe.go`) now
+  report `cpu_model`, `gpu_names`, `disk_total_mb`, `thermal_state`, `battery_powered`,
+  `battery_percent`, and `network_class`. The scheduler can filter or prefer nodes on any
+  of these fields. Nodes registered before these fields were added are unaffected —
+  missing fields degrade gracefully to their zero values.
+- **DAG / workflow support and checkpoint recovery are shipped.** Submit a JSON DAG with
+  stage dependencies, optional reduce stages, and `--wait` polling via
+  `meshpool dag submit DAG.json`. The coordinator persists stage state so a
+  coordinator restart mid-DAG resumes from completed stages without recomputing them.
+  Verified by `sim/scenarios/verify_dag_checkpoint_recovery.py` (checkpoint resume) and
+  `verify_dag_worksteal_preemption.py` (work-steal preemption).
+- **Per-job distributed trace timelines are live.** Each job accumulates ordered,
+  node-attributed attempt spans accessible at `GET /api/v1/jobs/<id>/timeline`. The web
+  console's `JobTimelinePage` renders them as a colour-coded timeline with duration and
+  outcome per attempt. Verified by `sim/scenarios/verify_job_timeline.py`.
+
+### A note on this build's substrate
+
+The reference spec targets Go + gRPC + Docker + a React dashboard. This repository is a
+**faithful, fully-runnable implementation of the same architecture** in a small-dependency
+Python/NumPy + vanilla-JS substrate, so every acceptance criterion actually executes here
+and now. The mapping (and the production upgrade path for each piece) is documented in
+[`docs/architecture.md`](docs/architecture.md#substrate--production-upgrade-path). The
+component boundaries, wire contracts, schemas and phased roadmap are identical to the spec.
+
+**Node agent: Go, not Rust.** The single-binary node agent under [`agent-go/`](agent-go/)
+is written in **Go**, not Rust as originally planned. This was a forced substitution, not a
+preference: the development machine has no Rust toolchain (`cargo`/`rustc` absent) and no
+`cmake`, so a Rust agent could not have been compiled or tested here — and shipping
+untested code would be worse than shipping a different language. Go gives the same
+outcome that mattered (one static binary, no runtime to install, cross-compiles to
+Windows/macOS/Linux) and its `wazero` WASM runtime is pure Go with zero CGO. The agent is
+verified against the real Python control plane by
+[`sim/scenarios/verify_go_agent_parity.py`](sim/scenarios/verify_go_agent_parity.py),
+which proves byte-identical device-identity derivation, signed enrollment, heartbeat
+liveness, blob round-trips, peer pulls, **execution of `wasm:` user functions** and the
+reclaim kill-switch across the two implementations.
+
+**Two WASM runtimes, one answer.** The Python agent runs user functions on `wasmtime`;
+`meshd` runs them on `wazero`. A job is fanned out across whichever agents are online, so
+what actually has to hold is that both give the *same answer for the same bytes* — if they
+diverged, the coordinator's spot-check oracle would start slashing honest nodes.
+[`verify_wasm_runtime_parity.py`](sim/scenarios/verify_wasm_runtime_parity.py) feeds
+identical modules to both and compares values *and* failure kinds. Two honest divergences
+are documented rather than papered over: `wazero` has no fuel meter (Go-side billing falls
+back to wall-clock + output bytes, and the result carries `metered: false` so a caller can
+tell "no fuel used" from "fuel unknown"), and the two runtimes return different `errno`
+values for a refused `path_open` — they agree on the part that matters, which is that it
+is refused.
+
+What `meshd` does **not** do yet: host app replicas, serve model shards, or redeem secret
+leases. Each returns an explanatory `501` rather than a plausible wrong answer, and curated
+built-ins like `square` stay 501 on purpose — two independent implementations of one
+function name is exactly how a pool starts disagreeing with itself. The reverse tunnel is a
+different story: it is **fully implemented** (`agent-go/internal/tunnel/tunnel.go`) and
+verified end-to-end by
+[`sim/scenarios/verify_go_tunnel.py`](sim/scenarios/verify_go_tunnel.py), which proves that
+a `meshd` node behind CGNAT with no inbound connectivity can register, receive work over the
+tunnel, and complete batch jobs and blob transfers. `meshd` now works from any home router
+with no port forwarding.
+
+**A node only ever gets work it can run.** Because `meshd` deliberately implements no
+curated built-ins, "it returns 501" is not good enough on its own: the scheduler used to
+filter candidates on CPU and RAM headroom alone, so a `square` unit could be handed to a
+Go node, rejected, and charged as a failed attempt. Five of those in a row fail the unit
+outright — on a pool that was perfectly able to run it, and *more* often the more Go nodes
+the pool has. Every agent now advertises `capability.runtimes` (`meshd` → `["wasm"]`, the
+Python agent → `["builtin", "wasm"]`) and placement filters on it. A pool that cannot serve
+a runtime at all fails the job with an explicit reason instead of leaving it pending
+forever. Proven end-to-end by
+[`verify_runtime_capability_routing.py`](sim/scenarios/verify_runtime_capability_routing.py),
+which runs a real mixed pool and includes a positive control showing the same scheduler
+*does* select the node once its advertisement is scrubbed back.
+
+The same defect had a sharper form on the **hosting and inference** paths, and it is worth
+spelling out because it inverts the usual intuition about adding capacity. Those planners
+do not retry elsewhere — they commit to a placement plan — and `topology_partition` counts
+a candidate's RAM toward *pooled* capacity. So a `meshd` node in the pool was handed a
+layer range (in a measured case, the last stage — the LM head), the deploy then died at
+`/shard/load`, **and the Python node alone could have held the whole model.** Adding a
+bigger, faster machine broke a deployment that worked before it joined. Capacity has to be
+monotonic; that one was not.
+
+The fix is a second, coarser advertisement next to `runtimes`: `capability.services`, the
+workload classes a node can serve at all — `batch`, `hosting`, `shards`, `storage`.
+`meshd` advertises `["batch", "storage"]`, matching exactly the routes it does not 501 on,
+and that correspondence is enforced structurally rather than by hand
+(`agent-go/internal/agent/advertisement_test.go` fails in **both** directions — advertising
+a service whose route returns 501, and implementing a route without advertising it). The
+shard, replica and blob planners all filter on it, and the "insufficient pooled memory"
+error now says how many online nodes were excluded, so the diagnostic can never contradict
+the planner it is explaining. Both fields default to *everything*, so a node registered
+before either existed is unaffected — the advertisement can only ever narrow a node that
+narrowed itself.
+
+Two smaller notes from the same work, since they are the kind of thing that silently
+rots: the storage tests' node fixtures were `SimpleNamespace` look-alikes carrying only
+`id` and `capability.disk_mb`. A fake that cannot answer the questions the real code asks
+is not testing the real code — and this one couldn't answer `provides()`. They are real
+`Node` objects now. And each new regression test was checked for non-vacuity by running it
+against the pre-fix semantics: three of the five scheduler tests fail there, and the two
+that pass under both are precisely the positive control and the backwards-compatibility
+guard, which is the intended result.
+
+---
+
+## 🗺️ Roadmap
+
+**Delivered** (all gated by automated acceptance tests in `tests/` + `sim/scenarios/`):
+
+- **Global connectivity** — agent-initiated **outbound reverse tunnel** + a deployable
+  coordinator, so machines anywhere join through NAT/firewalls with nothing to
+  port-forward. Batch, hosting, and sharded inference all run over the tunnel.
+- **Device identity** — Ed25519 keypair per device, generated on first run; zero-signup,
+  with an optional lightweight account link that pools credits/reputation across machines.
+- **Safety** — donated machines run untrusted work under hard limits: a **locked-down
+  process sandbox** (memory cap, wall-clock timeout, output cap, input validation) for
+  curated functions, and a **WebAssembly sandbox** for user-supplied code.
+- **Mesh Functions — run your OWN code** — upload a `wasm32-wasip1` module and it becomes
+  a `wasm:<sha256>` function any job can fan out across the pool. Validated at upload
+  time, distributed by the same content-addressed store that ships model weights (once
+  per node, not once per unit), and executed with **no filesystem, no sockets and no host
+  FFI**, under fuel/memory/wall-clock ceilings. Build it in Rust, Go, Zig, C or anything
+  else that targets WASI.
+- **Credits + trust (Tier 2)** — active earn-to-spend credit ledger with a starter grant;
+  reputation EMA + **known-answer spot-checks** that catch a dishonest node and stop paying
+  it (user WASM included — the coordinator re-runs sampled units against its own copy of
+  the module); per-owner rate limits.
+- **Product UX** — redesigned **Use / Contribute / Wallet / Explore** dashboard, one-command
+  cross-platform onboarding (`start.*`, `contribute.*`), and a reproducible zip build.
+
+**Next**
+
+- **Hosted MeshPool Cloud** — operate the public coordinator + relay as an always-on
+  service (the coordinator is built and tested; hosting it is an operational step).
+  Operator runbook: [`docs/deploy-cloud.md`](docs/deploy-cloud.md).
+- **Arbitrary containers** — opt-in Docker/OCI workloads for code that needs a full OS
+  (WASM covers pure compute today; containers add native deps, threads and sockets).
+- **Distributed LoRA training** (over the frozen sharded pipeline), **GPU** acceleration, direct
+  **P2P hole-punching**, control-plane **HA/multi-region**, and real-money settlement.
+
+Full detail: [`docs/roadmap.md`](docs/roadmap.md).
+
+---
+
+## 📚 Docs index
+
+| Doc | What's in it |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Components, data flow, schemas, substrate mapping |
+| [docs/quickstart.md](docs/quickstart.md) | Step-by-step first run + troubleshooting |
+| [docs/inference.md](docs/inference.md) | Sharding, the correctness oracle, OpenAI API, training |
+| [docs/batch.md](docs/batch.md) | Job model, spread scheduling, retries |
+| [docs/hosting.md](docs/hosting.md) | Deploy flow, load balancing, failover |
+| [docs/deploy-cloud.md](docs/deploy-cloud.md) | Public coordinator deployment runbook |
+| [docs/security.md](docs/security.md) | Sandboxing, isolation, secrets, kill-switch |
+| [docs/testing.md](docs/testing.md) | Unit + e2e + chaos test strategy |
+| [docs/roadmap.md](docs/roadmap.md) | Delivered phases + honestly-deferred next steps |
+
+---
+
+<div align="center">
+<sub>MeshPool — your machines, pooled. Built to work like magic, and tested so it doesn't break.</sub>
+</div>
