@@ -241,11 +241,16 @@ class ComputeEscrowEngine:
         released = 0.0
         if state["consecutive_passes"] >= self._consecutive_passes_to_release:
             released = state["held_escrow"]
-            self.ledger.record_donation(
-                node_id, owner, released,
+            # A grant, not a donation -- see the identical note in storage/audit.py.
+            # Nobody consumed these credits, so booking them as donated work breaks
+            # the donated == consumed conservation invariant (this is exactly what
+            # verify_chaos.py caught). Spendable balance is unaffected.
+            self.ledger.record_grant(
+                owner, released,
                 detail=(
                     f"compute escrow released: "
-                    f"{state['consecutive_passes']} consecutive verified units"))
+                    f"{state['consecutive_passes']} consecutive verified units"),
+                node_id=node_id)
             log.info("compute escrow released", node=node_id, amount=released,
                      passes=state["consecutive_passes"])
             state["consecutive_passes"] = 0

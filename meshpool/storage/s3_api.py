@@ -51,6 +51,9 @@ from fastapi import APIRouter, Request
 from fastapi.responses import Response
 
 from .engine import StorageError
+from ..common.logging import get_logger
+
+log = get_logger("storage.s3")
 
 # S3 XML namespace
 _S3_NS = "http://s3.amazonaws.com/doc/2006-03-01/"
@@ -251,6 +254,16 @@ def verify_sigv4_request(request: Request, cp) -> Optional[Any]:
 
     # String to sign
     amz_date = request.headers.get("x-amz-date", date_str + "T000000Z")
+
+    # Reject stale timestamps. Without this a captured signed request replays
+    # forever, which matters far more here than it does inside a single VPC:
+    # MeshPool requests cross untrusted networks by design. AWS uses a 15-minute
+    # window and clients already resign on skew errors, so matching it is both
+    # correct and compatible.
+    if not _timestamp_is_fresh(amz_date):
+        log.warning("s3 sigv4 rejected: stale timestamp", amz_date=amz_date[:32])
+        return None
+
     credential_scope = f"{date_str}/{region}/{service}/aws4_request"
     cr_hash = hashlib.sha256(canonical_req.encode()).hexdigest()
     string_to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, credential_scope, cr_hash])
@@ -271,6 +284,26 @@ def _uri_encode(s: str) -> str:
     """Percent-encode a string per AWS SigV4 rules (unreserved chars pass through)."""
     safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
     return "".join(c if c in safe else f"%{ord(c):02X}" for c in s)
+
+
+# Matches AWS: requests more than 15 minutes from the server's clock are refused.
+SIGV4_MAX_SKEW_S = 15 * 60
+
+
+def _timestamp_is_fresh(amz_date: str, now: Optional[float] = None) -> bool:
+    """True when ``x-amz-date`` is within the allowed skew of the server clock.
+
+    An unparseable timestamp is refused rather than waved through: a signature
+    scheme that silently ignores the one field bounding its lifetime is not
+    providing the property it appears to provide.
+    """
+    try:
+        ts = datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return False
+    current = time.time() if now is None else now
+    return abs(current - ts) <= SIGV4_MAX_SKEW_S
 
 
 # ---------------------------------------------------------------------------

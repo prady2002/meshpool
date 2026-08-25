@@ -102,6 +102,12 @@ class ControlPlane:
         # user safety property, not a public-mesh billing feature. Owners are
         # uncapped unless a cap is set or MESHPOOL_DEFAULT_SPEND_CAP is configured.
         self.spend_caps = SpendCapManager(self.store)
+        # S3-compatible API: access_key_id -> (secret_key, owner_subject).
+        # Durable (see storage/s3_credentials.py) -- an in-memory dict silently
+        # invalidated every boto3 client on control-plane restart, surfacing as
+        # SignatureDoesNotMatch, which blames the client for a server-side loss.
+        from ..storage.s3_credentials import S3CredentialStore
+        self.s3_credentials = S3CredentialStore(self.store)
         # Donations credit the resolved owner (linked account, else the device).
         self.registry.owner_resolver = self.accounts.owner_for_device
         self.client = httpx.AsyncClient()
@@ -132,9 +138,6 @@ class ControlPlane:
         self.inference = None  # set in app wiring (M5)
         self.storage = None    # set in app wiring (P3 pooled object store)
         self.storage_audit = None  # set in app wiring (proof-of-storage audit engine)
-        # S3-compatible API: access_key_id -> (secret_key, owner_subject).
-        # Created via POST /api/v1/s3/credentials; in-memory only.
-        self.s3_credentials: dict[str, tuple[str, str]] = {}
 
     def _node_reachable(self, node) -> bool:
         """Whether the scheduler can actually deliver work to ``node`` right now.
@@ -938,6 +941,7 @@ def _register_routes(app: FastAPI) -> None:
     # S3 credential management (MeshPool-native; not an S3 wire operation)
     _declare_route("GET",    "/api/v1/s3/credentials",          Scope.BLOBS_READ)
     _declare_route("POST",   "/api/v1/s3/credentials",          Scope.BLOBS_WRITE)
+    _declare_route("DELETE", "/api/v1/s3/credentials/{access_key}", Scope.BLOBS_WRITE)
 
     # ---- system ---------------------------------------------------------- #
     @app.get("/api/v1/health")
@@ -2419,13 +2423,20 @@ def _register_routes(app: FastAPI) -> None:
     # ---- S3-compatible API credentials management (p5-s3) --------------- #
 
     @app.get("/api/v1/s3/credentials")
-    async def list_s3_credentials() -> dict:
-        """Return all S3 access keys (never returns the secret key)."""
+    async def list_s3_credentials(request: Request, owner: str = "default") -> dict:
+        """Return the caller's S3 access keys (never returns the secret key).
+
+        Scoped to the caller. Returning every tenant's keys would hand any
+        caller the exact input needed to revoke all of them via the endpoint
+        below -- an enumeration step and a denial-of-service in one response.
+        """
         cp = _cp()
+        actor = _consumer_owner(cp, request, owner)
         return {
             "credentials": [
                 {"access_key": k, "owner": v[1]}
                 for k, v in cp.s3_credentials.items()
+                if v[1] == actor
             ]
         }
 
@@ -2434,15 +2445,43 @@ def _register_routes(app: FastAPI) -> None:
             request: Request, owner: str = "default") -> dict:
         """Create a new S3 access-key pair and bind it to the owner.
 
-        Returns ``access_key`` and ``secret_key`` once (the secret is never
-        stored in recoverable form); save it immediately.
+        Returns ``access_key`` and ``secret_key`` once; save the secret now
+        because this response is the only time it is displayed.
+
+        Note that SigV4 is a shared-secret scheme: the server must be able to
+        recompute the client's signature, so the secret key is necessarily
+        stored in recoverable form. It lives in the control-plane datastore,
+        the same trust boundary that already holds session tokens and the
+        ledger. Treat control-plane storage accordingly.
         """
         cp = _cp()
         actor = _consumer_owner(cp, request, owner)
-        ak = "MESHPOOL" + secrets.token_hex(6).upper()
-        sk = secrets.token_urlsafe(32)
-        cp.s3_credentials[ak] = (sk, actor)
+        ak, sk = cp.s3_credentials.create(actor)
         return {"access_key": ak, "secret_key": sk, "owner": actor}
+
+    @app.delete("/api/v1/s3/credentials/{access_key}")
+    async def revoke_s3_credentials(
+            request: Request, access_key: str, owner: str = "default") -> dict:
+        """Revoke an S3 access key.
+
+        Credentials that cannot be revoked are not really credentials; before
+        they were persisted there was nothing to revoke them *from*.
+
+        Only the key's own owner may revoke it. Without that check this is a
+        cross-tenant kill switch: one call per key takes every other tenant's
+        S3 clients offline, and the failure surfaces on the victim's side as
+        ``InvalidAccessKeyId`` with no indication of who did it.
+
+        A key belonging to someone else reports 404 rather than 403, so this
+        endpoint cannot be used to probe which access keys exist.
+        """
+        cp = _cp()
+        actor = _consumer_owner(cp, request, owner)
+        holder = cp.s3_credentials.owner_of(access_key)
+        if holder is None or holder != actor:
+            raise HTTPException(status_code=404, detail="unknown access key")
+        return {"access_key": access_key,
+                "revoked": cp.s3_credentials.revoke(access_key)}
 
     # ---- S3 protocol router (includes at /s3 prefix) --------------------- #
     from ..storage import s3_api as _s3_mod

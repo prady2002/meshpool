@@ -254,11 +254,18 @@ class StorageAuditEngine:
         released = 0.0
         if state["consecutive_passes"] >= CONSECUTIVE_PASSES_TO_RELEASE:
             released = state["held_escrow"]
-            # Convert held escrow to real donated credits in the existing ledger.
-            self.ledger.record_donation(
-                node_id, owner, released,
+            # Recorded as a *grant*, not a donation. An escrow release is a bonus
+            # the platform issues for sustained good behaviour -- no consumer paid
+            # for it. Booking it as "donated" inflates one half of a two-sided
+            # transfer, which quietly breaks the donated == consumed invariant that
+            # verify_ledger_conservation.py relies on to detect credit forgery.
+            # The node's spendable balance is unchanged: credits_by_owner() counts
+            # donated and grant identically.
+            self.ledger.record_grant(
+                owner, released,
                 detail=f"storage escrow released: {state['consecutive_passes']} "
-                       f"consecutive audit passes for shard {shard_id[:12]}")
+                       f"consecutive audit passes for shard {shard_id[:12]}",
+                node_id=node_id)
             log.info("escrow released", node=node_id, amount=released,
                      passes=state["consecutive_passes"])
             state["consecutive_passes"] = 0

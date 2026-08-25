@@ -218,6 +218,13 @@ def test_escrow_held_then_released(tmp_store):
     released = esc.on_verify_pass(node, owner=node)
     assert released > 0.0, "must release escrow at threshold"
     assert ledger.credits(node) > 0.0, "credits must appear in ledger after release"
+    # Booked as a grant, never as donated: nobody consumed these credits, so
+    # recording them as donated work breaks the donated == consumed invariant.
+    totals = tmp_store.ledger_totals_by_owner()[node]
+    assert abs(totals.get("grant", 0.0) - released) < 1e-9, (
+        f"escrow release must be booked as a grant, got {totals}")
+    assert totals.get("donated", 0.0) == 0.0, (
+        f"escrow release must not inflate donated credits, got {totals}")
     state2 = esc.escrow_state(node)
     assert state2["held_escrow"] == 0.0, "escrow resets to 0 after release"
     assert state2["consecutive_passes"] == 0

@@ -441,6 +441,24 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
 
 ## ⚖️ Honest constraints (we report real numbers, never invented ones)
 
+- **The S3 SigV4 signature binds a *claimed* payload digest, not the bytes we received.**
+  `x-amz-content-sha256` is read from the header and used verbatim in the canonical
+  request; the body is never hashed and compared. So a captured, signed `PUT` can be
+  replayed with substituted content and the signature still verifies. This is a
+  deliberate trade — verifying it requires buffering the whole object in memory before
+  the first byte reaches storage, which defeats streaming uploads — and AWS itself
+  permits `UNSIGNED-PAYLOAD` over HTTPS for the same reason. What *is* enforced: a
+  15-minute clock-skew window (`SIGV4_MAX_SKEW_S`), so the replay window is bounded
+  rather than infinite, and a timestamp that cannot be parsed is refused rather than
+  waved through. Run MeshPool's S3 endpoint over TLS; without it the signature is not
+  protecting object contents.
+- **S3 access keys are stored in recoverable form, because SigV4 requires it.** The
+  server has to recompute the client's signature, so unlike a password there is no
+  hash-and-compare option. Keys live in the control-plane database, inside the same
+  trust boundary that already holds session tokens and the ledger; they are durable
+  across restarts (an earlier in-memory dict silently invalidated every client on every
+  restart, reporting `SignatureDoesNotMatch` and blaming the client) and revocable via
+  `DELETE /api/v1/s3/credentials/{access_key}`.
 - **Hard spend caps stop work — and everything else about billing does not exist yet.**
   A cap set via `PUT /api/v1/account/spend-cap` genuinely halts execution: new work is
   refused with HTTP 402 at all twelve work-creating endpoints, and the batch dispatcher

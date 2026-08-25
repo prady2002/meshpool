@@ -530,11 +530,20 @@ class TestEscrowHeldThenReleased:
         assert abs(released_total - expected) < 1e-9, (
             f"Expected {expected} credits released, got {released_total}")
 
-        # Credits appear in the existing ledger as "donated"
+        # Credits appear in the existing ledger and are spendable
         credits = ledger.credits(node_id)
         assert abs(credits - expected) < 1e-9, (
             f"Ledger credits should match released escrow: "
             f"expected {expected}, got {credits}")
+
+        # ...but booked as a *grant*, never as "donated". Donated and consumed are
+        # two halves of one transfer; an escrow bonus has no payer, so recording it
+        # as donated forges the appearance of work and breaks conservation.
+        totals = store.ledger_totals_by_owner()[node_id]
+        assert abs(totals.get("grant", 0.0) - expected) < 1e-9, (
+            f"escrow release must be booked as a grant, got {totals}")
+        assert totals.get("donated", 0.0) == 0.0, (
+            f"escrow release must not inflate donated credits, got {totals}")
 
         # State is reset for the next cycle
         state = engine.escrow_state(node_id)
@@ -556,12 +565,15 @@ class TestEscrowHeldThenReleased:
             for i in range(N):
                 engine.on_audit_pass(node_id, shard_id, owner=node_id)
 
-        # After n_cycles × N passes, total donated = n_cycles × N × ESCROW_PER_AUDIT_UNIT
+        # After n_cycles × N passes, total credited = n_cycles × N × ESCROW_PER_AUDIT_UNIT
         expected = n_cycles * N * ESCROW_PER_AUDIT_UNIT
         credits = ledger.credits(node_id)
         assert abs(credits - expected) < 1e-9, (
-            f"Expected {expected} total donated credits over {n_cycles} cycles, "
+            f"Expected {expected} total credits over {n_cycles} cycles, "
             f"got {credits}")
+        totals = store.ledger_totals_by_owner()[node_id]
+        assert totals.get("donated", 0.0) == 0.0, (
+            f"repeated escrow cycles must not inflate donated credits, got {totals}")
 
     def test_end_to_end_audit_pass_releases_escrow(self, tmp_path):
         """Full audit cycle via audit_shard: honest node passes and escrow releases."""

@@ -143,11 +143,20 @@ class ContributionLedger:
             id=new_id("led"), node_id=node_id, owner=owner, kind="consumed",
             compute_units=max(0.0, compute_units), ts_ms=now_ms(), detail=detail))
 
-    def record_grant(self, owner: str, compute_units: float, detail: str = "") -> None:
+    def record_grant(self, owner: str, compute_units: float, detail: str = "",
+                     node_id: str = "system") -> None:
         """One-time (or promotional) credit grant — e.g. the starter balance a newly
-        verified device/account receives so it can consume before it has donated."""
+        verified device/account receives so it can consume before it has donated.
+
+        This is the ledger's **only** issuance channel. ``donated`` and ``consumed``
+        are two halves of one transfer and must stay equal in aggregate; anything
+        that creates credits without a matching consumer belongs here instead, or
+        the conservation invariant silently stops meaning anything. ``node_id``
+        attributes a grant that was earned by a specific node (e.g. an escrow
+        release) rather than issued to the account as a whole.
+        """
         self.store.add_ledger(LedgerEntry(
-            id=new_id("led"), node_id="system", owner=owner, kind="grant",
+            id=new_id("led"), node_id=node_id, owner=owner, kind="grant",
             compute_units=max(0.0, compute_units), ts_ms=now_ms(), detail=detail))
 
     def credits(self, owner: str) -> float:
