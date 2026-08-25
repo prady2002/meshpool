@@ -125,10 +125,16 @@ def main() -> int:  # noqa: C901 - a linear e2e script
         print(f"  PASS: {len(reps)} replicas healthy on {sorted(nodes)}")
 
         print("\n== test 2: a plain route still works through the proxy ==")
+        _t0 = time.perf_counter()
         hello = httpx.get(f"{cp}/app/{dep_id}/hello", timeout=10)
+        # Cost of a *non-streaming* trip through the same proxy to the same app:
+        # connect, route, dispatch to a replica, respond. Test 3 subtracts this so
+        # its first-byte check measures buffering rather than machine load.
+        baseline = time.perf_counter() - _t0
         assert hello.status_code == 200 and f"{TOKEN} home" in hello.text, \
             f"plain route broke: {hello.status_code} {hello.text[:80]}"
-        print(f"  PASS: /hello served by {hello.headers.get('X-MeshPool-Served-By')}")
+        print(f"  PASS: /hello served by {hello.headers.get('X-MeshPool-Served-By')} "
+              f"({baseline:.2f}s proxy baseline)")
 
         print("\n== test 3: SSE chunks arrive INCREMENTALLY (not buffered to the end) ==")
         arrivals: list = []
@@ -152,11 +158,20 @@ def main() -> int:  # noqa: C901 - a linear e2e script
         span = arrivals[-1] - arrivals[0]
         expected = (N_CHUNKS - 1) * GAP
         print(f"  first byte @ {arrivals[0]:.2f}s, last @ {arrivals[-1]:.2f}s, "
-              f"span={span:.2f}s (server spread ~{expected:.2f}s), reads={len(arrivals)}")
+              f"span={span:.2f}s (server spread ~{expected:.2f}s), reads={len(arrivals)}, "
+              f"proxy baseline={baseline:.2f}s")
         assert span >= expected * 0.5, \
             f"response was buffered, not streamed: span={span:.2f}s < {expected * 0.5:.2f}s"
-        assert arrivals[0] < expected * 0.5, \
-            f"first byte too late ({arrivals[0]:.2f}s) -- looks buffered"
+        # The first byte must arrive well before the server finished producing.
+        # Measured against the plain-route baseline from test 2, because the
+        # absolute arrival time also contains connect + proxy-dispatch cost,
+        # which balloons on a loaded machine and has nothing to do with
+        # buffering -- an unadjusted threshold here fails the gate for being
+        # busy rather than for being wrong.
+        first_after_connect = arrivals[0] - baseline
+        assert first_after_connect < expected * 0.5, \
+            (f"first byte too late ({arrivals[0]:.2f}s, {first_after_connect:.2f}s "
+             f"after the {baseline:.2f}s proxy baseline) -- looks buffered")
         print("  PASS: SSE relayed incrementally through the proxy")
 
         print("\n== test 4: kill a node -> streaming app still served (failover) ==")

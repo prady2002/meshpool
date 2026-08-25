@@ -28,6 +28,15 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from sim.harness import Harness, _kill_tree  # noqa: E402
 
+# The harness gives agent i the port cp_port + 1 + i, so a 2-agent cluster owns
+# CP_PORT..CP_PORT+2 -- the whole range, not just the control-plane port. The
+# old value 8180 therefore claimed 8181, which is verify_console's CP_PORT: the
+# gates run serially, so it only bit when one gate's processes had not fully
+# released their sockets before the next started, and it then failed as an
+# unrelated-looking "service not ready at 127.0.0.1:8181" timeout.
+# 8700-8702 is clear of every other gate.
+CP_PORT = 8700
+
 
 def _auth(cp: str) -> dict:
     r = httpx.post(f"{cp}/api/v1/auth/local", timeout=10)
@@ -89,7 +98,7 @@ def _wait_tunnels(cp: str, n: int, timeout: float = 60) -> None:
 def main() -> int:
     data = Path(__file__).resolve().parent / "_data_chaos"
     shutil.rmtree(data, ignore_errors=True)
-    h = Harness(n_agents=2, cp_port=8180, scale="public", sandbox=True,
+    h = Harness(n_agents=2, cp_port=CP_PORT, scale="public", sandbox=True,
                 tunnel=True, data_dir=str(data))
     ok = True
     try:

@@ -111,7 +111,7 @@ def test_models_list(cp: str) -> None:
 def test_models_list_via_sdk(cp: str) -> None:
     print("\n== test 1b: GET /v1/models via openai SDK ==")
     from openai import OpenAI
-    client = OpenAI(api_key="meshpool-token", base_url=f"{cp}/v1", max_retries=0)
+    client = OpenAI(api_key=_get_session(cp), base_url=f"{cp}/v1", max_retries=0)
     models = client.models.list()
     if not hasattr(models, "data") or not models.data:
         _fail(f"SDK models.list() returned empty or invalid object: {models}")
@@ -124,7 +124,7 @@ def test_models_list_via_sdk(cp: str) -> None:
 def test_chat_completions_non_streaming(cp: str) -> None:
     print("\n== test 2: POST /v1/chat/completions (non-streaming) ==")
     from openai import OpenAI
-    client = OpenAI(api_key="meshpool-token", base_url=f"{cp}/v1", max_retries=0)
+    client = OpenAI(api_key=_get_session(cp), base_url=f"{cp}/v1", max_retries=0)
     response = client.chat.completions.create(
         model="nano-gpt",
         messages=[{"role": "user", "content": "MeshPool turns idle machines into "}],
@@ -248,6 +248,40 @@ def test_spend_cap_returns_429(cp: str) -> None:
     _ok("capped owner received HTTP 429 with OpenAI error envelope")
 
 
+def test_unknown_api_key_is_rejected(cp: str) -> None:
+    """An API key that resolves to nobody must be refused, not silently served.
+
+    The old behaviour billed such a request to the ``default`` owner: the call
+    succeeded, somebody else paid, and because spend caps are per-owner the
+    caller's own cap never applied. A single typo in an API key spent another
+    account's credits. This test pins the fix so the fallback cannot return.
+    """
+    print("\n== test 7: an unknown API key must be rejected ==")
+    r = httpx.post(
+        f"{cp}/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4},
+        headers={"Authorization": "Bearer sk-not-a-real-meshpool-key"},
+        timeout=30,
+    )
+    if r.status_code != 401:
+        _fail(f"an unknown API key must be rejected with 401, got "
+              f"{r.status_code}: {r.text[:300]}")
+    body = r.json()
+    if body.get("error", {}).get("code") != "invalid_api_key":
+        _fail(f"expected error.code == 'invalid_api_key', got {body!r}")
+    # Control: the very same request with NO Authorization header still works,
+    # so local single-machine use is not collateral damage of this check.
+    r2 = httpx.post(
+        f"{cp}/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4},
+        timeout=30,
+    )
+    if r2.status_code != 200:
+        _fail(f"open-mode (no Authorization header) must still work; got "
+              f"{r2.status_code}: {r2.text[:300]}")
+    _ok("unknown API key -> 401 invalid_api_key; no-header open mode still 200")
+
+
 def test_bearer_auth(cp: str) -> None:
     print("\n== test 6: Authorization: Bearer <session-token> accepted ==")
     sess = _get_session(cp)
@@ -331,6 +365,7 @@ def main() -> int:
         test_legacy_completions(cp)
         test_spend_cap_returns_429(cp)
         test_bearer_auth(cp)
+        test_unknown_api_key_is_rejected(cp)
 
         print("\n== all functional tests passed ==")
 

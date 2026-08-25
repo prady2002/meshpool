@@ -28,6 +28,44 @@ if TYPE_CHECKING:
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+
+def _free_port(preferred: int) -> int:
+    """Return ``preferred`` if it is bindable, otherwise a free port.
+
+    Gate scenarios hard-code their ports, and a 2-agent cluster silently claims
+    three of them (``cp_port`` plus ``cp_port + 1 + idx`` per agent), so the
+    ranges overlap in several places even though every declared control-plane
+    port is distinct. The gates run serially, so an overlap only bites when the
+    previous gate's sockets have not been released yet -- and then it surfaces
+    as ``TimeoutError: service not ready at 127.0.0.1:<port>`` 25 seconds later,
+    which reads like the agent failed to boot rather than like a port clash.
+
+    Treating the hard-coded port as a *hint* removes the whole failure class
+    without renumbering every scenario. When the port is free -- the normal
+    case -- behaviour is exactly as before, so the documented ports still hold.
+
+    ``preferred=0`` means "just give me anything". It cannot be handled by the
+    bind-and-keep path, because binding port 0 always succeeds and would hand
+    back a literal 0 that then gets written into ``MESHPOOL_PORT`` -- the server
+    would pick its own ephemeral port and the harness would spend 25 seconds
+    health-checking a port nothing is listening on.
+    """
+    import socket
+    if preferred and preferred > 0:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", preferred))
+                return preferred
+            except OSError:
+                pass
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        chosen = s.getsockname()[1]
+    if preferred and preferred > 0:
+        print(f"[harness] port {preferred} is busy; using {chosen} instead")
+    return chosen
+
+
 # heterogeneous node profiles cycled across agents (cores, ram_mb, flops, vram_mb)
 PROFILES = [
     {"cores": 8, "ram": 16000, "flops": 60.0, "vram": 0},
@@ -87,6 +125,7 @@ class Harness:
         self.cp_proc: Optional[subprocess.Popen] = None
         self.agent_procs: list[Optional[subprocess.Popen]] = []
         self.agent_ports: list[int] = []
+        self._cp_port_resolved = False
 
     def cp_url(self) -> str:
         return f"http://{self.host}:{self.cp_port}"
@@ -106,6 +145,13 @@ class Harness:
 
     def start_control_plane(self) -> None:
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
+        # Resolve the port once, on first boot only. A restart (verify_chaos kills
+        # the coordinator and brings it back) must reuse the very same port, or
+        # the already-running agents would keep dialling the old URL and the
+        # self-heal this harness exists to test could never succeed.
+        if not self._cp_port_resolved:
+            self.cp_port = _free_port(self.cp_port)
+            self._cp_port_resolved = True
         env = self._base_env()
         env.update({
             "MESHPOOL_HOST": self.host,
@@ -121,7 +167,11 @@ class Harness:
         self._wait_http(f"{self.cp_url()}/api/v1/health", timeout=25)
 
     def start_agent(self, idx: int) -> None:
-        port = self.cp_port + 1 + idx
+        if idx < len(self.agent_ports):
+            # Restarting an existing agent: keep the port it already advertised.
+            port = self.agent_ports[idx]
+        else:
+            port = _free_port(self.cp_port + 1 + idx)
         prof = PROFILES[idx % len(PROFILES)]
         env = self._base_env()
         env.update({

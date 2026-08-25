@@ -423,9 +423,12 @@ def check_durability_endpoint() -> bool:
         # Start 3 agents: 2 in domain-a, 1 in domain-b
         import subprocess
         import os as _os
-        from sim.harness import REPO_ROOT, PROFILES, _kill_tree
+        from sim.harness import REPO_ROOT, PROFILES, _kill_tree, _free_port
         agent_procs = []
-        agent_ports = [CP_PORT + 1, CP_PORT + 2, CP_PORT + 3]
+        # Derive from harness.cp_port, not CP_PORT: start_control_plane() falls
+        # back to a free port when the hard-coded one is busy, and these agents
+        # would otherwise be told to bind ports next to a port nobody is using.
+        agent_ports = [_free_port(harness.cp_port + 1 + i) for i in range(3)]
         agent_domains = ["domain-a", "domain-a", "domain-b"]
         for idx in range(3):
             port = agent_ports[idx]
