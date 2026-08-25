@@ -402,4 +402,17 @@ class Verifier:
                 "total_released": esc.total_released if esc else 0.0,
                 "total_forfeited": esc.total_forfeited if esc else 0.0,
             },
+            # The endpoint's Tier 0/1 branch returns this block, so omitting it
+            # here would make the response *shape* depend on the deployment tier:
+            # a client that reads `classification` works against a tier-0 mesh
+            # and KeyErrors against a tier-2 one. The classification itself is
+            # static policy -- which functions are digest-verifiable, oracle-
+            # verifiable, or not verifiable at all -- so there is no reason for
+            # it to disappear once verification is actually switched on. If
+            # anything it matters *more* then.
+            "classification": {
+                "digest_verifiable": sorted(DIGEST_VERIFIABLE_FUNCS),
+                "oracle_verifiable": sorted(ORACLE_VERIFIABLE_FUNCS),
+                "not_verifiable": sorted(NOT_VERIFIABLE_FUNCS),
+            },
         }

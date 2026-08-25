@@ -7,6 +7,7 @@ stdlib + numpy (psutil isn't available in this environment), degrading gracefull
 from __future__ import annotations
 
 import ctypes
+import concurrent.futures as _futures
 import json
 import os
 import platform
@@ -27,6 +28,22 @@ log = get_logger("probe")
 
 
 _UNKNOWN_INT = 0
+
+
+def _unwrap(fut, fallback):
+    """Result of ``fut``, or ``fallback`` if it raised.
+
+    Every detector already swallows its own errors and returns a sentinel, so in
+    practice this never fires. It exists because the sequential version degraded
+    *per detector* -- a machine with no ``nvidia-smi`` still reported its RAM --
+    and moving to a pool must not quietly turn one detector's unexpected
+    exception into a total probe failure that leaves a node reporting nothing.
+    """
+    try:
+        return fut.result()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("hardware detector failed", error=str(exc))
+        return fallback
 
 
 @dataclass(frozen=True)
@@ -476,21 +493,53 @@ def _nvidia_gpu_names() -> list[str]:
 
 
 def probe_hardware_detail(link: Optional[_LinkMeasurement] = None) -> HardwareProbe:
-    """Measure detailed hardware locally; safe to call even when probes are absent."""
-    gpu, vram, gpu_names = _detect_gpu()
+    """Measure detailed hardware locally; safe to call even when probes are absent.
+
+    The five detections below are independent of each other and every one of them
+    is a *blocking wait on a child process* -- ``nvidia-smi``, ``rocm-smi``,
+    ``lscpu``, ``pmset``, and on Windows several ``powershell -Command
+    Get-CimInstance`` invocations that each cost seconds just to start the shell.
+    Run sequentially their timeouts add up: measured at **10.2 s on an idle
+    machine**, and worse under load.
+
+    That is not merely slow, it is on the critical path of node startup -- the
+    agent does not bind its HTTP port until the probe returns, so a node is
+    unreachable and unregistered for the whole duration. It made the sim harness
+    time out agents that were perfectly healthy (25 s readiness budget vs. a
+    22 s probe under load), and it eats a tenth of the contributor's
+    "download to first credit" budget doing nothing but waiting on subprocesses.
+
+    Because the work is I/O-bound, a thread pool collapses the cost to roughly
+    the slowest single probe rather than the sum of all of them. Each future is
+    unwrapped defensively so that one detector raising cannot take down the
+    whole probe -- the sequential version degraded per-detector too, and that
+    property must survive.
+    """
+    with _futures.ThreadPoolExecutor(max_workers=5) as pool:
+        f_gpu = pool.submit(_detect_gpu)
+        f_batt = pool.submit(_detect_battery)
+        f_cpu = pool.submit(_detect_cpu_model)
+        f_ram = pool.submit(_total_ram_mb)
+        f_therm = pool.submit(_detect_thermal_state)
+
+        gpu, vram, gpu_names = _unwrap(f_gpu, (False, 0, []))
+        batt_power, batt_pct = _unwrap(f_batt, (None, None))
+        cpu_model = _unwrap(f_cpu, None)
+        ram_mb = _unwrap(f_ram, 0)
+        thermal = _unwrap(f_therm, "unknown")
+
     disk = shutil.disk_usage(os.getcwd())
-    batt_power, batt_pct = _detect_battery()
     return HardwareProbe(
         cpu_cores=os.cpu_count() or 1,
         cpu_arch=platform.machine() or "unknown",
-        cpu_model=_detect_cpu_model(),
-        ram_mb=_total_ram_mb() or None,
+        cpu_model=cpu_model,
+        ram_mb=ram_mb or None,
         gpu=gpu,
         vram_mb=vram or None,
         gpu_names=gpu_names,
         disk_free_mb=int(disk.free // (1024 * 1024)),
         disk_total_mb=int(disk.total // (1024 * 1024)),
-        thermal_state=_detect_thermal_state(),
+        thermal_state=thermal,
         battery_powered=batt_power,
         battery_percent=batt_pct,
         network_class=(

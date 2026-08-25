@@ -28,6 +28,21 @@ if TYPE_CHECKING:
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# How long a freshly-spawned control plane or agent gets to answer /health.
+#
+# This was 25 s, which sounds generous until you count what happens first: the
+# agent runs a full hardware probe *before* binding its port, and that probe used
+# to take 10 s idle and 22 s under load. Three agents starting at once on a busy
+# machine blew straight through the budget, and the resulting
+# "service not ready at 127.0.0.1:8126" reads like the agent crashed rather than
+# like it was still booting -- so it got retried as flakiness for a long time.
+#
+# The probe is now parallel (~3 s), but the budget stays wide deliberately. The
+# two failure modes are not symmetric: timing out a *healthy* service produces a
+# red suite and a wild goose chase, while waiting longer on a genuinely dead one
+# only delays a failure that was going to happen anyway. Buy the margin.
+_READY_TIMEOUT = float(os.environ.get("MESHPOOL_SIM_READY_TIMEOUT", "75"))
+
 
 def _free_port(preferred: int) -> int:
     """Return ``preferred`` if it is bindable, otherwise a free port.
@@ -164,7 +179,7 @@ class Harness:
         self.cp_proc = subprocess.Popen(
             [sys.executable, "-m", "meshpool.controlplane.app"],
             env=env, cwd=str(REPO_ROOT))
-        self._wait_http(f"{self.cp_url()}/api/v1/health", timeout=25)
+        self._wait_http(f"{self.cp_url()}/api/v1/health", timeout=_READY_TIMEOUT)
 
     def start_agent(self, idx: int) -> None:
         if idx < len(self.agent_ports):
@@ -210,7 +225,7 @@ class Harness:
         else:
             self.agent_procs.append(proc)
             self.agent_ports.append(port)
-        self._wait_http(f"http://{self.host}:{port}/health", timeout=25)
+        self._wait_http(f"http://{self.host}:{port}/health", timeout=_READY_TIMEOUT)
 
     def start(self) -> None:
         self.start_control_plane()
