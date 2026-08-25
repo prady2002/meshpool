@@ -1,0 +1,8 @@
+/plan go through this codebase in depth and analyse and understand everything. analyse and see what all can be improved and enhanced, what all functionalites to be implemented and what new features must be  
+┃ implemented. i want this product to be used by everyone and it must be that good and reliable. anyone must be able to host any large application just like how they host in aws or gcp, run any large llm      
+┃ model like kimi k2 or any Trillion parameter model which is not possible to run on a single pc, storage also. this must be exactly like AWS, which provides services to user to do a lot of different things.  
+┃ it must intelloigently use any type of resources from all other pcs or servers in the internet and must be able to use this to provide services to others. see what all resources can be used from the pool    
+┃ and what all services can be provided to others. this must be truely decentralised and very seamless. search the internet and research on all the research papers you can find on this topic and related       
+┃ topics, journals, blogs, code, tools, applications, user comments, open source projects and basically everything you can find related to this concept of decentralisation. after doint the deep research,      
+┃ brainstorm on all the ideas and concepts and try to come up with a perfect idea and technical things related to this. create or invent your own concept, brainstorm on how to make this work. this can be an   
+┃ entire new concept in the market and this must be mindblowing. this must solve a painpoint and this type of concept and product must be first in the market. this must be a high

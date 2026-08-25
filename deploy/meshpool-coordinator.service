@@ -1,0 +1,30 @@
+# Install:
+#   sudo cp deploy/meshpool-coordinator.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now meshpool-coordinator
+#
+# Assumes the repo is installed at /opt/meshpool, dependencies are installed in
+# /opt/meshpool/.venv, /var/lib/meshpool exists, and a non-root "meshpool" user
+# owns the install and data directories.
+
+[Unit]
+Description=MeshPool public coordinator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meshpool
+Group=meshpool
+WorkingDirectory=/opt/meshpool
+Environment=MESHPOOL_SCALE=public
+Environment=MESHPOOL_HOST=0.0.0.0
+Environment=MESHPOOL_PORT=8080
+Environment=MESHPOOL_DATA_DIR=/var/lib/meshpool
+Environment=MESHPOOL_CONTROL_PLANE_URL=https://meshpool.example.com
+ExecStart=/opt/meshpool/.venv/bin/python -m meshpool.controlplane.app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

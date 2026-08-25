@@ -53,7 +53,7 @@ for cryptographically strong guarantees that the bytes themselves must be held.
 from __future__ import annotations
 
 import hashlib
-import secrets
+import random
 import time
 from typing import Optional
 
@@ -95,7 +95,7 @@ class StorageAuditEngine:
     def __init__(
         self,
         ledger: ContributionLedger,
-        rng: Optional["random.Random"] = None,
+        rng: Optional[random.Random] = None,
     ) -> None:
         # per-shard verification material: shard_id -> [sha256_bytes, ...]
         # One entry per AUDIT_CHUNK_SIZE block of the shard's raw bytes.
@@ -113,8 +113,7 @@ class StorageAuditEngine:
 
         self.ledger = ledger
 
-        import random as _random
-        self._rng = rng or _random.Random()
+        self._rng = rng or random.Random()
 
     # ------------------------------------------------------------------ #
     # Write-time: record verification material
@@ -139,6 +138,48 @@ class StorageAuditEngine:
     def forget_shard(self, shard_id: str) -> None:
         """Drop verification material for a shard that has been deleted."""
         self._chunk_hashes.pop(shard_id, None)
+
+    async def ensure_shard_hashes(
+        self,
+        shard_id: str,
+        node_ids: list[str],
+        storage_manager,
+    ) -> bool:
+        """Re-derive missing verification material for ``shard_id``, if possible.
+
+        WHY THIS EXISTS
+        ---------------
+        ``_chunk_hashes`` lives only in memory.  A control-plane restart therefore
+        wipes every shard's verification material, and without this method the
+        auditor would silently become a no-op for the entire pre-existing dataset
+        forever — the single worst failure mode this module can have, because it
+        looks exactly like success.
+
+        Rebuilding is **cryptographically safe** even though the bytes come from
+        the very nodes we are policing: a shard id IS the sha256 of its bytes
+        (``StorageManager.digest``), and ``StorageManager._fetch`` refuses any
+        payload whose digest does not match the id it asked for.  A cheater can
+        therefore only supply the genuine bytes or nothing at all — and supplying
+        the genuine bytes is precisely the thing we wanted to prove.
+
+        Returns True if verification material exists after the call.
+        """
+        if shard_id in self._chunk_hashes:
+            return True
+        if not node_ids:
+            return False
+        try:
+            raw = await storage_manager._fetch(node_ids, shard_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("audit rebaseline fetch failed",
+                        shard=shard_id[:12], err=str(exc)[:120])
+            return False
+        if raw is None:
+            return False
+        self.record_shard_hashes(shard_id, raw)
+        log.info("audit material rebaselined from digest-verified shard",
+                 shard=shard_id[:12], chunks=len(self._chunk_hashes[shard_id]))
+        return True
 
     # ------------------------------------------------------------------ #
     # Challenge issuance
@@ -233,9 +274,16 @@ class StorageAuditEngine:
     ) -> float:
         """Record a failing audit.
 
-        Forfeits all held escrow for ``node_id``, drops the shard placement for
-        ``node_id``, and triggers an idempotent repair of ``blob_id`` if the
-        anti-thrash cooldown has elapsed.
+        Forfeits all held escrow for ``node_id`` and drops the shard placement for
+        ``node_id`` so reads stop targeting it.
+
+        Repair is **not** performed here.  Removing the node from the shard's
+        replica set is what causes ``StorageManager._reconcile`` to observe the
+        blob as degraded and call ``_repair_ec_locked`` on its next sweep; that is
+        deliberately the single repair path, so an audit failure and a node going
+        offline heal through identical, already-tested code.  The event published
+        below is an observability signal for the UI/SSE stream, rate-limited by
+        ``REPAIR_COOLDOWN_S`` so a mass failure cannot flood subscribers.
 
         Returns the amount of escrow forfeited.
         """
@@ -316,8 +364,11 @@ class StorageAuditEngine:
         Returns a summary dict ``{passed, failed, skipped}``.
         Safe to call repeatedly from a background loop; the anti-thrash guard
         prevents repair storms.
+
+        A shard with no verification material is **never counted as a pass** — it
+        is rebaselined if possible and otherwise reported as ``skipped``, so a
+        blinded auditor can never masquerade as a healthy one.
         """
-        from ..common.models import BlobMeta
         passed = failed = skipped = 0
         live = {n.id for n in storage_manager.registry.online()}
 
@@ -334,6 +385,12 @@ class StorageAuditEngine:
                     continue
                 node_id = shard_meta.replicas[0]
                 if node_id not in live:
+                    skipped += 1
+                    continue
+                live_holders = [r for r in shard_meta.replicas if r in live]
+                if not await self.ensure_shard_hashes(
+                        shard_id, live_holders, storage_manager):
+                    # Cannot judge this shard: do NOT inflate the pass count.
                     skipped += 1
                     continue
                 owner = meta.owner

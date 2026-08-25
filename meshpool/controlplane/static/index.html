@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MeshPool — borrow the world's spare compute</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%234f8cff'/></svg>">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="2.4"/><circle cx="5" cy="19" r="2.4"/><circle cx="19" cy="19" r="2.4"/><path d="M12 7.4v3.2M10.5 12.5 6.6 16.8M13.5 12.5l3.9 4.3"/><circle cx="12" cy="12" r="1.6" fill="#fff"/></svg></span>
+    MeshPool
+  </div>
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-view="use">Use</button>
+    <button class="tab" data-view="contribute">Contribute</button>
+    <button class="tab" data-view="wallet">Wallet</button>
+    <button class="tab" data-view="explore">Explore</button>
+  </nav>
+  <div class="spacer"></div>
+  <div class="wallet-chip" id="walletChip" title="your compute-credit balance" onclick="showView('wallet')">
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></svg>
+    <b id="balance">—</b><span class="crlbl">cr</span>
+  </div>
+  <div class="conn"><span id="dot" class="dot"></span><span id="connTxt">connecting…</span></div>
+</header>
+
+<div class="wrap">
+
+  <!-- ================= USE ================= -->
+  <section class="view active" id="view-use">
+    <div class="hero">
+      <h1>Run heavy work on the whole mesh</h1>
+      <p>Submit compute, deploy an app, or chat with a model that's too big for one
+        machine — it runs across donated computers around the world. You spend
+        compute-credits; you earn them back by contributing your own spare capacity.</p>
+    </div>
+
+    <div id="useBanner"></div>
+
+    <div class="stats" id="poolStats"></div>
+
+    <div class="grid3">
+      <!-- BATCH -->
+      <div class="card action">
+        <h2><span class="ico">⚙️</span> Run a batch job <span class="cnt" id="jobCnt"></span></h2>
+        <div class="body">
+          <p class="lead">Fan thousands of independent work-units across every machine at once.</p>
+          <label>What to run</label>
+          <select id="jFunc" onchange="describeFunc()">
+            <option value="sha_pow">sha_pow — CPU proof-of-work</option>
+            <option value="is_prime">is_prime — primality test</option>
+            <option value="embed">embed — text embeddings</option>
+            <option value="square">square — trivial demo</option>
+            <option value="sleep_echo">sleep_echo — failover demo</option>
+          </select>
+          <div class="funcHint" id="funcHint"></div>
+          <label>Work units</label>
+          <input id="jCount" type="number" value="24" min="1" max="500">
+          <button class="btn p block" id="jBtn" onclick="submitJob()">Submit job</button>
+        </div>
+      </div>
+
+      <!-- HOSTING -->
+      <div class="card action">
+        <h2><span class="ico">🌐</span> Deploy an app <span class="cnt" id="depCnt"></span></h2>
+        <div class="body">
+          <p class="lead">Run a web app with load-balancing and automatic failover across nodes.</p>
+          <label>App</label>
+          <select id="dApp" onchange="onAppChange()">
+            <option value="hello">hello — demo web app</option>
+            <option value="site">my site — host your own HTML</option>
+          </select>
+          <div id="siteWrap" style="display:none">
+            <label>Upload a site (.zip)</label>
+            <input id="dZip" type="file" accept=".zip,application/zip">
+            <div class="funcHint">Zip a multi-page app folder and drop it here — a static site (with <b>index.html</b>) <i>or</i> a real server app (include a <b>Procfile</b> like <code>web: python server.py</code>, listening on <code>$PORT</code>). Served across the mesh with load-balancing &amp; failover. Or paste a single page below.</div>
+            <label>Config (one <code>KEY=VALUE</code> per line, optional)</label>
+            <textarea id="dEnv" rows="2" placeholder="DATABASE_URL=postgres://…&#10;API_KEY=…"></textarea>
+            <label>…or paste one page (HTML)</label>
+            <textarea id="dSite" rows="3" placeholder="Paste your index.html — hosted across the mesh with load-balancing & failover."></textarea>
+          </div>
+          <label>Replicas</label>
+          <input id="dRep" type="number" value="2" min="1" max="8">
+          <button class="btn p block" id="dBtn" onclick="deployApp()">Deploy app</button>
+          <div id="deps" class="feed"></div>
+        </div>
+      </div>
+
+      <!-- INFERENCE -->
+      <div class="card action">
+        <h2><span class="ico">🧠</span> Run a model <span class="cnt" id="modelState"></span></h2>
+        <div class="body">
+          <p class="lead">Run a real LLM across the pool. Models too big for one machine shard
+            across nodes; models that fit are replicated so requests load-balance for throughput —
+            with automatic failover if a machine drops.</p>
+          <label>Model</label>
+          <select id="modelPick" onchange="onModelPick()"><option value="nano-gpt">nano-gpt — built-in demo (sharded)</option></select>
+          <div class="funcHint" id="modelHint"></div>
+          <div id="byoWrap" style="display:none">
+            <label>Bring your own weights (optional)</label>
+            <input id="wFile" type="file" accept=".npz,application/octet-stream">
+            <div class="funcHint">Upload a trained checkpoint (.npz) — it's staged in the pool and each node runs only its slice of layers, so weights too big for one machine still run across the pool.</div>
+          </div>
+          <div id="topo"></div>
+          <button class="btn p block" id="modelBtn" onclick="deployModel()">Deploy across the pool</button>
+          <div class="chat" id="chatWrap" style="display:none">
+            <div class="msgs" id="msgs"></div>
+            <div class="chatbox"><input id="chatIn" placeholder="Ask the model…" onkeydown="if(event.key==='Enter')sendChat()"><button class="btn p" onclick="sendChat()">Send</button></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- STORAGE -->
+      <div class="card action">
+        <h2><span class="ico">📦</span> Store files <span class="cnt" id="fileCnt"></span></h2>
+        <div class="body">
+          <p class="lead">Drop a file into the pool — it's replicated across your machines' spare disk, so it survives any single machine going away, and you can download it from anywhere on the mesh.</p>
+          <label>Upload a file</label>
+          <input id="fFile" type="file">
+          <div class="funcHint">Content-addressed &amp; replicated across nodes. A machine dropping out never loses your file — the mesh re-replicates it automatically to keep it safe.</div>
+          <button class="btn p block" id="fBtn" onclick="uploadFile()">Upload to the pool</button>
+          <div id="files" class="feed"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card jobs-panel">
+      <h2><span class="ico">📈</span> Live batch jobs <span class="cnt" id="jobLiveCnt"></span>
+        <span class="r"><button class="btn sm" onclick="loadJobs()">Refresh</button></span></h2>
+      <div class="body"><div id="jobs" class="feed jobs-live"><div class="empty">No batch jobs yet.</div></div></div>
+    </div>
+  </section>
+
+  <!-- ================= CONTRIBUTE ================= -->
+  <section class="view" id="view-contribute">
+    <div class="hero">
+      <h1>Share your spare compute</h1>
+      <p>Donate the CPU your machine isn't using and earn compute-credits you can spend
+        anywhere on the mesh. It's OS-enforced, reversible in one click, and never
+        touches the resources you're actively using.</p>
+    </div>
+
+    <div class="stats" id="contribStats"></div>
+
+    <div class="grid">
+      <div class="col-main">
+        <div class="card">
+          <h2><span class="ico">🖥️</span> Your machines <span class="cnt" id="myNodeCnt"></span>
+            <span class="r"><button class="btn sm" onclick="refreshAll()">Refresh</button></span></h2>
+          <div class="body" id="myNodes"><div class="empty">Loading…</div></div>
+        </div>
+      </div>
+      <div class="col-side">
+        <div class="card">
+          <h2><span class="ico">✨</span> Add a machine</h2>
+          <div class="body">
+            <div class="pair">
+              <div class="pairlbl">Pairing token</div>
+              <div class="code" id="pairCode">••••••</div>
+              <div class="joinlbl">Windows</div>
+              <div class="cmd" id="joinWin" title="click to copy" onclick="copyText(this.textContent)">…</div>
+              <div class="joinlbl">macOS / Linux</div>
+              <div class="cmd" id="joinNix" title="click to copy" onclick="copyText(this.textContent)">…</div>
+            </div>
+            <div class="hint">Run the matching command on any machine — even across the
+              internet. It generates its own identity, dials out over an outbound
+              connection (no port-forwarding), and joins the mesh automatically.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= WALLET ================= -->
+  <section class="view" id="view-wallet">
+    <div class="hero">
+      <h1>Your wallet</h1>
+      <p>Compute-credits are the mesh's fuel: earn them by donating, spend them by
+        using. Everything you donate is credited to you; everything you use is debited —
+        so the ledger always balances.</p>
+    </div>
+
+    <div class="wallet-hero" id="walletHero"></div>
+
+    <div class="grid">
+      <div class="col-main">
+        <div class="card">
+          <h2><span class="ico">📜</span> Recent activity</h2>
+          <div class="body"><div id="txns" class="txns"><div class="empty">No transactions yet.</div></div></div>
+        </div>
+      </div>
+      <div class="col-side">
+        <div class="card">
+          <h2><span class="ico">🔗</span> Link an account</h2>
+          <div class="body">
+            <p class="lead">Optional. Link a handle to pool credits &amp; reputation across
+              your machines and unlock a larger balance. Anonymous works fully without it.</p>
+            <div id="linkArea">
+              <button class="btn block" onclick="startLink()">Link an account</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <h2><span class="ico">🏆</span> Top contributors</h2>
+          <div class="body"><table><thead><tr><th>Owner</th><th class="num">Donated</th><th class="num">Used</th></tr></thead>
+            <tbody id="leaderboard"></tbody></table></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= EXPLORE ================= -->
+  <section class="view" id="view-explore">
+    <div class="hero">
+      <h1>The global pool</h1>
+      <p>Everything running across the mesh right now — the machines, the compute they
+        pool together, their trust scores, and a live feed of activity.</p>
+    </div>
+
+    <div class="stats" id="exploreStats"></div>
+
+    <div class="grid">
+      <div class="col-main">
+        <div class="card">
+          <h2><span class="ico">🖥️</span> All machines <span class="cnt" id="nodeCnt"></span></h2>
+          <div class="body" id="nodes"><div class="empty">Waiting for machines to join…</div></div>
+        </div>
+      </div>
+      <div class="col-side">
+        <div class="card">
+          <h2><span class="ico">📊</span> Contribution &amp; trust</h2>
+          <div class="body">
+            <table><thead><tr><th>Machine</th><th class="num">Donated</th><th class="num">Used</th><th class="num">Trust</th></tr></thead>
+              <tbody id="ledger"></tbody></table>
+            <div class="hint" id="trustTier"></div>
+          </div>
+        </div>
+        <div class="card">
+          <h2><span class="ico">📡</span> Live activity</h2>
+          <div class="body"><div class="log" id="log"></div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+[Unit]
+Description=MeshPool Node Agent — donate this machine's spare compute
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO_DIR@
+Environment=MESHPOOL_CONTROL_PLANE_URL=@JOIN@
+Environment=MESHPOOL_NAME=@NAME@
+Environment=MESHPOOL_AGENT_HOST=@ADVHOST@
+Environment=MESHPOOL_DONATE_CPU_PCT=@CPU@
+ExecStart=@PY@ -m meshpool.agent.daemon
+Restart=on-failure
+RestartSec=2
+# OS-level enforcement of the donation cap (cgroups v2). The agent also sizes its
+# worker pool from the cap, so the workload can never exceed it (spec §4.1, §5).
+CPUQuota=@CPU@%
+MemoryHigh=2G
+
+[Install]
+WantedBy=multi-user.target

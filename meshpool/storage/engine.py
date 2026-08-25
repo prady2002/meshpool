@@ -179,6 +179,63 @@ class StorageManager:
         self._require_bucket(bucket, actor, "read")
         return [dict(v) for v in self._object_versions.get((bucket, key), [])]
 
+    def list_all_buckets(self, *, actor: str) -> list[dict]:
+        """Return all buckets the actor can read."""
+        result = []
+        for bucket, owner in self._bucket_owners.items():
+            if actor == owner:
+                result.append({"bucket": bucket, "owner": owner, "created_ms": 0})
+            else:
+                perms = self._bucket_acls.get((bucket, actor), set())
+                if "read" in perms or "admin" in perms:
+                    result.append({"bucket": bucket, "owner": owner, "created_ms": 0})
+        return result
+
+    def list_bucket_objects(self, *, actor: str, bucket: str) -> list[dict]:
+        """Return the latest version record for every key in a bucket."""
+        self._require_bucket(bucket, actor, "read")
+        result = []
+        for (b, key), versions in self._object_versions.items():
+            if b == bucket and versions:
+                result.append(dict(versions[-1]))
+        return result
+
+    async def delete_object_version(self, *, actor: str, bucket: str,
+                                     key: str) -> bool:
+        """Delete the latest object version and its blob.  Returns False if not found."""
+        self._require_bucket(bucket, actor, "write")
+        versions = self._object_versions.get((bucket, key), [])
+        if not versions:
+            return False
+        latest = versions[-1]
+        blob_id = latest.get("blob_id", "")
+        self._object_versions[(bucket, key)] = []
+        if blob_id:
+            try:
+                await self.delete(blob_id)
+            except Exception:
+                pass
+        return True
+
+    def delete_bucket(self, *, bucket: str, actor: str) -> bool:
+        """Delete an empty bucket.  Returns False if it does not exist.
+        Raises StorageError if the bucket still has objects."""
+        if bucket not in self._bucket_owners:
+            return False
+        self._require_bucket(bucket, actor, "admin")
+        for (b, _key), versions in self._object_versions.items():
+            if b == bucket and versions:
+                raise StorageError("bucket is not empty")
+        del self._bucket_owners[bucket]
+        for k in [k for k in list(self._bucket_acls.keys()) if k[0] == bucket]:
+            del self._bucket_acls[k]
+        meta_id = _BUCKET_META_PREFIX + hashlib.sha256(bucket.encode("utf-8")).hexdigest()
+        try:
+            self.store.delete_blob(meta_id)
+        except Exception:
+            pass
+        return True
+
     def _require_bucket(self, bucket: str, actor: str, permission: str) -> None:
         owner = self._bucket_owners.get(bucket)
         if owner is None:
@@ -243,11 +300,19 @@ class StorageManager:
 
     # --- placement ------------------------------------------------------- #
     def _pick_nodes(self, count: int, exclude: set) -> list:
-        """Up to ``count`` schedulable nodes not in ``exclude``, roomiest disk first."""
+        """Up to ``count`` schedulable storage nodes not in ``exclude``.
+
+        Nodes are sorted by available disk space (roomiest first) and then
+        reordered by pick_diverse_nodes to maximise failure-domain spread.
+        Adding more nodes to the pool never reduces the returned set -- the
+        diversity layer is a soft tie-breaker, not a hard filter.
+        """
+        from ..controlplane.topology import pick_diverse_nodes
         nodes = [n for n in self.registry.schedulable_nodes()
                  if n.id not in exclude and n.provides("storage")]
+        # Pre-sort by disk so that within a domain we prefer the roomiest node.
         nodes.sort(key=lambda n: n.capability.disk_mb, reverse=True)
-        return nodes[:max(0, count)]
+        return pick_diverse_nodes(nodes, max(0, count))
 
     @staticmethod
     def digest(data: bytes) -> str:
@@ -479,6 +544,12 @@ class StorageManager:
                     name="", replicas=[node.id], replication_desired=1,
                     status="stored", internal=True)
                 self.store.put_blob(shard_blob)
+                if self.audit is not None:
+                    # A repaired shard must be auditable too. new_sid normally
+                    # equals the old id (RS encoding is deterministic, ids are
+                    # content addresses), but re-recording makes the audit path
+                    # correct without depending on that coincidence.
+                    self.audit.record_shard_hashes(new_sid, raw_shard)
                 shard_ids[idx] = new_sid
                 placed_nodes.add(node.id)
             except TransportError as exc:
@@ -671,6 +742,10 @@ class StorageManager:
                         except TransportError:
                             pass
                     self.store.delete_blob(cid)
+                    if self.audit is not None:
+                        # Release the shard's verification material, otherwise
+                        # _chunk_hashes grows without bound across delete cycles.
+                        self.audit.forget_shard(cid)
                 self.store.delete_blob(blob_id)
                 self.events.publish("blob_removed",
                                     {"id": blob_id, "chunks": len(meta.chunks)})

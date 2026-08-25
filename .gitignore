@@ -1,0 +1,46 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# --- Test / tooling caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- MeshPool runtime artifacts ---
+# Sim scenarios + the verify_lan proof write ephemeral cluster state into _data_* dirs
+# (under sim/scenarios/ and at the repo root); ignore them wherever they appear.
+_data_*/
+sim/scenarios/_data_*/
+# SQLite datastores created at runtime (the tracked demo weights .npz is kept).
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+# Scratch files produced by manual/e2e probes.
+_sec.txt
+_*.txt
+_probe_*.py
+_gatelogs/
+full_suite_out*.txt
+# JUnit XML reports written by ad-hoc pytest --junitxml runs.
+report_*.xml
+# First-run marker written next to the launcher scripts in an extracted build.
+.meshpool-deps-ok
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+meshpool_build_spec.md

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshpool"
+version = "1.0.0"
+description = "Turn the machines you already own into one pooled computer — host apps, run batch jobs, and serve models too big for any single machine."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "httpx",
+    "typer",
+    "rich",
+    "pyyaml",
+    "cryptography",
+]
+
+[project.scripts]
+meshpool = "meshpool.cli.main:main"
+meshpool-controlplane = "meshpool.controlplane.app:main"
+meshpool-agent = "meshpool.agent.daemon:main"
+
+[tool.setuptools.packages.find]
+include = ["meshpool*"]
+
+[tool.setuptools.package-data]
+"meshpool.controlplane" = ["static/*"]
+"meshpool.inference" = ["weights/*.npz"]

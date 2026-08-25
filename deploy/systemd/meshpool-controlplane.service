@@ -1,0 +1,21 @@
+[Unit]
+Description=MeshPool Control Plane — pool your machines into one computer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO_DIR@
+Environment=MESHPOOL_HOST=0.0.0.0
+Environment=MESHPOOL_PORT=@PORT@
+Environment=MESHPOOL_SCALE=home
+Environment=MESHPOOL_DATA_DIR=/var/lib/meshpool
+ExecStart=@PY@ -m meshpool.controlplane.app
+Restart=on-failure
+RestartSec=2
+# Resource guardrails (the control plane is lightweight).
+MemoryMax=1G
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

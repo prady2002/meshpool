@@ -1,0 +1,9 @@
+numpy
+fastapi
+uvicorn
+pydantic
+httpx
+typer
+rich
+pyyaml
+cryptography

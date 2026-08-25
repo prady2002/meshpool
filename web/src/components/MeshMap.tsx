@@ -43,6 +43,14 @@ interface Particle {
   t: number; speed: number
 }
 
+/**
+ * Cap on rows rendered in the accessible table. Each row is 9 cells, so an
+ * uncapped table on a 5000-node mesh is 45,000 DOM elements -- enough to make
+ * the page janky purely from layout. The caption states plainly how many rows
+ * are hidden rather than pretending the list is complete.
+ */
+const TABLE_ROW_LIMIT = 250
+
 // ── physics helpers ────────────────────────────────────────────────────────────
 
 function clamp(v: number, lo: number, hi: number) {
@@ -393,6 +401,20 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
     [nodes],
   )
 
+  // node id -> simulated-item id, built once per aggregate.
+  // The table previously did `sNodes.find(n => n.raw.some(r => r.id === node.id))`
+  // INSIDE its row loop, which is O(items x nodes-per-item) per row and becomes
+  // tens of millions of operations per render on a large mesh.
+  const itemIdByNodeId = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const item of aggregate.items) {
+      for (const raw of item.nodes) m.set(raw.id, item.id)
+    }
+    return m
+  }, [aggregate])
+
+  const visibleRows = sortedNodes.slice(0, TABLE_ROW_LIMIT)
+
   // ── render ────────────────────────────────────────────────────────────────
 
   return (
@@ -437,9 +459,19 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
             <div className="space-y-3">
               <div className="flex items-start justify-between gap-2">
                 <div>
-                  <p className="text-xs uppercase tracking-widest text-slate-500">Node detail</p>
-                  <h3 className="mt-1 font-semibold text-slate-100">{selectedNode.name}</h3>
+                  <p className="text-xs uppercase tracking-widest text-slate-500">
+                    {selectedSNode.raw.length > 1 ? 'Group detail' : 'Node detail'}
+                  </p>
+                  <h3 className="mt-1 font-semibold text-slate-100">
+                    {selectedSNode.raw.length > 1 ? selectedSNode.label : selectedNode.name}
+                  </h3>
                   <p className="mt-0.5 text-xs text-slate-500">{selectedNode.owner}</p>
+                  {selectedSNode.raw.length > 1 ? (
+                    <p className="mt-1 text-xs text-amber-400/80">
+                      This marker represents {selectedSNode.raw.length} nodes. The figures
+                      below are for {selectedNode.name} only, not a group total.
+                    </p>
+                  ) : null}
                 </div>
                 <span className="rounded-full px-2 py-0.5 text-xs font-semibold"
                   style={{ backgroundColor: `${STATUS_COLOR[selectedNode.status]}22`, color: STATUS_COLOR[selectedNode.status] }}>
@@ -579,7 +611,10 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
             <table className="min-w-full text-sm">
               <caption className="py-3 text-xs text-slate-500">
                 Mesh nodes — {nodes.length} total, {nodes.filter((n) => n.status === 'online').length} online.
-                Positions in the canvas above are synthesised from mesh topology, not geography.
+                {sortedNodes.length > TABLE_ROW_LIMIT
+                  ? ` Showing the first ${TABLE_ROW_LIMIT} rows; ${sortedNodes.length - TABLE_ROW_LIMIT} more are not listed.`
+                  : ''}
+                {' '}Positions in the canvas above are synthesised from mesh topology, not geography.
               </caption>
               <thead className="border-b border-slate-800 bg-slate-950/70">
                 <tr>
@@ -589,13 +624,13 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800">
-                {sortedNodes.map((node) => {
-                  const sn = sNodesRef.current.find((n) => n.raw.some((r) => r.id === node.id))
-                  const isRowSelected = selectedId != null && sn?.id === selectedId
+                {visibleRows.map((node) => {
+                  const snId = itemIdByNodeId.get(node.id)
+                  const isRowSelected = selectedId != null && snId === selectedId
                   return (
                     <tr key={node.id}
                       className={`cursor-pointer transition hover:bg-slate-900/50 ${isRowSelected ? 'bg-indigo-950/30' : ''}`}
-                      onClick={() => setSelectedId(sn?.id ?? node.id)}
+                      onClick={() => setSelectedId(snId ?? node.id)}
                       role="row">
                       <td className="px-4 py-3 font-medium text-slate-200">{node.name}</td>
                       <td className="px-4 py-3">

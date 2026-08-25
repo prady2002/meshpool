@@ -1,0 +1,50 @@
+# MeshPool public coordinator.
+#
+# Agents connect outbound to MESHPOOL_CONTROL_PLANE_URL. Put a TLS reverse
+# proxy (Caddy, nginx, Traefik, or your cloud load balancer) in front so that
+# contributors use HTTPS/WSS; do not expose a public coordinator as plain HTTP.
+
+services:
+  coordinator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: meshpool-coordinator:latest
+    restart: unless-stopped
+    environment:
+      MESHPOOL_SCALE: public
+      MESHPOOL_PORT: "8080"
+      MESHPOOL_DATA_DIR: /data
+      # Replace with the public HTTPS origin agents and browsers use.
+      MESHPOOL_CONTROL_PLANE_URL: https://meshpool.example.com
+    volumes:
+      - coordinator-data:/data
+    # For direct testing only. In production, bind to localhost or a private
+    # network and publish the TLS reverse proxy on 443 instead.
+    ports:
+      - "8080:8080"
+
+  # Optional Caddy example for automatic HTTPS:
+  #
+  # caddy:
+  #   image: caddy:2
+  #   restart: unless-stopped
+  #   depends_on: [coordinator]
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - caddy-data:/data
+  #     - caddy-config:/config
+  #   command:
+  #     - caddy
+  #     - reverse-proxy
+  #     - --from
+  #     - meshpool.example.com
+  #     - --to
+  #     - coordinator:8080
+
+volumes:
+  coordinator-data:
+  # caddy-data:
+  # caddy-config:

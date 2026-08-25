@@ -1,0 +1,401 @@
+"""Unit tests for the dynamic (process) hosting path.
+
+These lock down the pieces that let MeshPool host an app *with its own backend* (not
+just static files): launching the deployer's server on the injected ``$PORT``
+(:func:`meshpool.agent.runtime.start_proc_app`), the relaxed "any response = up"
+health check that supports servers without a ``/healthz`` route
+(:meth:`HostingManager._healthy`), the ``index.html``-optional bundle validation, and
+the CLI's Procfile/``meshpool.json`` start-command auto-detection.
+"""
+from __future__ import annotations
+
+import asyncio
+import asyncio
+import base64
+import time
+import types
+
+import httpx
+import pytest
+
+from meshpool.agent import runtime
+from meshpool.cli.main import _detect_start_cmd
+from meshpool.common.models import Deployment, Replica
+from meshpool.common.transport import HttpTransport
+from meshpool.hosting import site
+from meshpool.hosting.engine import HostingManager
+
+
+def b64(s: str) -> str:
+    return base64.b64encode(s.encode()).decode()
+
+
+# a tiny, self-contained backend that honours $PORT and echoes the injected env,
+# proving it is a real *process* (not static file serving)
+_SERVER_PY = (
+    "import os\n"
+    "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n"
+    "PORT = int(os.environ['PORT'])\n"
+    "class H(BaseHTTPRequestHandler):\n"
+    "    def do_GET(self):\n"
+    "        body = ('PORT=%s RID=%s' % (PORT, os.environ.get('MESHPOOL_REPLICA_ID',''))).encode()\n"
+    "        self.send_response(200)\n"
+    "        self.send_header('Content-Length', str(len(body)))\n"
+    "        self.end_headers()\n"
+    "        self.wfile.write(body)\n"
+    "    def log_message(self, *a):\n"
+    "        pass\n"
+    "ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()\n"
+)
+
+
+# --------------------------- start_proc_app -------------------------------- #
+def test_start_proc_app_launches_a_real_server_on_injected_port(tmp_path):
+    (tmp_path / "server.py").write_text(_SERVER_PY, encoding="utf-8")
+    port = runtime.free_port()
+    try:
+        proc = runtime.start_proc_app(str(tmp_path), "python server.py", port,
+                                      replica_id="rtest", node_name="node-x")
+    except OSError:
+        pytest.skip("no 'python' on PATH for the spawned child")
+    try:
+        body = ""
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise AssertionError("server process exited before binding")
+            try:
+                r = httpx.get(f"http://127.0.0.1:{port}/", timeout=0.5)
+                if r.status_code == 200:
+                    body = r.text
+                    break
+            except httpx.HTTPError:
+                time.sleep(0.1)
+        assert f"PORT={port}" in body, f"server did not bind injected $PORT: {body!r}"
+        assert "RID=rtest" in body, f"replica id env not injected: {body!r}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            proc.kill()
+
+
+def test_start_proc_app_substitutes_port_token_and_injects_env(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_popen(args, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs.get("env", {})
+        return types.SimpleNamespace(poll=lambda: None, terminate=lambda: None)
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", fake_popen)
+    runtime.start_proc_app(str(tmp_path), "python server.py --port {port}", 54321,
+                           replica_id="r7", node_name="node-9")
+    assert "54321" in captured["args"], captured["args"]
+    assert "{port}" not in " ".join(captured["args"])
+    env = captured["env"]
+    assert env.get("PORT") == "54321" and env.get("MESHPOOL_APP_PORT") == "54321"
+    assert env.get("MESHPOOL_REPLICA_ID") == "r7" and env.get("MESHPOOL_NODE_NAME") == "node-9"
+
+
+def test_start_proc_app_applies_user_env_but_reserved_vars_win(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_popen(args, **kwargs):
+        captured["env"] = kwargs.get("env", {})
+        return types.SimpleNamespace(poll=lambda: None, terminate=lambda: None)
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", fake_popen)
+    runtime.start_proc_app(
+        str(tmp_path), "python server.py", 45000, replica_id="r1", node_name="n1",
+        env_extra={"DATABASE_URL": "postgres://db/app", "PORT": "1",
+                   "MESHPOOL_REPLICA_ID": "hacked"})
+    env = captured["env"]
+    # the deployer's own config reaches the app ...
+    assert env.get("DATABASE_URL") == "postgres://db/app"
+    # ... but the reserved platform vars always win over user-supplied values
+    assert env.get("PORT") == "45000"
+    assert env.get("MESHPOOL_REPLICA_ID") == "r1"
+
+
+def test_start_proc_app_rejects_empty_command(tmp_path):
+    with pytest.raises(ValueError, match="empty start command"):
+        runtime.start_proc_app(str(tmp_path), "   ", 8000)
+
+
+# --------------------------- log capture ----------------------------------- #
+def test_log_buffer_is_bounded_and_returns_ordered_tail():
+    buf = runtime.LogBuffer(maxlen=500)
+    for i in range(600):
+        buf.append(f"line-{i}")
+    all_lines = buf.tail(1000)
+    assert len(all_lines) == 500                 # oldest 100 dropped by the ring buffer
+    assert all_lines[0] == "line-100"            # order preserved, tail kept
+    assert all_lines[-1] == "line-599"
+    assert buf.tail(3) == ["line-597", "line-598", "line-599"]
+
+
+def test_start_proc_app_captures_child_stdout_and_stderr(tmp_path):
+    (tmp_path / "logger.py").write_text(
+        "import sys\n"
+        "print('hello-from-app-stdout', flush=True)\n"
+        "print('warning-on-stderr', file=sys.stderr, flush=True)\n"
+        "print('app-ready-marker', flush=True)\n",
+        encoding="utf-8")
+    buf = runtime.LogBuffer()
+    try:
+        proc = runtime.start_proc_app(str(tmp_path), "python -u logger.py", 8000,
+                                      replica_id="rlog", log_buffer=buf)
+    except OSError:
+        pytest.skip("no 'python' on PATH for the spawned child")
+    try:
+        deadline = time.time() + 6
+        while time.time() < deadline and len(buf.tail(50)) < 3:
+            time.sleep(0.1)
+        lines = buf.tail(50)
+        assert "hello-from-app-stdout" in lines           # stdout captured
+        assert "warning-on-stderr" in lines               # stderr merged in too
+        assert "app-ready-marker" in lines
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            proc.kill()
+
+
+# --------------------------- clean_env validation -------------------------- #
+def test_clean_env_accepts_valid_and_coerces_values():
+    out = site.clean_env({"DATABASE_URL": "x", "DEBUG": 1, "EMPTY": None})
+    assert out == {"DATABASE_URL": "x", "DEBUG": "1", "EMPTY": ""}
+
+
+def test_clean_env_none_or_empty_is_empty_dict():
+    assert site.clean_env(None) == {}
+    assert site.clean_env({}) == {}
+
+
+@pytest.mark.parametrize("bad", ["1BAD", "has space", "DASH-KEY", "", "a.b"])
+def test_clean_env_rejects_bad_key(bad):
+    with pytest.raises(ValueError, match="invalid env var name"):
+        site.clean_env({bad: "x"})
+
+
+def test_clean_env_enforces_count_cap(monkeypatch):
+    monkeypatch.setattr(site, "MAX_ENV_VARS", 3)
+    with pytest.raises(ValueError, match="too many env vars"):
+        site.clean_env({f"K{i}": "v" for i in range(4)})
+
+
+def test_clean_env_enforces_byte_cap(monkeypatch):
+    monkeypatch.setattr(site, "MAX_ENV_BYTES", 10)
+    with pytest.raises(ValueError, match="exceeds"):
+        site.clean_env({"KEY": "a value that is definitely longer than ten bytes"})
+
+
+# --------------------------- _healthy relaxation --------------------------- #
+def _manager_with_transport(behavior) -> HostingManager:
+    class FakeTransport:
+        async def proxy(self, node_id, method, url, **kwargs):
+            return behavior(url)
+
+    mgr = object.__new__(HostingManager)   # bypass __init__: _healthy only needs transport
+    mgr.transport = FakeTransport()
+    return mgr
+
+
+def _replica() -> Replica:
+    return Replica(id="r1", node_id="n1", node_name="node-1", url="http://10.0.0.1:9000")
+
+
+def test_healthy_true_when_app_answers_even_without_healthz():
+    # a process app with no /healthz returns 404 there -> still "up" (any response)
+    mgr = _manager_with_transport(lambda url: types.SimpleNamespace(status_code=404))
+    assert asyncio.run(mgr._healthy(_replica())) is True
+
+
+def test_healthy_true_on_200():
+    mgr = _manager_with_transport(lambda url: types.SimpleNamespace(status_code=200))
+    assert asyncio.run(mgr._healthy(_replica())) is True
+
+
+def test_healthy_false_when_connection_refused():
+    def boom(url):
+        raise httpx.ConnectError("connection refused")
+
+    mgr = _manager_with_transport(boom)
+    assert asyncio.run(mgr._healthy(_replica())) is False
+
+
+def test_healthy_false_when_server_errors_on_every_path():
+    mgr = _manager_with_transport(lambda url: types.SimpleNamespace(status_code=502))
+    assert asyncio.run(mgr._healthy(_replica())) is False
+
+
+# --------------------------- index-optional bundles ------------------------ #
+def test_normalize_site_allows_no_index_for_process_apps():
+    bundle = {"server.py": b64("print('hi')"), "requirements.txt": b64("flask\n")}
+    out = site.normalize_site(bundle, require_index=False)
+    assert set(out) == {"server.py", "requirements.txt"}
+
+
+def test_normalize_site_still_requires_index_by_default():
+    with pytest.raises(ValueError, match="index.html"):
+        site.normalize_site({"server.py": b64("print('hi')")})
+
+
+def test_pack_dir_no_index_when_not_required(tmp_path):
+    (tmp_path / "server.py").write_text("print('hi')", encoding="utf-8")
+    (tmp_path / "Procfile").write_text("web: python server.py\n", encoding="utf-8")
+    bundle = site.pack_dir(str(tmp_path), require_index=False)
+    assert "server.py" in bundle and "Procfile" in bundle
+
+
+# --------------------------- CLI start-command detection ------------------- #
+def test_detect_start_cmd_from_procfile(tmp_path):
+    (tmp_path / "Procfile").write_text("web: gunicorn app:app --port {port}\n", encoding="utf-8")
+    assert _detect_start_cmd(tmp_path) == "gunicorn app:app --port {port}"
+
+
+def test_detect_start_cmd_from_manifest(tmp_path):
+    (tmp_path / "meshpool.json").write_text('{"start": "node server.js"}', encoding="utf-8")
+    assert _detect_start_cmd(tmp_path) == "node server.js"
+
+
+def test_detect_start_cmd_procfile_wins_over_manifest(tmp_path):
+    (tmp_path / "Procfile").write_text("web: python server.py\n", encoding="utf-8")
+    (tmp_path / "meshpool.json").write_text('{"start": "node server.js"}', encoding="utf-8")
+    assert _detect_start_cmd(tmp_path) == "python server.py"
+
+
+def test_detect_start_cmd_static_site_returns_empty(tmp_path):
+    (tmp_path / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
+    assert _detect_start_cmd(tmp_path) == ""
+
+
+# --------------------------- session affinity ------------------------------ #
+def _manager_with_deployment(dep) -> HostingManager:
+    class FakeStore:
+        def get_deployment(self, dep_id):
+            return dep if (dep is not None and dep.id == dep_id) else None
+
+    mgr = object.__new__(HostingManager)   # bypass __init__: sticky only needs the store
+    mgr.store = FakeStore()
+    return mgr
+
+
+def _dep_with(replicas) -> Deployment:
+    return Deployment(id="dep-1", name="app", app="proc", site=None,
+                      start_cmd="python server.py", replicas_desired=2,
+                      replicas=replicas, owner="o", status="running")
+
+
+def test_sticky_replica_returns_pinned_replica_when_healthy():
+    r = Replica(id="rA", node_id="n1", node_name="node-1", url="http://x", healthy=True)
+    mgr = _manager_with_deployment(_dep_with([r]))
+    assert mgr.sticky_replica("dep-1", "rA") is r
+
+
+def test_sticky_replica_none_when_pinned_replica_unhealthy():
+    r = Replica(id="rA", node_id="n1", url="http://x", healthy=False)
+    mgr = _manager_with_deployment(_dep_with([r]))
+    assert mgr.sticky_replica("dep-1", "rA") is None   # -> caller round-robins instead
+
+
+def test_sticky_replica_none_when_pinned_replica_already_tried():
+    r = Replica(id="rA", node_id="n1", url="http://x", healthy=True)
+    mgr = _manager_with_deployment(_dep_with([r]))
+    assert mgr.sticky_replica("dep-1", "rA", exclude={"rA"}) is None   # failover skips it
+
+
+def test_sticky_replica_none_when_id_unknown_or_blank():
+    r = Replica(id="rA", node_id="n1", url="http://x", healthy=True)
+    mgr = _manager_with_deployment(_dep_with([r]))
+    assert mgr.sticky_replica("dep-1", "rZ") is None
+    assert mgr.sticky_replica("dep-1", "") is None
+
+
+def test_sticky_replica_none_when_deployment_missing():
+    mgr = _manager_with_deployment(None)
+    assert mgr.sticky_replica("dep-1", "rA") is None
+
+
+# --------------------------- deployment removal ---------------------------- #
+def _manager_for_remove(dep):
+    """Wire a HostingManager with just enough fakes to exercise remove()."""
+    stopped: list[str] = []
+    deleted: list[str] = []
+
+    class FakeStore:
+        def get_deployment(self, dep_id):
+            return dep if (dep is not None and dep.id == dep_id) else None
+
+        def delete_deployment(self, dep_id):
+            deleted.append(dep_id)
+
+    class FakeRegistry:
+        def get(self, node_id):
+            return types.SimpleNamespace(id=node_id)
+
+    class FakeTransport:
+        async def call(self, node_id, method, payload, timeout=None):
+            if method == "stop_replica":
+                stopped.append(payload["replica_id"])
+            return {}
+
+    class FakeEvents:
+        def publish(self, *a, **k):
+            pass
+
+    mgr = object.__new__(HostingManager)   # bypass __init__: remove only needs these attrs
+    mgr.store = FakeStore()
+    mgr.registry = FakeRegistry()
+    mgr.transport = FakeTransport()
+    mgr.events = FakeEvents()
+    mgr._rr = {"dep-1": 3}
+    mgr._lock = asyncio.Lock()
+    return mgr, stopped, deleted
+
+
+def test_remove_stops_every_replica_then_deletes_deployment():
+    r1 = Replica(id="rA", node_id="n1", node_name="node-1", url="http://x", healthy=True)
+    r2 = Replica(id="rB", node_id="n2", node_name="node-2", url="http://y", healthy=True)
+    mgr, stopped, deleted = _manager_for_remove(_dep_with([r1, r2]))
+
+    assert asyncio.run(mgr.remove("dep-1")) is True
+    assert sorted(stopped) == ["rA", "rB"]     # both replicas told to stop across the pool
+    assert deleted == ["dep-1"]                 # store row removed
+    assert "dep-1" not in mgr._rr               # round-robin cursor cleaned up
+
+
+def test_remove_unknown_deployment_returns_false_and_touches_nothing():
+    mgr, stopped, deleted = _manager_for_remove(None)
+    assert asyncio.run(mgr.remove("dep-1")) is False
+    assert stopped == [] and deleted == []
+
+
+# --------------------------- header passthrough ---------------------------- #
+def test_http_transport_proxy_forwards_request_and_response_headers():
+    captured = {}
+
+    class FakeClient:
+        async def request(self, method, url, **kwargs):
+            captured["method"] = method
+            captured["url"] = url
+            captured["headers"] = kwargs.get("headers")
+            captured["content"] = kwargs.get("content")
+            return httpx.Response(200, headers={"set-cookie": "sid=abc; Path=/"},
+                                  content=b"ok")
+
+    t = HttpTransport(registry=None, client=FakeClient())
+    res = asyncio.run(t.proxy("n1", "POST", "http://10.0.0.1:9000/login",
+                              headers={"cookie": "sid=abc", "content-type": "application/json"},
+                              content=b"{}"))
+    # the client's real headers reach the app (so logins / sessions work)
+    assert captured["headers"] == {"cookie": "sid=abc", "content-type": "application/json"}
+    assert captured["content"] == b"{}"
+    # and the app's own response headers (Set-Cookie!) come back for the browser
+    assert res.status_code == 200
+    assert res.headers.get("set-cookie") == "sid=abc; Path=/"
+

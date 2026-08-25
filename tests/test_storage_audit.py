@@ -710,3 +710,90 @@ class TestEscrowForfeitedOnFail:
         # No credits in the ledger
         assert ledger.credits(target_node) == 0.0, (
             "Forfeited escrow must not appear as donated credits")
+
+
+# ---------------------------------------------------------------------------
+# Group 6: A blinded auditor must never masquerade as a healthy one
+# ---------------------------------------------------------------------------
+
+class TestBlindedAuditorNeverReportsPasses:
+    """``_chunk_hashes`` is in-memory only, so a control-plane restart wipes every
+    shard's verification material.
+
+    Before the fix, ``audit_shard`` returned True for a shard it had no material
+    for and ``run_audit_pass`` counted that as ``passed`` -- so a restarted
+    coordinator reported "100% of audits passing" while verifying precisely
+    nothing.  That is the worst possible failure mode for a trust component,
+    because total loss of the security property is indistinguishable from
+    success.
+
+    These tests pin both halves of the fix:
+      1. material is rebaselined from digest-verified bytes when reachable, and
+      2. when it cannot be rebaselined the shard is ``skipped``, never ``passed``.
+    """
+
+    def test_restart_rebaselines_from_digest_verified_bytes(self, tmp_path):
+        rng = random.Random(101)
+        node_ids = [f"n{i}" for i in range(9)]
+        mgr, reg, store, transport, events, audit, ledger = _manager_with_audit(
+            node_ids, rng=rng)
+
+        data = bytes(rng.getrandbits(8) for _ in range(4096 * 7))
+        meta = asyncio.run(mgr.put(data, erasure=True, ec_k=6, ec_m=3))
+        assert meta.chunks
+
+        # Simulate a control-plane restart: all verification material is gone.
+        audit._chunk_hashes.clear()
+        assert not any(audit.has_shard_info(s) for s in meta.chunks)
+
+        summary = asyncio.run(audit.run_audit_pass(mgr, transport))
+
+        assert summary["passed"] > 0, (
+            "auditor should rebaseline from digest-verified shard bytes and "
+            f"then really audit; got {summary}")
+        assert summary["failed"] == 0, f"honest nodes must not fail: {summary}"
+        assert all(audit.has_shard_info(s) for s in meta.chunks), (
+            "every audited shard should have material again after rebaseline")
+
+    def test_unrebaselinable_shard_is_skipped_not_passed(self, tmp_path):
+        """NON-VACUITY: when the bytes cannot be re-fetched the auditor must
+        report ``skipped``, and must NOT inflate ``passed``."""
+        rng = random.Random(202)
+        node_ids = [f"n{i}" for i in range(9)]
+        mgr, reg, store, transport, events, audit, ledger = _manager_with_audit(
+            node_ids, rng=rng)
+
+        data = bytes(rng.getrandbits(8) for _ in range(4096 * 7))
+        meta = asyncio.run(mgr.put(data, erasure=True, ec_k=6, ec_m=3))
+
+        # Restart wipes material, AND every holder refuses to serve the bytes
+        # (still "online", so they are not simply skipped as offline).
+        audit._chunk_hashes.clear()
+        for nid in node_ids:
+            transport.disks[nid].clear()
+
+        summary = asyncio.run(audit.run_audit_pass(mgr, transport))
+
+        assert summary["passed"] == 0, (
+            "a blinded auditor must never report a pass -- this is exactly the "
+            f"bug that makes total verification loss look like success: {summary}")
+        assert summary["skipped"] > 0, (
+            f"unauditable shards must be reported as skipped: {summary}")
+
+    def test_forget_shard_releases_material_on_delete(self, tmp_path):
+        """Deleted blobs must not leak verification material forever."""
+        rng = random.Random(303)
+        node_ids = [f"n{i}" for i in range(9)]
+        mgr, reg, store, transport, events, audit, ledger = _manager_with_audit(
+            node_ids, rng=rng)
+
+        data = bytes(rng.getrandbits(8) for _ in range(4096 * 7))
+        meta = asyncio.run(mgr.put(data, erasure=True, ec_k=6, ec_m=3))
+        shard_ids = list(meta.chunks)
+        assert any(audit.has_shard_info(s) for s in shard_ids)
+
+        assert asyncio.run(mgr.delete(meta.id)) is True
+
+        assert not any(audit.has_shard_info(s) for s in shard_ids), (
+            "delete must release per-shard audit material, otherwise "
+            "_chunk_hashes grows without bound")

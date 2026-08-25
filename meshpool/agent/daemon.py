@@ -348,6 +348,11 @@ async def _register_once(client: httpx.AsyncClient, st: "AgentState | None" = No
         enroll_token=st.enroll_token,
         device_id=st.identity.device_id, public_key=st.identity.public_key_b64,
         signature=signature, ts_ms=ts,
+        # MESHPOOL_FAILURE_DOMAIN lets the simulation harness inject synthetic
+        # domain labels so gates can test correlated-failure scenarios with real
+        # OS processes on a single host.  In production this env var is unset and
+        # the control plane auto-infers the domain from the URL + owner.
+        failure_domain=os.environ.get("MESHPOOL_FAILURE_DOMAIN") or None,
     )
     try:
         r = await client.post(

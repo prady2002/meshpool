@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- MeshPool node agent (macOS launchd). Installed to
+     ~/Library/LaunchAgents/com.meshpool.agent.plist by deploy/install.sh. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.meshpool.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@PY@</string>
+        <string>-m</string>
+        <string>meshpool.agent.daemon</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@REPO_DIR@</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MESHPOOL_CONTROL_PLANE_URL</key>
+        <string>@JOIN@</string>
+        <key>MESHPOOL_NAME</key>
+        <string>@NAME@</string>
+        <key>MESHPOOL_AGENT_HOST</key>
+        <string>@ADVHOST@</string>
+        <key>MESHPOOL_DONATE_CPU_PCT</key>
+        <string>@CPU@</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Keep MeshPool out of the way of the user: run at a low priority. -->
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

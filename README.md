@@ -441,6 +441,26 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
 
 ## ⚖️ Honest constraints (we report real numbers, never invented ones)
 
+- **Hard spend caps stop work — and everything else about billing does not exist yet.**
+  A cap set via `PUT /api/v1/account/spend-cap` genuinely halts execution: new work is
+  refused with HTTP 402 at all twelve work-creating endpoints, and the batch dispatcher
+  re-checks before handing out each further unit, so a job already running is stopped
+  mid-flight rather than allowed to overrun. Units already in flight are permitted to
+  finish. Proven end-to-end by `sim/scenarios/verify_spend_cap_hard_stop.py`, which
+  includes a non-vacuity control showing the identical job completes when uncapped.
+  What does **not** exist: real money, payouts, invoices, or fiat rails. The cap is
+  denominated in internal compute-credits. Owners are **uncapped by default** — set
+  `MESHPOOL_DEFAULT_SPEND_CAP` to change that. The console reports `enforced: false`
+  when no cap is set rather than displaying a number nothing applies.
+- **Proof-of-storage audits are per-chunk hashes, not a Merkle tree or PoRep.** Nodes are
+  challenged on a random chunk offset and must return its SHA-256. A node that deleted the
+  bytes fails. A determined cheater *can* defeat this by caching the chunk hash table
+  (~8 KB per 1 MB shard) instead of the data; the defence is economic (escrow forfeit
+  exceeds the storage saved), not cryptographic. Audit material lives in memory and is
+  rebuilt after a restart by re-fetching shards, which is safe because shard ids are
+  content addresses. Crucially, a shard whose material cannot be rebuilt is reported as
+  **skipped, never as passed** — a blinded auditor must not look like a healthy one.
+
 - **Single-machine training today; not *distributed* training.** Local **LoRA fine-tuning**
   of the nano-GPT over a frozen base ships and is gradient-checked
   (`python -m meshpool.inference.lora`); *distributed* training over the pool stays deferred —

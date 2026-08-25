@@ -36,6 +36,7 @@ from ..batch.engine import BatchManager
 from ..batch.dag import DagError, DagManager
 from ..cloud.tunnel import CompositeTransport, TunnelHub, HDR_NODE_TOKEN
 from .accounts import AccountManager, MAX_ACTIVE_JOBS_PER_OWNER
+from .spend import SpendCapManager
 from .registry import EventBus, NodeRegistry, schedulable
 from .timeline import JobTimeline
 
@@ -96,6 +97,11 @@ class ControlPlane:
         # Anonymous devices work fully; this just resolves the owner that earns and
         # spends credits and enforces earn-to-spend for strangers.
         self.accounts = AccountManager(self.store, self.ledger, settings.trust_tier)
+        # Hard spend caps (plan §6.3): a cap STOPS work rather than emailing about
+        # it afterwards. Enforced at every tier -- protection from bill shock is a
+        # user safety property, not a public-mesh billing feature. Owners are
+        # uncapped unless a cap is set or MESHPOOL_DEFAULT_SPEND_CAP is configured.
+        self.spend_caps = SpendCapManager(self.store)
         # Donations credit the resolved owner (linked account, else the device).
         self.registry.owner_resolver = self.accounts.owner_for_device
         self.client = httpx.AsyncClient()
@@ -126,6 +132,9 @@ class ControlPlane:
         self.inference = None  # set in app wiring (M5)
         self.storage = None    # set in app wiring (P3 pooled object store)
         self.storage_audit = None  # set in app wiring (proof-of-storage audit engine)
+        # S3-compatible API: access_key_id -> (secret_key, owner_subject).
+        # Created via POST /api/v1/s3/credentials; in-memory only.
+        self.s3_credentials: dict[str, tuple[str, str]] = {}
 
     def _node_reachable(self, node) -> bool:
         """Whether the scheduler can actually deliver work to ``node`` right now.
@@ -188,6 +197,17 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
         # User WASM modules are distributed through the pooled object store, so the
         # batch engine needs the same handle.
         CP.batch.storage = CP.storage
+        # Hard spend caps must reach the dispatcher, not just the API: a cap
+        # enforced only at submission cannot stop a job that is already running.
+        CP.batch.spend_caps = CP.spend_caps
+        # Workload-matched result verification (spec §P6).  Only wired at Tier 2
+        # (public/adversarial) where strangers donate compute and lying is profitable.
+        # At lower tiers the verifier stays None and all guards in the engine fail-open,
+        # so LAN behaviour is completely unchanged.
+        if settings.trust_tier >= 2:
+            from .verification import ComputeEscrowEngine, Verifier, VerificationPolicy
+            _vp = VerificationPolicy()
+            CP.batch.verifier = Verifier(ledger=CP.ledger, policy=_vp)
         # Audit interval from env so tests can shrink it.
         _audit_interval = float(os.environ.get("MESHPOOL_AUDIT_INTERVAL_S", "60"))
         tasks = [
@@ -272,6 +292,25 @@ class DeploySubmit(BaseModel):
 class ModelDeploySubmit(BaseModel):
     model: str = "nano-gpt"
     owner: str = "default"
+
+
+class SpendCapBody(BaseModel):
+    # None clears the cap (the owner becomes uncapped). Negative values are
+    # rejected by SpendCapManager.set_cap.
+    cap: Optional[float] = None
+
+
+class RttReport(BaseModel):
+    """Vivaldi RTT observation reported by an agent.
+
+    ``from_node`` identifies the reporting node; ``to_node`` is the peer.
+    In ``auth_mode=open`` the caller-supplied ids are trusted verbatim (same as
+    heartbeat).  In ``auth_mode=enforced`` the handler verifies the
+    X-MeshPool-Node-Token header and overrides ``from_node`` with the verified id.
+    """
+    from_node: str
+    to_node: str
+    rtt_ms: float
 
 
 class InferSubmit(BaseModel):
@@ -409,10 +448,35 @@ def _get_request_principal(request: Request, cp: "ControlPlane") -> Principal:
         if owner:
             return mint_session_principal(owner)
 
-    # 4. Loopback (Tier 0-1 only; Tier 2 requires an explicit credential)
+    # 4. Authorization: Bearer <token> — OpenAI-compatible surface.
+    #    Treat the Bearer value as a session token so existing OpenAI SDK callers
+    #    can authenticate by setting their API key to a MeshPool session token.
+    auth_hdr = request.headers.get("Authorization", "")
+    if auth_hdr.lower().startswith("bearer "):
+        bearer_tok = auth_hdr[7:].strip()
+        if bearer_tok:
+            owner = cp.accounts.owner_for_session(bearer_tok)
+            if owner:
+                return mint_session_principal(owner)
+            # Also accept a signed capability token delivered as a Bearer value
+            verifier = _token_verifier(cp)
+            if verifier:
+                p = verifier.verify(bearer_tok)
+                if p and not p.is_expired():
+                    return p
+
+    # 5. Loopback (Tier 0-1 only; Tier 2 requires an explicit credential)
     if cp.settings.trust_tier < 2 and _is_loopback(request):
         subject = cp.accounts.owner_for_device(cp.identity.device_id)
         return mint_loopback_principal(subject)
+
+    # 6. AWS SigV4 (S3-compatible API callers such as boto3)
+    auth_hdr2 = request.headers.get("Authorization", "")
+    if auth_hdr2.startswith("AWS4-HMAC-SHA256 "):
+        from ..storage.s3_api import verify_sigv4_request
+        p = verify_sigv4_request(request, cp)
+        if p is not None:
+            return p
 
     return None  # type: ignore[return-value]  # no credential
 
@@ -603,6 +667,16 @@ def _consumer_owner(cp: "ControlPlane", request: Request, body_owner: str) -> st
 
 
 def _require_credits(cp: "ControlPlane", owner: str) -> None:
+    # A hard spend cap stops work before anything else is considered: the whole
+    # point of the guarantee is that reaching the cap cannot be worked around by
+    # having credits available. Checked here so all twelve work-creating
+    # endpoints inherit it from one place.
+    if cp.spend_caps.exceeded(owner):
+        st = cp.spend_caps.status(owner)
+        raise HTTPException(status_code=402, detail=(
+            f"spend cap reached for {owner}: {st['spent']} of {st['cap']} "
+            f"compute-credits used. Work is stopped, not just flagged. Raise the "
+            f"cap or reset the spend window via PUT /api/v1/account/spend-cap"))
     if not cp.accounts.can_spend(owner):
         raise HTTPException(status_code=402, detail=(
             f"insufficient compute-credits for {owner}: donate spare compute to earn "
@@ -775,6 +849,13 @@ def _register_routes(app: FastAPI) -> None:
     # Authenticated routes — scope required.
     _declare_route("POST",   "/api/v1/account/link/complete", Scope.WALLET_READ)
     _declare_route("GET",    "/api/v1/wallet",                Scope.WALLET_READ)
+    # Spend caps are the user's own safety limit on their own account, so the
+    # owner may set them with wallet:write -- no admin scope. Raising a cap is
+    # exactly as sensitive as spending, and it is already gated by the same
+    # session-resolved owner as /api/v1/wallet.
+    _declare_route("GET",    "/api/v1/account/spend-cap",       Scope.WALLET_READ)
+    _declare_route("PUT",    "/api/v1/account/spend-cap",       Scope.WALLET_WRITE)
+    _declare_route("POST",   "/api/v1/account/spend-cap/reset", Scope.WALLET_WRITE)
     _declare_route("GET",    "/api/v1/ledger",                Scope.LEDGER_READ)
     _declare_route("GET",    "/api/v1/cluster",               Scope.NODES_READ)
     _declare_route("GET",    "/api/v1/nodes",                 Scope.NODES_READ)
@@ -787,6 +868,7 @@ def _register_routes(app: FastAPI) -> None:
     _declare_route("GET",    "/api/v1/jobs",                  Scope.JOBS_READ)
     _declare_route("GET",    "/api/v1/jobs/{job_id}",         Scope.JOBS_READ)
     _declare_route("GET",    "/api/v1/jobs/{job_id}/timeline", Scope.JOBS_READ)
+    _declare_route("GET",    "/api/v1/verification",           Scope.JOBS_READ)
     _declare_route("POST",   "/api/v1/dags",                  Scope.JOBS_WRITE)
     _declare_route("GET",    "/api/v1/dags",                  Scope.JOBS_READ)
     _declare_route("GET",    "/api/v1/dags/{dag_id}",         Scope.JOBS_READ)
@@ -799,6 +881,7 @@ def _register_routes(app: FastAPI) -> None:
     _declare_route("POST",   "/api/v1/blobs",                 Scope.BLOBS_WRITE)
     _declare_route("GET",    "/api/v1/blobs",                 Scope.BLOBS_READ)
     _declare_route("GET",    "/api/v1/blobs/{blob_id}",       Scope.BLOBS_READ)
+    _declare_route("GET",    "/api/v1/durability",            Scope.BLOBS_READ)
     _declare_route("DELETE", "/api/v1/blobs/{blob_id}",       Scope.BLOBS_WRITE)
     _declare_route("POST",   "/api/v1/buckets/{bucket}",      Scope.BLOBS_WRITE)
     _declare_route("POST",   "/api/v1/buckets/{bucket}/acl",  Scope.BLOBS_WRITE)
@@ -816,15 +899,45 @@ def _register_routes(app: FastAPI) -> None:
     _declare_route("GET",    "/api/v1/models/{model_id}",     Scope.MODELS_READ)
     _declare_route("DELETE", "/api/v1/models/{model_id}",     Scope.MODELS_WRITE)
     _declare_route("POST",   "/api/v1/inference/chat",        Scope.INFERENCE_INVOKE)
+    # OpenAI-compatible surface (/v1/ prefix to match the OpenAI wire protocol)
+    _declare_route("GET",    "/v1/models",                    Scope.MODELS_READ)
     _declare_route("POST",   "/v1/chat/completions",          Scope.INFERENCE_INVOKE)
+    _declare_route("POST",   "/v1/completions",               Scope.INFERENCE_INVOKE)
     _declare_route("GET",    "/api/v1/secrets",               Scope.SECRETS_READ)
     _declare_route("POST",   "/api/v1/secrets",               Scope.SECRETS_WRITE)
     _declare_route("DELETE", "/api/v1/secrets/{name}",        Scope.SECRETS_WRITE)
     _declare_route("GET",    "/api/v1/events",                Scope.EVENTS_SUBSCRIBE)
+    # ---- Vivaldi network coordinates --------------------------------------- #
+    # POST is public (like heartbeat) — nodes report RTTs before they have any
+    # other credential; verified by X-MeshPool-Node-Token inside the handler.
+    # GET is scoped: coordinate data is only interesting to authenticated operators
+    # and the future live Mesh Map visualization.
+    _declare_route("POST",   "/api/v1/mesh/rtt",              None,
+                   "Vivaldi RTT observation from an agent — same pre-credential "
+                   "rationale as /nodes/heartbeat; from_node verified by node token")
+    _declare_route("GET",    "/api/v1/mesh/coordinates",      Scope.NODES_READ)
     # api_route with multiple methods (proxy): declare for each method
     for _m in ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"):
         _declare_route(_m, "/app/{dep_id}/{path:path}", None,
                        "hosted-app proxy — app itself may require auth")
+
+    # ---- S3-compatible object-store protocol adapter (p5-s3) ----------- #
+    # Every S3 operation maps onto the existing StorageManager: reads need
+    # storage:read, writes need storage:write.  None of these are public so that
+    # every PUT/POST/DELETE in the S3 surface is covered by the mutation gate.
+    _declare_route("GET",    "/s3",                            Scope.STORAGE_READ)
+    _declare_route("GET",    "/s3/",                           Scope.STORAGE_READ)
+    _declare_route("PUT",    "/s3/{bucket}",                   Scope.STORAGE_WRITE)
+    _declare_route("DELETE", "/s3/{bucket}",                   Scope.STORAGE_WRITE)
+    _declare_route("GET",    "/s3/{bucket}",                   Scope.STORAGE_READ)
+    _declare_route("PUT",    "/s3/{bucket}/{key:path}",         Scope.STORAGE_WRITE)
+    _declare_route("GET",    "/s3/{bucket}/{key:path}",         Scope.STORAGE_READ)
+    _declare_route("HEAD",   "/s3/{bucket}/{key:path}",         Scope.STORAGE_READ)
+    _declare_route("DELETE", "/s3/{bucket}/{key:path}",         Scope.STORAGE_WRITE)
+    _declare_route("POST",   "/s3/{bucket}/{key:path}",         Scope.STORAGE_WRITE)
+    # S3 credential management (MeshPool-native; not an S3 wire operation)
+    _declare_route("GET",    "/api/v1/s3/credentials",          Scope.BLOBS_READ)
+    _declare_route("POST",   "/api/v1/s3/credentials",          Scope.BLOBS_WRITE)
 
     # ---- system ---------------------------------------------------------- #
     @app.get("/api/v1/health")
@@ -1042,6 +1155,49 @@ def _register_routes(app: FastAPI) -> None:
             "nodes": [n.id for n in cp.registry.list() if n.owner == owner],
         }
 
+    # ---- hard spend caps -------------------------------------------------- #
+    def _cap_owner(cp: "ControlPlane", request: Request,
+                   owner: Optional[str]) -> str:
+        """Resolve the owner whose cap is being read/written (same rule as /wallet)."""
+        if cp.settings.trust_tier >= 2:
+            token = request.headers.get("X-MeshPool-Session", "")
+            resolved = cp.accounts.owner_for_session(token)
+            if not resolved:
+                raise HTTPException(status_code=401,
+                                    detail="authenticate the device first")
+            return resolved
+        return owner or "default"
+
+    @app.get("/api/v1/account/spend-cap")
+    async def get_spend_cap(request: Request, owner: Optional[str] = None) -> dict:
+        """Current hard spend cap and spend inside the active window.
+
+        ``enforced`` is false when no cap exists — the UI must show that rather
+        than displaying a number nothing enforces.
+        """
+        cp = _cp()
+        return cp.spend_caps.status(_cap_owner(cp, request, owner))
+
+    @app.put("/api/v1/account/spend-cap")
+    async def put_spend_cap(body: SpendCapBody, request: Request,
+                            owner: Optional[str] = None) -> dict:
+        """Set (``cap``) or clear (``cap: null``) the caller's hard spend cap.
+
+        Changing the cap deliberately does **not** reset accrued spend; otherwise
+        the cap could be bypassed indefinitely by re-setting it.
+        """
+        cp = _cp()
+        try:
+            return cp.spend_caps.set_cap(_cap_owner(cp, request, owner), body.cap)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/v1/account/spend-cap/reset")
+    async def reset_spend_cap(request: Request, owner: Optional[str] = None) -> dict:
+        """Begin a new spend window. Ledger history is preserved for billing."""
+        cp = _cp()
+        return cp.spend_caps.reset_spend(_cap_owner(cp, request, owner))
+
     # ---- nodes ----------------------------------------------------------- #
     @app.get("/api/v1/ledger")
     async def ledger() -> dict:
@@ -1253,6 +1409,42 @@ def _register_routes(app: FastAPI) -> None:
         nodes = {n.id: n for n in cp.registry.list()}
         return cp.timeline.build(job, nodes, cp.events.recent_for_job(job_id))
 
+    @app.get("/api/v1/verification")
+    async def get_verification_stats() -> dict:
+        """Workload-matched result verification statistics (spec \xa7P6).
+
+        Returns policy config, observable counters (units verified, disagreements,
+        nodes penalised), and compute escrow balances.  At Tier 0/1 the verifier
+        is not wired in and an empty snapshot is returned so the endpoint is
+        always callable without errors.
+        """
+        cp = _cp()
+        verifier = getattr(cp.batch, "verifier", None)
+        if verifier is not None:
+            return verifier.as_dict()
+        # Verifier not active (Tier 0/1 or build_app wiring not yet complete).
+        from .verification import (
+            DIGEST_VERIFIABLE_FUNCS, ORACLE_VERIFIABLE_FUNCS, NOT_VERIFIABLE_FUNCS,
+        )
+        return {
+            "policy": {"redundant_rate": 0.0, "redundant_n": 2, "active": False},
+            "stats": {
+                "units_verified": 0,
+                "redundant_verifications": 0,
+                "disagreements": 0,
+                "nodes_penalized": 0,
+                "degraded": {"no_secondary": 0, "secondary_error": 0,
+                             "no_tiebreak": 0},
+            },
+            "escrow": {"total_held": 0.0, "total_released": 0.0,
+                       "total_forfeited": 0.0},
+            "classification": {
+                "digest_verifiable": sorted(DIGEST_VERIFIABLE_FUNCS),
+                "oracle_verifiable": sorted(ORACLE_VERIFIABLE_FUNCS),
+                "not_verifiable": sorted(NOT_VERIFIABLE_FUNCS),
+            },
+        }
+
     # ---- DAG workflows ---------------------------------------------------- #
     @app.post("/api/v1/dags")
     async def submit_dag(req: DagSubmit, request: Request) -> dict:
@@ -1459,6 +1651,84 @@ def _register_routes(app: FastAPI) -> None:
         if not ok:
             raise HTTPException(status_code=404, detail="unknown object")
         return {"removed": blob_id}
+
+    @app.get("/api/v1/durability")
+    async def get_durability(blob_id: Optional[str] = None) -> dict:
+        """Report per-blob *effective* durability accounting for correlated placement.
+
+        The classic failure: RS(6,3) promises 3-failure tolerance, but if all 9 shards
+        live on machines in one subnet the real tolerance is 0 (one power cut loses
+        everything). This endpoint reports what was actually achieved, not what RS
+        mathematics would give under an independence assumption that does not hold.
+
+        Without ``blob_id`` returns a cluster summary.
+        With ``blob_id`` returns that object's full durability breakdown including a
+        warning whenever correlated placement degrades the effective durability.
+        """
+        cp = _cp()
+        from ..controlplane.topology import effective_durability as _eff_dur
+        from ..storage.engine import _unpack_ec_params
+
+        def _blob_durability(meta) -> dict:
+            if meta is None:
+                return {}
+            # EC-coded object: compute domain-aware effective durability
+            is_ec = (meta.id in (cp.storage._ec_params if cp.storage else {})
+                     or (meta.chunks and meta.replication_desired >= 256))
+            if not is_ec or not meta.chunks:
+                return {
+                    "blob_id": meta.id[:16], "ec": False,
+                    "replicas": len(meta.replicas),
+                    "desired": meta.replication_desired,
+                    "status": meta.status,
+                }
+            stored_k_m = (cp.storage._ec_params.get(meta.id)
+                          if cp.storage else None)
+            k_val, m_val = stored_k_m if stored_k_m else _unpack_ec_params(
+                meta.replication_desired)
+            # Collect the failure domain of each shard holder
+            domains: list[str] = []
+            for sid in meta.chunks:
+                sm = cp.storage.get_meta(sid) if cp.storage else None
+                if sm and sm.replicas:
+                    with cp.registry._lock:
+                        node = cp.registry._nodes.get(sm.replicas[0])
+                    if node:
+                        domains.append(node.failure_domain or node.id)
+            eff = _eff_dur(domains, k_val, m_val)
+            eff["blob_id"] = meta.id[:16]
+            eff["ec_k"] = k_val
+            eff["ec_m"] = m_val
+            eff["status"] = meta.status
+            eff["ec"] = True
+            return eff
+
+        if blob_id is not None:
+            if cp.storage is None:
+                raise HTTPException(status_code=503, detail="storage not ready")
+            meta = cp.storage.get_meta(blob_id)
+            if meta is None or meta.internal:
+                raise HTTPException(status_code=404, detail="unknown blob")
+            return _blob_durability(meta)
+
+        # Cluster summary
+        if cp.storage is None:
+            return {"blobs": [], "summary": {
+                "total_blobs": 0, "ec_blobs": 0,
+                "correlated_blobs": 0, "perfectly_diverse": 0}}
+        results = [_blob_durability(m) for m in cp.storage.list() if m is not None]
+        ec_results = [r for r in results if r.get("ec")]
+        return {
+            "summary": {
+                "total_blobs": len(results),
+                "ec_blobs": len(ec_results),
+                "correlated_blobs": sum(1 for r in ec_results if r.get("correlated")),
+                "perfectly_diverse": sum(
+                    1 for r in ec_results if not r.get("correlated")),
+                "any_warning": any(r.get("warning") for r in ec_results),
+            },
+            "blobs": results,
+        }
 
     @app.post("/api/v1/buckets/{bucket}")
     async def create_bucket(bucket: str, request: Request, owner: str = "default") -> dict:
@@ -1937,44 +2207,10 @@ def _register_routes(app: FastAPI) -> None:
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
 
-    # OpenAI-compatible Chat Completions (spec §9.6 — existing clients work as-is)
-    @app.post("/v1/chat/completions")
-    async def openai_chat_completions(req: OpenAIChatRequest, request: Request) -> dict:
-        cp = _cp()
-        owner = _consumer_owner(cp, request, "default")
-        _require_credits(cp, owner)
-        model_id = _resolve_model_id(None)
-        if not model_id:
-            raise HTTPException(status_code=409, detail="no model deployed; deploy one first")
-        prompt = _flatten_chat(req.messages)
-        try:
-            out = await cp.inference.chat(model_id, prompt, req.max_tokens,
-                                          temperature=req.temperature, seed=req.seed,
-                                          speculative=req.speculative,
-                                          draft_k=req.draft_k,
-                                          draft_layers=req.draft_layers,
-                                          chunked_prefill=req.chunked_prefill)
-        except (KeyError, RuntimeError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        usage = {"completion_tokens": out["tokens"],
-                 "meshpool_tokens_per_sec": out["tokens_per_sec"],
-                 "meshpool_stages": len(out["stages"])}
-        if out.get("speculative"):
-            usage["meshpool_speculative"] = out["speculative"]
-        if out.get("pipeline"):
-            usage["meshpool_pipeline"] = out["pipeline"]
-        return {
-            "id": f"chatcmpl-{now_ms()}",
-            "object": "chat.completion",
-            "created": now_ms() // 1000,
-            "model": out["model"],
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": out["text"]},
-                "finish_reason": "length" if out["tokens"] >= req.max_tokens else "stop",
-            }],
-            "usage": usage,
-        }
+    # OpenAI-compatible surface (/v1/*) — registered from openai_api.py so the
+    # implementation lives in one place and the non-vacuity gate can mutate it.
+    from .openai_api import register_openai_routes as _reg_oai
+    _reg_oai(app, _cp)
 
     # ---- secrets (scoped, short-lived brokering; docs/security.md) ------- #
     @app.get("/api/v1/secrets")
@@ -2027,6 +2263,115 @@ def _register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=403, detail=str(exc))
         return {"value": value}
 
+    # ---- Vivaldi network coordinates ------------------------------------ #
+    @app.post("/api/v1/mesh/rtt")
+    async def report_rtt(body: RttReport, request: Request) -> dict:
+        """Accept an RTT observation from an agent and update Vivaldi coordinates.
+
+        ``from_node`` is overridden by the verified node token when present
+        (enforced mode).  The symmetrical update means both endpoints' coordinates
+        converge from each observation.
+        """
+        cp = _cp()
+        # Resolve the reporter's identity: node token takes precedence.
+        node_tok = request.headers.get("X-MeshPool-Node-Token", "")
+        verified_id = cp.registry.node_id_for_token(node_tok) if node_tok else None
+        from_node = verified_id or body.from_node
+        if not from_node or not body.to_node:
+            raise HTTPException(status_code=400, detail="from_node and to_node are required")
+        if body.rtt_ms <= 0:
+            raise HTTPException(status_code=400, detail="rtt_ms must be positive")
+        # Nodes must be known to the registry; otherwise a caller could inject
+        # coordinates for arbitrary IDs and pollute the coordinate space.
+        if cp.registry.get(from_node) is None:
+            raise HTTPException(status_code=404, detail=f"unknown node: {from_node!r}")
+        if cp.registry.get(body.to_node) is None:
+            raise HTTPException(status_code=404, detail=f"unknown node: {body.to_node!r}")
+        cp.registry.update_vivaldi(from_node, body.to_node, body.rtt_ms)
+        coord = cp.registry.get_coordinate(from_node)
+        return {
+            "ok": True,
+            "from_node": from_node,
+            "to_node": body.to_node,
+            "rtt_ms": body.rtt_ms,
+            "error": round(coord.error, 4) if coord else None,
+            "n_samples": coord.n_samples if coord else 0,
+        }
+
+    @app.get("/api/v1/mesh/coordinates")
+    async def mesh_coordinates() -> dict:
+        """Return all nodes' Vivaldi coordinates plus a predicted RTT matrix.
+
+        This is the data source for the live Mesh Map visualization and for the
+        ``predicted_rtt(a, b)`` scheduler helper.  The matrix is O(n²) but the
+        number of nodes in a MeshPool cluster is bounded in practice (10s–100s),
+        so it is cheap to compute on demand.
+
+        Response shape::
+
+            {
+              "nodes": {
+                "<node_id>": {
+                  "vec": [x, y],
+                  "height": h,
+                  "error": e,
+                  "n_samples": n,
+                  "trusted": bool
+                }, ...
+              },
+              "predicted_rtt_ms": {
+                "<node_a_id>": {"<node_b_id>": 42.1, ...},
+                ...
+              },
+              "scheduler_uses_vivaldi": bool
+            }
+        """
+        cp = _cp()
+        coords = cp.registry.vivaldi_snapshot()
+        # Build predicted RTT matrix for all known nodes (only pairs where both
+        # have coordinates; absent from the matrix otherwise).
+        from ..common.vivaldi import distance_to as _dist_to
+        rtt_matrix: dict[str, dict[str, float]] = {}
+        ids = list(coords.keys())
+        for i, a in enumerate(ids):
+            row: dict[str, float] = {}
+            for b in ids:
+                if a == b:
+                    continue
+                row[b] = round(_dist_to(coords[a], coords[b]), 3)
+            if row:
+                rtt_matrix[a] = row
+
+        # Include nodes that are in the registry but have no coordinate yet
+        # (so the consumer knows they exist but lack data).
+        all_nodes = {n.id for n in cp.registry.list()}
+        nodes_out: dict[str, dict] = {}
+        for nid in all_nodes:
+            c = coords.get(nid)
+            if c is not None:
+                nodes_out[nid] = {
+                    "vec": [round(v, 4) for v in c.vec],
+                    "height": round(c.height, 4),
+                    "error": round(c.error, 4),
+                    "n_samples": c.n_samples,
+                    "trusted": c.is_trusted(),
+                }
+            else:
+                nodes_out[nid] = {
+                    "vec": None,
+                    "height": None,
+                    "error": 1.0,
+                    "n_samples": 0,
+                    "trusted": False,
+                }
+        return {
+            "nodes": nodes_out,
+            "predicted_rtt_ms": rtt_matrix,
+            "scheduler_uses_vivaldi": any(
+                c.is_trusted() for c in coords.values()
+            ),
+        }
+
     # ---- events (SSE) ---------------------------------------------------- #
     @app.get("/api/v1/events")
     async def events(request: Request) -> StreamingResponse:
@@ -2070,6 +2415,39 @@ def _register_routes(app: FastAPI) -> None:
                 detail="the console has not been built — run "
                        "`npm --prefix web install && npm --prefix web run build`")
         return FileResponse(str(index))
+
+    # ---- S3-compatible API credentials management (p5-s3) --------------- #
+
+    @app.get("/api/v1/s3/credentials")
+    async def list_s3_credentials() -> dict:
+        """Return all S3 access keys (never returns the secret key)."""
+        cp = _cp()
+        return {
+            "credentials": [
+                {"access_key": k, "owner": v[1]}
+                for k, v in cp.s3_credentials.items()
+            ]
+        }
+
+    @app.post("/api/v1/s3/credentials")
+    async def create_s3_credentials(
+            request: Request, owner: str = "default") -> dict:
+        """Create a new S3 access-key pair and bind it to the owner.
+
+        Returns ``access_key`` and ``secret_key`` once (the secret is never
+        stored in recoverable form); save it immediately.
+        """
+        cp = _cp()
+        actor = _consumer_owner(cp, request, owner)
+        ak = "MESHPOOL" + secrets.token_hex(6).upper()
+        sk = secrets.token_urlsafe(32)
+        cp.s3_credentials[ak] = (sk, actor)
+        return {"access_key": ak, "secret_key": sk, "owner": actor}
+
+    # ---- S3 protocol router (includes at /s3 prefix) --------------------- #
+    from ..storage import s3_api as _s3_mod
+    _s3_mod.init(lambda: CP)
+    app.include_router(_s3_mod.router, prefix="/s3")
 
 
 def _owner_reputation(cp: ControlPlane, owner: str) -> float:
