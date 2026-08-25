@@ -449,13 +449,14 @@ class TestWrongApiKeyIsRejected:
     def test_no_header_at_all_is_still_allowed_in_open_mode(self, home_app):
         """Absent credential keeps existing behaviour; only a WRONG one fails.
 
-        Without this control the test above could pass simply because the
+        Without this control the tests above could pass simply because the
         endpoint rejects everything.
         """
-        c = TestClient(home_app)
-        r = c.post("/v1/chat/completions",
-                   json={"model": "nano-gpt",
-                         "messages": [{"role": "user", "content": "hi"}]})
+        with TestClient(home_app) as client:
+            _inject_mock_inference(home_app)
+            r = client.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hi"}]})
         assert r.status_code != 401, r.text
 
     def test_error_body_uses_the_openai_envelope(self, home_app):
