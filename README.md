@@ -441,6 +441,31 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
 
 ## ⚖️ Honest constraints (we report real numbers, never invented ones)
 
+- **Real GGUF checkpoints load and shard correctly — but no pretrained weights were ever
+  downloaded on this machine.** `meshpool/inference/gguf_loader.py` reads real GGUF
+  containers through llama.cpp's own reference reader, loads *only* an assigned layer
+  range via `np.memmap`, inverts llama.cpp's RoPE permutation, and dequantizes
+  Q8_0/Q5_1/Q4_0/F16. `sim/scenarios/verify_gguf_inference.py` proves the load-only-my-
+  layers property empirically rather than by assertion: it overwrites the byte ranges of
+  every layer a stage was *not* assigned and demands bit-identical weights, with a
+  companion check confirming that corrupting *all* layers does change them (so the first
+  check cannot pass vacuously). What is **not** proven: model quality. Corporate TLS
+  interception blocks HuggingFace model downloads here (`CRYPT_E_NO_REVOCATION_CHECK`),
+  so every checkpoint under test has a real format and deterministically generated
+  weights. The format, the sharding and the arithmetic are measured; "this produces good
+  text" is not, and is not claimed. K-quants (Q4_K, Q6_K, Q2_K, Q3_K, Q5_K) are supported
+  through the reference dequantizer but are **untested locally** — the reference `gguf`
+  package can decode them but cannot encode them, so no local fixture is possible.
+- **The tokenizer is verified against SentencePiece, and deliberately disagrees with it in
+  two places.** `gguf_tokenizer.py` implements llama.cpp's SPM bigram-merge algorithm and
+  is checked token-for-token against the real `sentencepiece` library — a round-trip test
+  would prove nothing, since a tokenizer can be self-consistently wrong and still
+  round-trip perfectly while emitting ids the model never saw. Two intentional
+  divergences: MeshPool does **not** apply NFKC normalization and does **not** delete
+  control characters, matching llama.cpp (which is what real GGUF checkpoints are served
+  by) rather than SentencePiece's default `nmt_nfkc` normalizer. Both are pinned by test
+  so they cannot be silently "fixed" into bugs. Byte-level BPE vocabularies
+  (`tokenizer.ggml.model == "gpt2"`) are **refused with an error**, not approximated.
 - **The S3 SigV4 signature binds a *claimed* payload digest, not the bytes we received.**
   `x-amz-content-sha256` is read from the header and used verbatim in the canonical
   request; the body is never hashed and compared. So a captured, signed `PUT` can be
