@@ -7,3 +7,13 @@ typer
 rich
 pyyaml
 cryptography
+
+# Real checkpoint support. `gguf` is llama.cpp's own reference reader/writer:
+# its GGUFReader memory-maps the file, which is what lets a node load only the
+# layer range it was assigned instead of the whole model.
+gguf
+
+# Reference tokenizer, used only by the test suite as an independent oracle for
+# meshpool/inference/gguf_tokenizer.py. Not imported at runtime; those tests
+# skip if it is absent.
+sentencepiece

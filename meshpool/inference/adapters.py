@@ -8,20 +8,29 @@ a forward hop is computed) differ between backends. This module is that seam.
 * ``MeshShardBackend`` (default, active): the from-scratch NumPy transformer sharded
   across agent ``/shard/*`` endpoints. Always runnable, zero downloads, and the basis
   for the bit-for-bit correctness oracle.
-* ``PetalsBackend`` / ``ExoBackend`` (documented stubs): drop-in points for genuinely
-  large open-weight models on real GPUs. They implement the same interface; enabling
-  one is a dependency + config change, not an engine rewrite.
+* ``GGUFBackend`` (active): **real checkpoints, really layer-sharded.** Each node
+  memory-maps only its own layer range, so the pool can serve a model no single
+  member could hold. This is the flagship path.
+* ``OllamaBackend`` (active): whole-model replicas on nodes that already have the
+  model. Aggregate throughput and failover, but bounded by one machine's memory.
+* ``PetalsBackend`` / ``ExoBackend`` (documented stubs): drop-in points for other
+  large-model runtimes. They implement the same interface; enabling one is a
+  dependency + config change, not an engine rewrite.
 
 Keeping this interface stable is what lets "prove the concept on a laptop" and "serve a
 70B model across the office" share one control plane.
 """
 from __future__ import annotations
 
+import dataclasses
+import os
 from typing import Optional, Protocol
 
 from ..common.models import LayerAssignment, Node
 from ..controlplane.scheduler import topology_partition
+from . import gguf_loader
 from . import model as M
+from .gguf_tokenizer import GGUFTokenizer
 
 
 def ollama_node_has_model(node: Node, model_name: str) -> bool:
@@ -182,9 +191,107 @@ class OllamaBackend:
         return M.CharTokenizer(vocab_size=cfg.vocab_size)
 
 
+class GGUFBackend:
+    """Real checkpoints, genuinely split by layer range across separate nodes.
+
+    This is the backend the flagship depends on. Unlike ``ollama`` (whole-model
+    replicas, so the model must fit on one box) and unlike ``meshshard`` (real
+    sharding, toy weights), this one is real on both axes: a node assigned layers
+    40-48 of a 600 GB file loads *only* those layers and never pages in the rest.
+    That is the property that makes a model no single machine can hold runnable
+    on a pool of machines that individually cannot hold it.
+
+    ``native_generate`` is False on purpose: the engine drives the pipeline,
+    which is what lets speculative pipeline decoding, hot spares and chunked
+    prefill apply. Handing generation to the backend would forfeit all three.
+
+    Model names are filesystem paths to ``.gguf`` files, resolved against
+    ``MESHPOOL_GGUF_DIR`` when relative. Nothing is downloaded implicitly --
+    fetching multi-hundred-gigabyte weights is the Weight Swarm's job, not a
+    side effect of naming a model.
+    """
+
+    name = "gguf"
+    native_generate = False
+
+    def available(self) -> bool:
+        try:
+            import gguf  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    def resolve_path(self, model_name: str) -> Optional[str]:
+        """Model name -> checkpoint path, or ``None`` if there is no such file."""
+        if not model_name:
+            return None
+        cand = [model_name]
+        if not model_name.lower().endswith(".gguf"):
+            cand.append(model_name + ".gguf")
+        root = os.environ.get("MESHPOOL_GGUF_DIR")
+        if root:
+            cand += [os.path.join(root, c) for c in list(cand)]
+        for c in cand:
+            if os.path.isfile(c):
+                return os.path.abspath(c)
+        return None
+
+    def resolve_config(self, model_name: str) -> Optional[M.ModelConfig]:
+        if not self.available():
+            return None
+        path = self.resolve_path(model_name)
+        if path is None:
+            return None
+        try:
+            info = gguf_loader.cached_info(path)
+        except gguf_loader.GGUFUnsupported:
+            # An unreadable or unsupported checkpoint is "unknown model", not a
+            # crash: the manager tries other backends and reports cleanly.
+            return None
+        # The checkpoint's own ``general.name`` is usually the architecture
+        # ("llama"), which cannot be resolved back to a file. Everything
+        # downstream -- deployments, the tokenizer lookup, the dashboard -- keys
+        # off ``cfg.name``, so it must stay the name the caller actually used.
+        return dataclasses.replace(info.config, name=model_name)
+
+    def plan_partition(self, nodes: list[Node], cfg: M.ModelConfig) -> list[LayerAssignment]:
+        """Partition using the checkpoint's *measured* per-layer size.
+
+        ``cfg.per_layer_mb`` here comes from summing real tensor byte counts in
+        the file, not from a constant. Placement therefore fails honestly when
+        the pool genuinely lacks the memory instead of succeeding on paper.
+        """
+        return topology_partition(nodes, cfg.n_layer, cfg.per_layer_mb)
+
+    def tokenizer(self, cfg: M.ModelConfig, meta: Optional[dict]):
+        """The checkpoint's own tokenizer -- never a substitute.
+
+        Pairing real weights with an approximate tokenizer produces text that is
+        wrong in a way that reads as poor model quality, so an unsupported vocab
+        raises rather than falling back to something that merely runs.
+        """
+        path = (meta or {}).get("gguf_path") or self.resolve_path(cfg.name)
+        if path is None:
+            raise gguf_loader.GGUFUnsupported(
+                f"cannot build a tokenizer for {cfg.name!r}: no GGUF file found. "
+                f"Set MESHPOOL_GGUF_DIR or pass an absolute path.")
+        return GGUFTokenizer.from_vocab(gguf_loader.read_vocab(path))
+
+    def describe(self, model_name: str) -> Optional[str]:
+        """One-line summary for logs and the console, or ``None`` if unresolvable."""
+        path = self.resolve_path(model_name)
+        if path is None or not self.available():
+            return None
+        try:
+            return gguf_loader.describe(gguf_loader.cached_info(path))
+        except gguf_loader.GGUFUnsupported:
+            return None
+
+
 DEFAULT_BACKEND = "meshshard"
 BACKENDS: dict[str, InferenceBackend] = {
     "meshshard": MeshShardBackend(),
+    "gguf": GGUFBackend(),
     "ollama": OllamaBackend(),
     "petals": PetalsBackend(),
     "exo": ExoBackend(),

@@ -308,11 +308,35 @@ def loads_npz(raw: bytes) -> tuple[dict, dict]:
     return P, meta
 
 
+_LLAMA_LAYER_SUFFIXES: tuple[str, ...] = (
+    "rms1.g", "attn.Wq", "attn.Wk", "attn.Wv", "attn.Wo", "rms2.g",
+    "mlp.Wgate", "mlp.Wup", "mlp.Wdown")
+
+
 def _layer_suffixes(cfg: ModelConfig) -> tuple[str, ...]:
     if cfg.architecture == "llama":
-        return ("rms1.g", "attn.Wq", "attn.Wk", "attn.Wv", "attn.Wo", "rms2.g",
-                "mlp.Wgate", "mlp.Wup", "mlp.Wdown")
+        return _LLAMA_LAYER_SUFFIXES
     return _LAYER_SUFFIXES
+
+
+def _suffixes_from_params(full: dict) -> Optional[tuple[str, ...]]:
+    """Pick the layer-parameter naming from the parameters themselves.
+
+    ``slice_params`` used to decide this by looking d_model/vocab_size up in
+    ``REGISTRY``, which can only recognise models we ship. Any checkpoint loaded
+    from a file -- which is the entire point of the GGUF loader -- misses,
+    silently falls back to the GPT names, and then dies inside the slice loop
+    with ``KeyError: 'h0.ln1.g'``, a message that points nowhere near the cause.
+
+    The parameter names are direct evidence of the architecture, so use them and
+    keep the registry lookup only as a fallback for param dicts that carry no
+    layers at all.
+    """
+    if any(k.endswith(".rms1.g") for k in full):
+        return _LLAMA_LAYER_SUFFIXES
+    if any(k.endswith(".ln1.g") for k in full):
+        return _LAYER_SUFFIXES
+    return None
 
 
 def slice_params(full: dict, start: int, end: int,
@@ -325,8 +349,10 @@ def slice_params(full: dict, start: int, end: int,
     is shipped just its slice, and no node ever needs the full (possibly larger than
     one machine) checkpoint."""
     sub: dict = {}
-    cfg = _infer_cfg_from_params(full)
-    suffixes = _layer_suffixes(cfg) if cfg is not None else _LAYER_SUFFIXES
+    suffixes = _suffixes_from_params(full)
+    if suffixes is None:
+        cfg = _infer_cfg_from_params(full)
+        suffixes = _layer_suffixes(cfg) if cfg is not None else _LAYER_SUFFIXES
     for i in range(start, end):
         for suf in suffixes:
             sub[f"h{i}.{suf}"] = full[f"h{i}.{suf}"]
@@ -339,6 +365,8 @@ def slice_params(full: dict, start: int, end: int,
         sub["lnf.g"] = full["lnf.g"]
         if "lnf.b" in full:
             sub["lnf.b"] = full["lnf.b"]
+        if "out" in full:
+            sub["out"] = full["out"]
     return sub
 
 
@@ -541,7 +569,12 @@ def head(P: dict, cfg: ModelConfig, x: np.ndarray) -> np.ndarray:
         x = _rmsnorm(x, P["lnf.g"], cfg.rms_norm_eps)
     else:
         x = _layernorm(x, P["lnf.g"], P["lnf.b"])
-    return (x @ P["wte"].T).astype(np.float32)          # tied embedding
+    # Tied embeddings are the default (and what the toy checkpoint uses), but a
+    # real checkpoint may ship a separate output projection -- Llama-2/3 do.
+    # Silently tying an untied model produces fluent nonsense rather than an
+    # error, so honour "out" whenever the checkpoint provides it.
+    out = P.get("out")
+    return (x @ (out if out is not None else P["wte"]).T).astype(np.float32)
 
 
 def forward_full(P, cfg, tokens) -> np.ndarray:
