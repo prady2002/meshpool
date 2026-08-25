@@ -41,6 +41,38 @@ def _wait_job(cp: str, job_id: str, timeout: float = 90) -> dict:
     raise TimeoutError(f"job {job_id} did not finish in {timeout}s")
 
 
+def _wait_unit_in_flight(cp: str, job_id: str, node_id: str,
+                         timeout: float = 30.0) -> int:
+    """Block until ``node_id`` actually holds unfinished work for ``job_id``.
+
+    The kill below used to be a fixed ``time.sleep(1.0)``, which is a race: it
+    assumes the units are still running a second after submission. They often
+    are not. With 12 units of 1.5 s spread over 3 nodes the whole job can finish
+    in under 4 s, so on a fast or lightly-loaded machine every unit completed
+    *before* the kill landed -- the job then finished with ``failed=0`` and
+    ``max_attempts=1``, and the gate failed claiming no retry happened.
+
+    That is a false negative: failover was never exercised, so there was nothing
+    to retry. Widening the sleep would only move the race. Waiting for observed
+    in-flight work makes the kill deterministic -- when it fires, the node
+    provably holds units that must be reassigned.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        j = httpx.get(f"{cp}/api/v1/jobs/{job_id}", timeout=10).json()
+        held = [u for u in j["units"]
+                if u.get("assigned_node") == node_id
+                and u.get("status") in ("assigned", "running")]
+        if held:
+            return len(held)
+        if j["status"].startswith("completed"):
+            raise AssertionError(
+                "job finished before any unit was observed in flight on "
+                f"{node_id}; the workload is too short to exercise failover")
+        time.sleep(0.1)
+    raise TimeoutError(f"no in-flight unit on {node_id} within {timeout}s")
+
+
 def _served_by(cp: str, dep_id: str, n: int) -> Counter:
     c: Counter = Counter()
     for _ in range(n):
@@ -117,11 +149,15 @@ def main() -> int:  # noqa: C901 — a deliberately end-to-end gate
         print(f"  PASS: 24 units completed across {used} nodes -- entirely over the tunnel")
 
         print("\n== test 2: kill a node mid-batch -> retry over tunnel ==")
-        payloads = [{"seconds": 1.5, "echo": i} for i in range(12)]
+        # Long enough per unit that a node cannot drain its share before the
+        # kill; the wait below is what makes the timing deterministic, but a
+        # too-short unit would still let the job finish during the poll.
+        payloads = [{"seconds": 6.0, "echo": i} for i in range(12)]
         jid = httpx.post(f"{cp}/api/v1/jobs", json={"name": "sleep_echo", "func": "sleep_echo",
                          "payloads": payloads, "cpu_pct": 15}, timeout=10).json()["job_id"]
-        time.sleep(1.0)
-        print("  killing sim-node-2 ...")
+        victim = next(n["id"] for n in nodes if n["name"] == "sim-node-2")
+        held = _wait_unit_in_flight(cp, jid, victim)
+        print(f"  killing sim-node-2 while it holds {held} in-flight unit(s) ...")
         h.stop_agent(1)
         job = _wait_job(cp, jid, timeout=90)
         done = sum(1 for u in job["units"] if u["status"] == "done")

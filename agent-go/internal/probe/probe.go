@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"meshd/internal/config"
@@ -68,16 +69,95 @@ type Link struct {
 	BandwidthMbps float64 `json:"bandwidth_mbps"`
 }
 
+// Probe gathers local hardware capability and the link to the control plane.
+//
+// Every detector below blocks on a child process, and on Windows most of them
+// are a separate `powershell -NoProfile -Command Get-CimInstance ...` that costs
+// seconds just to start the shell. Run one after another the seven of them took
+// ~45s (measured: `go test ./internal/probe` at 45.4s), and the agent does not
+// bind its HTTP port until Probe returns -- so a node stayed unreachable and
+// unregistered for the whole time. That is what made verify_hw_probe fail with
+// "service not ready at 127.0.0.1:8362" against a 30s budget: the agent was
+// healthy, just still shelling out.
+//
+// The work is I/O-bound, so running the detectors concurrently collapses the
+// cost to roughly the slowest one instead of the sum. Two further savings come
+// free: a detector whose result a MESHD_SIM_* override would immediately
+// discard is not run at all, which is exactly equivalent to running it and
+// throwing the answer away, and the link measurement overlaps the hardware
+// probes since it shares nothing with them.
 func Probe(cfg config.Config) (Capability, Link) {
-	cap := Capability{CPUCores: runtime.NumCPU(), CPUArch: runtime.GOARCH, CPUModel: detectCPUModel(), RAMMB: 0, GPU: false, VRAMMB: 0, DiskMB: detectDiskFreeMB(), DiskTotalMB: detectDiskTotalMB(), FLOPSEstimate: detectFLOPSEstimate(), ThermalState: detectThermalState(), NetworkClass: "unknown", OllamaModels: []string{}, GPUNames: []string{}, Runtimes: Runtimes, Services: Services}
+	var (
+		wg          sync.WaitGroup
+		cpuModel    string
+		diskFree    int
+		diskTotal   int
+		flops       float64
+		thermal     string
+		battPowered *bool
+		battPct     *float64
+		ramMB       int
+		gpu         bool
+		vramMB      int
+		gpuNames    []string
+		link        Link
+	)
+
+	run := func(fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fn()
+		}()
+	}
+
+	run(func() { cpuModel = detectCPUModel() })
+	run(func() { diskFree = detectDiskFreeMB() })
+	run(func() { diskTotal = detectDiskTotalMB() })
+	run(func() { thermal = detectThermalState() })
+	run(func() { battPowered, battPct = detectBattery() })
+	run(func() { link = measureLink(cfg.ControlPlaneURL) })
+
+	// Skipped when overridden: the value would be overwritten below anyway, and
+	// the FLOPS estimate is a real CPU benchmark that the sim harness always
+	// discards.
+	if cfg.SimFLOPS <= 0 {
+		run(func() { flops = detectFLOPSEstimate() })
+	}
+	if cfg.SimRAMMB <= 0 {
+		run(func() { ramMB = detectRAMMB() })
+	}
+	if !cfg.SimGPU {
+		run(func() { gpu, vramMB, gpuNames = detectGPU() })
+	}
+
+	wg.Wait()
+
+	cap := Capability{
+		CPUCores:       runtime.NumCPU(),
+		CPUArch:        runtime.GOARCH,
+		CPUModel:       cpuModel,
+		RAMMB:          ramMB,
+		GPU:            gpu,
+		VRAMMB:         vramMB,
+		DiskMB:         diskFree,
+		DiskTotalMB:    diskTotal,
+		FLOPSEstimate:  flops,
+		ThermalState:   thermal,
+		NetworkClass:   "unknown",
+		OllamaModels:   []string{},
+		GPUNames:       gpuNames,
+		Runtimes:       Runtimes,
+		Services:       Services,
+		BatteryPowered: battPowered,
+		BatteryPercent: battPct,
+	}
 	if cap.CPUCores < 1 {
 		cap.CPUCores = 1
 	}
 	if cap.DiskMB <= 0 {
 		cap.DiskMB = cfg.DonateDiskMB
 	}
-	cap.BatteryPowered, cap.BatteryPercent = detectBattery()
-	cap.RAMMB = detectRAMMB()
 	if cfg.SimCores > 0 {
 		cap.CPUCores = cfg.SimCores
 	}
@@ -92,13 +172,12 @@ func Probe(cfg config.Config) (Capability, Link) {
 	}
 	if cfg.SimGPU {
 		cap.GPU = true
-	} else {
-		cap.GPU, cap.VRAMMB, cap.GPUNames = detectGPU()
 	}
+	// Never nil: Go marshals a nil slice as JSON null, and the control plane
+	// rejects null for this field.
 	if cap.GPUNames == nil {
 		cap.GPUNames = []string{}
 	}
-	link := measureLink(cfg.ControlPlaneURL)
 	cap.NetworkClass = networkClass(link)
 	return cap, link
 }

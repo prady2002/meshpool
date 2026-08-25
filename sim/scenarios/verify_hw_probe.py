@@ -26,7 +26,19 @@ PY_PORT = 8361
 GO_PORT = 8362
 
 
-def _wait_http(url: str, timeout: float = 30.0) -> None:
+def _wait_http(url: str, timeout: float = 75.0) -> None:
+    """Wait for a freshly-spawned agent to answer /health.
+
+    This was 30s, which the Go agent missed: meshd runs its full hardware probe
+    *before* binding its port, and that probe used to shell out to seven
+    PowerShell CIM queries in sequence for ~45s total. The gate then failed with
+    "service not ready at 127.0.0.1:8362" -- an error that reads like a crash
+    rather than like a node still booting.
+
+    The probe is concurrent now (~17s in CI, ~3s warm), but the budget stays
+    wide on purpose: timing out a healthy agent costs a red suite and a wrong
+    diagnosis, while waiting longer on a dead one only delays the inevitable.
+    """
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
@@ -39,7 +51,7 @@ def _wait_http(url: str, timeout: float = 30.0) -> None:
     raise TimeoutError(f"service not ready at {url}: {last}")
 
 
-def _wait_node(cp: str, name: str, timeout: float = 30.0) -> dict:
+def _wait_node(cp: str, name: str, timeout: float = 75.0) -> dict:
     deadline = time.time() + timeout
     seen = None
     while time.time() < deadline:
