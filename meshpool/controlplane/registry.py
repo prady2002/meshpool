@@ -99,6 +99,11 @@ class NodeRegistry:
         self.store = store
         self.node_timeout_s = node_timeout_s
         self.events = events
+        # How often reap() is expected to be called, used only to notice when the
+        # coordinator itself stalled. See reap() for why that matters.
+        self.reap_interval_s: float = 2.0
+        self._last_reap_monotonic: Optional[float] = None
+        self._eviction_grace_until: float = 0.0
         # _lock guards _nodes, _tokens, _token_to_node (see module docstring).
         self._lock = threading.RLock()
         self._nodes: dict[str, Node] = {n.id: n for n in store.list_nodes()}
@@ -325,7 +330,64 @@ class NodeRegistry:
 
     # --- reaper ---------------------------------------------------------- #
     def reap(self) -> list[str]:
-        """Mark nodes offline whose heartbeat is stale. Returns their ids."""
+        """Mark nodes offline whose heartbeat is stale. Returns their ids.
+
+        Guards against evicting the entire mesh because *we* stalled.
+
+        The cutoff is wall-clock: a node is offline if its last heartbeat is
+        older than ``node_timeout_s``. That is correct only while this loop is
+        actually running. If the coordinator's event loop is starved for longer
+        than the timeout -- a long GC pause, a blocking call on the loop thread,
+        a VM suspend, or simply a badly oversubscribed host -- then on the next
+        tick *every* heartbeat looks stale at once, and this method evicts a
+        completely healthy mesh in a single pass.
+
+        That is not hypothetical. A gate run on a loaded machine produced::
+
+            22:04:06 WARNING registry  node timed out -> offline node=... sim-node-1
+            22:04:06 WARNING registry  node timed out -> offline node=... sim-node-2
+            22:04:06 WARNING registry  node timed out -> offline node=... sim-node-3
+            22:04:06 WARNING inference cannot re-partition: insufficient survivor capacity
+
+        Three nodes in the same second is the signature: not three independent
+        failures, one coordinator stall. The blast radius is everything the
+        reaper drives -- tunnels dropped, batch units requeued, hosting replicas
+        torn down, model partitions abandoned -- so a hiccup inside the control
+        plane becomes a mesh-wide outage, and re-partitioning cannot even
+        succeed because no survivors are left to place onto.
+
+        The fix is to distrust the clock after a gap. If far more time passed
+        than the reap interval, the missing heartbeats say nothing about the
+        nodes; they are evidence about us. Skip the eviction pass and grant a
+        grace period so live nodes get a fair chance to re-assert before any
+        judgement is made. Kubernetes' node controller and Akka's accrual
+        detector both do a version of this for the same reason.
+
+        Deliberately one-sided: a stall delays eviction of genuinely dead nodes
+        by one grace period, which costs a little failover latency. Getting it
+        wrong the other way tears down the whole mesh.
+        """
+        mono = time.monotonic()
+        last, self._last_reap_monotonic = self._last_reap_monotonic, mono
+
+        if last is not None:
+            gap = mono - last
+            # Normal gap is reap_interval_s. Treat anything approaching the
+            # eviction timeout as a stall -- by then the cutoff is meaningless.
+            stall_threshold = max(self.reap_interval_s * 3, self.node_timeout_s * 0.5)
+            if gap > stall_threshold:
+                self._eviction_grace_until = mono + max(gap, self.node_timeout_s)
+                log.warning(
+                    "reaper stalled; deferring evictions",
+                    gap_s=round(gap, 1),
+                    expected_s=self.reap_interval_s,
+                    grace_s=round(self._eviction_grace_until - mono, 1),
+                )
+                return []
+
+        if mono < self._eviction_grace_until:
+            return []
+
         cutoff = now_ms() - self.node_timeout_s * 1000
         gone: list[str] = []
         with self._lock:
@@ -337,6 +399,8 @@ class NodeRegistry:
                     if node.status is not NodeStatus.OFFLINE and node.last_heartbeat_ms < cutoff:
                         node.status = NodeStatus.OFFLINE
                         gone.append(node.id)
+                    else:
+                        continue
                 self.store.put_node(node)
                 log.warning("node timed out -> offline", node=node.id, name=node.name)
                 self.events.publish("node_offline", {"id": node.id, "name": node.name})

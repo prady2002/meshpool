@@ -152,6 +152,9 @@ class ControlPlane:
         return True
 
     async def reaper_loop(self) -> None:
+        # Tell the registry how often we intend to call it, so it can recognise a
+        # stall in this loop and defer evictions rather than blaming the nodes.
+        self.registry.reap_interval_s = 2.0
         while True:
             try:
                 gone = self.registry.reap()
