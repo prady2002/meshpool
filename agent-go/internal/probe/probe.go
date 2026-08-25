@@ -112,8 +112,7 @@ func Probe(cfg config.Config) (Capability, Link) {
 	}
 
 	run(func() { cpuModel = detectCPUModel() })
-	run(func() { diskFree = detectDiskFreeMB() })
-	run(func() { diskTotal = detectDiskTotalMB() })
+	run(func() { diskFree, diskTotal = detectDiskMB() })
 	run(func() { thermal = detectThermalState() })
 	run(func() { battPowered, battPct = detectBattery() })
 	run(func() { link = measureLink(cfg.ControlPlaneURL) })
@@ -590,27 +589,51 @@ func networkClass(link Link) string {
 	return "wan"
 }
 
-func detectDiskTotalMB() int {
+// detectDiskMB returns (freeMB, totalMB) for the volume holding the working
+// directory, sampled in a single call.
+//
+// These used to be two independent detectors, and the total was computed as
+// Used+Free from Get-PSDrive. Both of those numbers move while the machine is
+// running and each rounds independently, so the "total" -- a static property of
+// the volume -- jittered by a megabyte between probes. That made every
+// heartbeat look like a capability change to the control plane, and it also
+// allowed free > total if the two spawns happened to straddle a large write.
+//
+// Reading Size and FreeSpace from one Win32_LogicalDisk row fixes all of that:
+// Size is the volume capacity and does not move, the two values are mutually
+// consistent because they come from the same sample, and it costs one child
+// process instead of two.
+func detectDiskMB() (free int, total int) {
 	switch runtime.GOOS {
 	case "windows":
 		cwd, err := os.Getwd()
 		if err != nil || len(cwd) < 2 || cwd[1] != ':' {
-			return 0
+			return 0, 0
 		}
 		drive := strings.ToUpper(string(cwd[0]))
 		out, err := exec.Command("powershell", "-NoProfile", "-Command",
-			fmt.Sprintf("$d = Get-PSDrive -Name %s; $d.Used + $d.Free", drive)).Output()
+			fmt.Sprintf(`$d = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='%s:'"; `+
+				`"$($d.FreeSpace)`+"`n"+`$($d.Size)"`, drive)).Output()
 		if err != nil {
-			return 0
+			return 0, 0
 		}
-		return parseBytesAsMB(string(out))
+		return parseFreeAndTotalMB(string(out))
 	default:
 		out, err := exec.Command("df", "-k", ".").Output()
 		if err != nil {
-			return 0
+			return 0, 0
 		}
-		return parseDFTotalMB(string(out))
+		return parseDFAvailableMB(string(out)), parseDFTotalMB(string(out))
 	}
+}
+
+// parseFreeAndTotalMB reads two byte counts on separate lines.
+func parseFreeAndTotalMB(text string) (free int, total int) {
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	if len(lines) < 2 {
+		return 0, 0
+	}
+	return parseBytesAsMB(lines[0]), parseBytesAsMB(lines[1])
 }
 
 // parseDFTotalMB reads the 1K-blocks (total size) column, where
@@ -629,29 +652,6 @@ func parseDFTotalMB(text string) int {
 		return 0
 	}
 	return int(kb / 1024)
-}
-
-func detectDiskFreeMB() int {
-	switch runtime.GOOS {
-	case "windows":
-		cwd, err := os.Getwd()
-		if err != nil || len(cwd) < 2 || cwd[1] != ':' {
-			return 0
-		}
-		drive := strings.ToUpper(string(cwd[0]))
-		out, err := exec.Command("powershell", "-NoProfile", "-Command",
-			fmt.Sprintf("(Get-PSDrive -Name %s).Free", drive)).Output()
-		if err != nil {
-			return 0
-		}
-		return parseBytesAsMB(string(out))
-	default:
-		out, err := exec.Command("df", "-k", ".").Output()
-		if err != nil {
-			return 0
-		}
-		return parseDFAvailableMB(string(out))
-	}
 }
 
 func parseDFAvailableMB(text string) int {

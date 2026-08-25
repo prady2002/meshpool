@@ -1,6 +1,8 @@
 package probe
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -50,6 +52,14 @@ func TestConcurrentProbeStillPopulatesEveryField(t *testing.T) {
 	if cap.DiskTotalMB <= 0 {
 		t.Errorf("DiskTotalMB = %d, want > 0", cap.DiskTotalMB)
 	}
+	// Free and total come from one sample of one volume, so free can never
+	// exceed total. When they were two separate child processes a large write
+	// landing between them could invert the pair, and a node advertising more
+	// free space than it physically has is a placement bug waiting to happen.
+	if cap.DiskMB > cap.DiskTotalMB {
+		t.Errorf("DiskMB = %d exceeds DiskTotalMB = %d; free and total are "+
+			"not from a consistent sample", cap.DiskMB, cap.DiskTotalMB)
+	}
 	if cap.FLOPSEstimate <= 0 {
 		t.Errorf("FLOPSEstimate = %v, want > 0", cap.FLOPSEstimate)
 	}
@@ -89,9 +99,72 @@ func TestRepeatedProbesAreStable(t *testing.T) {
 	}
 }
 
-// The sim harness pins fake capabilities, so detecting the real ones is pure
-// waste -- the answer is overwritten immediately. Skipping them must produce
-// exactly the values the overrides ask for.
+// The total size of a volume does not change while the machine is running, so
+// two probes must never disagree about it. This is a bug that was actually
+// observed in a real run, not a hypothetical:
+//
+//	--- FAIL: TestRepeatedProbesAreStable
+//	    run 0: DiskTotalMB = 487756, first run said 487755
+//
+// DiskTotalMB was derived as Used+Free from Get-PSDrive. Those are two live
+// counters and their sum is not guaranteed to equal the volume capacity --
+// Free is "bytes available to the caller", which reserved space and quotas can
+// push below the true free count, so the sum drifts below Size by a varying
+// amount. The volume's Size is the capacity and is invariant by definition.
+//
+// A capability field that changes between probes looks like a real capacity
+// change to the control plane and churns anything that diffs capabilities or
+// re-evaluates placement when they change.
+//
+// Honest scope: the drift is infrequent, so this is a regression detector
+// rather than a proof -- it caught the original defect and will catch a
+// systematic one, but a single clean run does not by itself establish that the
+// value is invariant. The stronger guarantee comes from the free <= total
+// invariant below, which a single consistent sample enforces structurally and
+// two independently-sampled child processes cannot.
+//
+// This drives detectDiskMB directly rather than the full Probe: one child
+// process per iteration instead of six, so it can afford real samples under
+// real disk activity.
+func TestDiskTotalDoesNotDriftUnderChurn(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode")
+	}
+
+	churn := filepath.Join(t.TempDir(), "churn.bin")
+	blob := make([]byte, 8<<20)
+
+	const samples = 8
+	seen := map[int]int{}
+	for i := 0; i < samples; i++ {
+		// Move real bytes so the used/free counters actually change; without
+		// this the old implementation looks stable on a quiet machine.
+		if err := os.WriteFile(churn, blob, 0o600); err != nil {
+			t.Fatalf("churn write: %v", err)
+		}
+		free, total := detectDiskMB()
+		if total <= 0 {
+			t.Fatalf("sample %d: total = %d, want > 0", i, total)
+		}
+		// Structural, not probabilistic: free and total come from one sample of
+		// one volume, so this cannot fail by luck. Two separate child processes
+		// could invert the pair if a large write landed between them, and a node
+		// advertising more free space than the disk has is a placement bug.
+		if free > total {
+			t.Fatalf("sample %d: free = %d exceeds total = %d; free and total "+
+				"are not from a consistent sample", i, free, total)
+		}
+		seen[total]++
+		_ = os.Remove(churn)
+	}
+
+	if len(seen) != 1 {
+		t.Fatalf("volume total drifted across %d samples: %v -- it must be a "+
+			"static property of the volume, not derived from live counters",
+			samples, seen)
+	}
+}
+
 func TestSimOverridesWinAndSkipTheirDetectors(t *testing.T) {
 	cfg := config.Config{
 		ControlPlaneURL: "http://127.0.0.1:9",
