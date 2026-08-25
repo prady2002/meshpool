@@ -138,9 +138,52 @@ def _resolve_owner(request: Request, cp) -> str:
     return "default"
 
 
+def _reject_bad_key(request: Request, cp) -> Optional[JSONResponse]:
+    """401 when a caller presents an API key that does not resolve to anyone.
+
+    Falling back to the ``default`` owner for an unrecognised key is worse than
+    it first looks. The request is served, the work is billed to somebody else,
+    and — because spend caps are per-owner — the caller's own cap never applies.
+    A typo in an API key would silently spend another account's credits.
+
+    Only an *explicitly wrong* credential is rejected here. A request with no
+    Authorization header at all keeps the existing open-mode behaviour, so
+    local single-machine use is unaffected.
+    """
+    tok = _bearer_token(request)
+    if not tok:
+        return None
+    if cp.accounts.owner_for_session(tok):
+        return None
+    principal = getattr(request.state, "principal", None)
+    if principal and getattr(principal, "kind", "") not in ("anonymous", None):
+        # A signed capability token presented as a bearer already resolved.
+        subj = getattr(principal, "subject", "")
+        if subj and subj != "anonymous":
+            return None
+    return openai_error(
+        "Incorrect API key provided. Use a MeshPool session token as the API "
+        "key; create one with `meshpool auth` or POST /api/v1/auth/local.",
+        error_type="invalid_request_error",
+        code="invalid_api_key",
+        status=401,
+    )
+
+
 def _check_credits(cp, owner: str) -> Optional[JSONResponse]:
-    """Return None if the owner may spend; return a 429 error response if capped."""
-    if cp.spend_caps.exceeded(owner):
+    """Return None if the owner may spend; return a 429 error response if capped.
+
+    Cap and balance lookups are wrapped because they touch the datastore. The
+    batch dispatcher's equivalent check deliberately fails **open** — an
+    infrastructure error must never freeze the mesh — and this path follows the
+    same rule, so a storage hiccup degrades to "allowed" rather than turning
+    every inference request into a 500.
+    """
+    try:
+        capped = cp.spend_caps.exceeded(owner)
+    except Exception:
+        capped = False
+    if capped:
         st = cp.spend_caps.status(owner)
         return openai_error(
             f"spend cap reached for {owner}: "
@@ -150,7 +193,11 @@ def _check_credits(cp, owner: str) -> Optional[JSONResponse]:
             code="insufficient_quota",
             status=429,
         )
-    if not cp.accounts.can_spend(owner):
+    try:
+        can_spend = cp.accounts.can_spend(owner)
+    except Exception:
+        can_spend = True
+    if not can_spend:
         return openai_error(
             f"insufficient compute-credits for {owner}: donate spare compute "
             "to earn credits, or link an account for a larger starter balance",
@@ -234,6 +281,9 @@ def register_openai_routes(app, cp_factory: Callable) -> None:  # noqa: C901
             return openai_error("service unavailable", "server_error", status=503)
 
         # Resolve owner and check spend cap
+        bad_key = _reject_bad_key(request, cp)
+        if bad_key is not None:
+            return bad_key
         owner = _resolve_owner(request, cp)
         cap_err = _check_credits(cp, owner)
         if cap_err is not None:
@@ -317,6 +367,9 @@ def register_openai_routes(app, cp_factory: Callable) -> None:  # noqa: C901
         except Exception:
             return openai_error("service unavailable", "server_error", status=503)
 
+        bad_key = _reject_bad_key(request, cp)
+        if bad_key is not None:
+            return bad_key
         owner = _resolve_owner(request, cp)
         cap_err = _check_credits(cp, owner)
         if cap_err is not None:

@@ -503,7 +503,7 @@ async def get_object(bucket: str, key: str, request: Request) -> Response:
         return _s3_err("NoSuchBucket", str(exc), 404)
 
     if data is None:
-        return _s3_err("NoSuchKey", "The specified key does not exist.", 418)
+        return _s3_err("NoSuchKey", "The specified key does not exist.", 404)
 
     meta = _s3_obj_meta.get((bucket, key), {})
     etag = meta.get("etag") or f'"{hashlib.md5(data).hexdigest()}"'

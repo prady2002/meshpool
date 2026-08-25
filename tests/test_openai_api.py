@@ -363,17 +363,23 @@ class TestBearerAuth:
         assert r.status_code == 200, (
             f"Bearer session token must be accepted, got {r.status_code}: {r.text}")
 
-    def test_invalid_bearer_token_falls_back_to_default_in_open_mode(self, home_app):
-        """In open mode an invalid Bearer token falls back to 'default' owner."""
+    def test_invalid_bearer_token_is_rejected(self, home_app):
+        """An unrecognised API key must NOT be served as the 'default' owner.
+
+        This test previously asserted the opposite (HTTP 200, silently falling
+        back to the "default" owner). That billed another account for the work
+        and bypassed the caller's own per-owner spend cap, so one typo in a key
+        would spend someone else's credits. OpenAI answers 401 invalid_api_key.
+        """
         with TestClient(home_app) as client:
             _inject_mock_inference(home_app)
             r = client.post(
                 "/v1/chat/completions",
                 json={"messages": [{"role": "user", "content": "hi"}]},
-                headers={"Authorization": "Bearer invalid-token-xyz"},
+                headers={"Authorization": "Bearer sk-definitely-not-a-valid-key"},
             )
-        # In open mode the request still succeeds (defaults to "default" owner)
-        assert r.status_code == 200, r.text
+        assert r.status_code == 401, r.text
+        assert r.json()["error"]["code"] == "invalid_api_key"
 
 
 # ---------------------------------------------------------------------------
@@ -407,3 +413,56 @@ class TestErrorEnvelope:
         body = r.json()
         assert "error" in body
         assert "message" in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# A wrong API key must be rejected, not silently billed to someone else
+# ---------------------------------------------------------------------------
+
+class TestWrongApiKeyIsRejected:
+    """An unrecognised key used to fall through to the ``default`` owner.
+
+    That is worse than it sounds: the request is served, the work is billed to
+    another account, and because spend caps are per-owner the caller's own cap
+    never applies. A single typo in an API key would spend someone else's
+    credits. OpenAI answers 401 ``invalid_api_key``; so must we.
+    """
+
+    def test_chat_rejects_unknown_bearer(self, home_app):
+        c = TestClient(home_app)
+        r = c.post("/v1/chat/completions",
+                   headers={"Authorization": "Bearer sk-not-a-real-key"},
+                   json={"model": "nano-gpt",
+                         "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 401, r.text
+        body = r.json()
+        assert body["error"]["code"] == "invalid_api_key"
+
+    def test_completions_rejects_unknown_bearer(self, home_app):
+        c = TestClient(home_app)
+        r = c.post("/v1/completions",
+                   headers={"Authorization": "Bearer sk-not-a-real-key"},
+                   json={"model": "nano-gpt", "prompt": "hi"})
+        assert r.status_code == 401, r.text
+        assert r.json()["error"]["code"] == "invalid_api_key"
+
+    def test_no_header_at_all_is_still_allowed_in_open_mode(self, home_app):
+        """Absent credential keeps existing behaviour; only a WRONG one fails.
+
+        Without this control the test above could pass simply because the
+        endpoint rejects everything.
+        """
+        c = TestClient(home_app)
+        r = c.post("/v1/chat/completions",
+                   json={"model": "nano-gpt",
+                         "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code != 401, r.text
+
+    def test_error_body_uses_the_openai_envelope(self, home_app):
+        c = TestClient(home_app)
+        r = c.post("/v1/chat/completions",
+                   headers={"Authorization": "Bearer nope"},
+                   json={"model": "nano-gpt",
+                         "messages": [{"role": "user", "content": "hi"}]})
+        err = r.json()["error"]
+        assert set(("message", "type", "code")).issubset(err.keys())
