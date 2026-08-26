@@ -315,6 +315,8 @@ class DeploySubmit(BaseModel):
     site: Optional[dict[str, str]] = None
     start_cmd: Optional[str] = None
     env: Optional[dict[str, str]] = None
+    autoscale_min: Optional[int] = None
+    autoscale_max: Optional[int] = None
 
 
 class ModelDeploySubmit(BaseModel):
@@ -902,7 +904,8 @@ def _register_routes(app: FastAPI) -> None:
     _declare_route("GET",    "/api/v1/dags",                  Scope.JOBS_READ)
     _declare_route("GET",    "/api/v1/dags/{dag_id}",         Scope.JOBS_READ)
     _declare_route("POST",   "/api/v1/deployments",           Scope.DEPLOYMENTS_WRITE)
-    _declare_route("POST",   "/api/v1/deployments/upload",    Scope.DEPLOYMENTS_WRITE)
+    _declare_route("PUT",    "/api/v1/deployments/{dep_id}", Scope.DEPLOYMENTS_WRITE)
+    _declare_route("POST",   "/api/v1/deployments/upload",   Scope.DEPLOYMENTS_WRITE)
     _declare_route("GET",    "/api/v1/deployments",           Scope.DEPLOYMENTS_READ)
     _declare_route("GET",    "/api/v1/deployments/{dep_id}",  Scope.DEPLOYMENTS_READ)
     _declare_route("DELETE", "/api/v1/deployments/{dep_id}",  Scope.DEPLOYMENTS_WRITE)
@@ -1561,7 +1564,44 @@ def _register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=400, detail=f"invalid env: {exc}")
         dep = await cp.hosting.deploy(req.name, req.app, req.replicas, owner,
                                      site=site, site_blob_id=site_blob_id,
-                                     start_cmd=req.start_cmd, env=env)
+                                     start_cmd=req.start_cmd, env=env,
+                                     autoscale_min=req.autoscale_min,
+                                     autoscale_max=req.autoscale_max)
+        return {"id": dep.id, "status": dep.status, "replicas": len(dep.replicas)}
+
+    @app.put("/api/v1/deployments/{dep_id}")
+    async def rollout_deployment(dep_id: str, req: DeploySubmit, request: Request) -> dict:
+        cp = _cp()
+        owner = _consumer_owner(cp, request, req.owner)
+        _require_credits(cp, owner)
+        site = None
+        site_blob_id = None
+        if req.site:
+            from ..hosting.site import MAX_BUNDLE_BYTES, SiteTooLarge, normalize_site
+            try:
+                site = normalize_site(req.site, require_index=req.start_cmd is None)
+            except SiteTooLarge:
+                try:
+                    site = normalize_site(req.site, require_index=req.start_cmd is None,
+                                          max_bytes=MAX_BUNDLE_BYTES)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=f"invalid site: {exc}")
+                site_blob_id = await _pool_bundle(cp, site, owner, req.name)
+                site = None
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"invalid site: {exc}")
+        from ..hosting.site import clean_env
+        try:
+            env = clean_env(req.env)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"invalid env: {exc}")
+        dep = await cp.hosting.rollout(dep_id, req.name, req.app, req.replicas, owner,
+                                      site=site, site_blob_id=site_blob_id,
+                                      start_cmd=req.start_cmd, env=env,
+                                      autoscale_min=req.autoscale_min,
+                                      autoscale_max=req.autoscale_max)
+        if dep is None:
+            raise HTTPException(status_code=404, detail="unknown deployment")
         return {"id": dep.id, "status": dep.status, "replicas": len(dep.replicas)}
 
     @app.post("/api/v1/deployments/upload")
@@ -1877,6 +1917,7 @@ def _register_routes(app: FastAPI) -> None:
     async def proxy_app(dep_id: str, path: str, request: Request):
         cp = _cp()
         from fastapi.responses import StreamingResponse
+        t0 = time.perf_counter()
         body = await request.body()
         # Forward the client's real request headers (Cookie, Authorization,
         # Content-Type, Accept, ...) so a genuine stateful app behaves normally;
@@ -1934,7 +1975,10 @@ def _register_routes(app: FastAPI) -> None:
             if aff != replica.id:   # (re)pin this client to the serving replica
                 resp.set_cookie(_AFF_COOKIE, replica.id, path=f"/app/{dep_id}/",
                                 httponly=True, samesite="lax", max_age=3600)
+            cp.hosting.record_request(dep_id, upstream.status_code,
+                                      (time.perf_counter() - t0) * 1000.0)
             return resp
+        cp.hosting.record_request(dep_id, 502, (time.perf_counter() - t0) * 1000.0)
         raise HTTPException(status_code=502, detail=last_err)
 
     @app.get("/app/{dep_id}")

@@ -90,6 +90,12 @@ def _post(path: str, body: Optional[dict] = None) -> dict:
     return r.json()
 
 
+def _put(path: str, body: Optional[dict] = None) -> dict:
+    r = httpx.put(f"{base_url()}{path}", json=body or {}, headers=_auth_headers(), timeout=300)
+    r.raise_for_status()
+    return r.json()
+
+
 def _delete(path: str) -> dict:
     r = httpx.request("DELETE", f"{base_url()}{path}", headers=_auth_headers(), timeout=30)
     r.raise_for_status()
@@ -602,6 +608,16 @@ def deploy(target: str = typer.Argument("hello",
            cmd: str = typer.Option("", "--cmd",
                help="start command for a dynamic app; its server must listen on $PORT "
                     "(e.g. \"python server.py\"). Auto-detected from Procfile/meshpool.json."),
+           build: bool = typer.Option(True, "--build/--no-build",
+               help="run an auto-detected build command before uploading static output"),
+           autoscale_min: int = typer.Option(0, "--autoscale-min",
+               help="minimum replicas for request-driven autoscaling (0 = fixed size)"),
+           autoscale_max: int = typer.Option(0, "--autoscale-max",
+               help="maximum replicas for request-driven autoscaling (0 = fixed size)"),
+           domain: str = typer.Option("", "--domain",
+               help="custom domain to attach when domain automation exists"),
+           tls: bool = typer.Option(False, "--tls",
+               help="request managed TLS when certificate automation exists"),
            env: Optional[list[str]] = typer.Option(None, "--env", "-e",
                help="set an env var for a dynamic app as KEY=VALUE (repeatable), e.g. "
                     "-e DATABASE_URL=postgres://... -e DEBUG=1"),
@@ -619,7 +635,21 @@ def deploy(target: str = typer.Argument("hello",
     ``meshpool deploy ./api --cmd "python server.py" -r 2``.
     """
     from ..hosting import site as sitelib
+    from ..hosting.frameworks import prepare_app
+    if domain:
+        _fail(_UnavailableBackend(
+            "custom domains are not available in this build; deploy returns a "
+            f"{base_url()}/app/<deployment>/ URL"
+        ))
+    if tls:
+        _fail(_UnavailableBackend(
+            "managed TLS is not available in this build; terminate TLS in front of "
+            "the control plane until certificate automation exists"
+        ))
     body: dict = {"replicas": replicas}
+    if autoscale_min or autoscale_max:
+        body["autoscale_min"] = autoscale_min or replicas
+        body["autoscale_max"] = max(autoscale_max or replicas, body["autoscale_min"])
     env_map: dict[str, str] = {}
     for item in (env or []):
         key, sep, val = item.partition("=")
@@ -628,9 +658,17 @@ def deploy(target: str = typer.Argument("hello",
         env_map[key.strip()] = val
     p = Path(target)
     if p.is_dir():
-        start_cmd = cmd or _detect_start_cmd(p)
         try:
-            site = sitelib.pack_dir(str(p), require_index=not start_cmd,
+            plan = prepare_app(p, explicit_cmd=cmd, run_build=build)
+        except Exception as exc:  # noqa: BLE001
+            _fail(exc)
+        if plan.wrote_config:
+            console.print(f"[dim]wrote {plan.root / 'meshpool.json'} "
+                          f"({plan.framework}, {plan.kind})[/]")
+        start_cmd = plan.start_cmd
+        bundle_dir = plan.root if start_cmd else plan.deploy_dir
+        try:
+            site = sitelib.pack_dir(str(bundle_dir), require_index=not start_cmd,
                                     max_bytes=sitelib.MAX_BUNDLE_BYTES)
         except ValueError as exc:
             _fail(exc)
@@ -664,10 +702,21 @@ def deploy(target: str = typer.Argument("hello",
     if env_map:
         body["env"] = env_map
     try:
-        r = _post("/api/v1/deployments", body)
+        existing = None
+        try:
+            deployments = _get("/api/v1/deployments").get("deployments", [])
+            existing = next((d for d in deployments if d.get("name") == dep_name), None)
+        except Exception:
+            existing = None
+        if existing:
+            r = _put(f"/api/v1/deployments/{existing['id']}", body)
+            action = "rolled out"
+        else:
+            r = _post("/api/v1/deployments", body)
+            action = "deploying"
     except Exception as exc:  # noqa: BLE001
         _fail(exc)
-    console.print(f"[green]deploying[/] {summary} -> [bold]{r['id']}[/] "
+    console.print(f"[green]{action}[/] {summary} -> [bold]{r['id']}[/] "
                   f"({r['replicas']} replicas, status {r['status']})")
     console.print(f"[dim]serve at {base_url()}/app/{r['id']}/[/]")
 

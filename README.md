@@ -564,6 +564,12 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   **calibrated projection**. What is not implemented yet: fiat invoices, payouts,
   taxes, regional price books, or a guarantee that today's in-process metering gate
   proves every future service adapter's production transport path.
+- **Mesh Apps now roll forward, but not into managed edge hosting.** App deploys
+  auto-detect common Vite/React, Node, FastAPI and Flask layouts, write the detected
+  plan to `meshpool.json`, and blue/green rollouts keep the old version serving until
+  the new one is health-checked. Routing uses only healthy replicas, and autoscale
+  decisions come from observed proxy traffic. What is not implemented here: managed
+  TLS certificates, DNS automation, global edge POPs, or custom-domain provisioning.
 - **Proof-of-storage audits are per-chunk hashes, not a Merkle tree or PoRep.** Nodes are
   challenged on a random chunk offset and must return its SHA-256. A node that deleted the
   bytes fails. A determined cheater *can* defeat this by caching the chunk hash table

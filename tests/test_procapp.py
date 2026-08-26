@@ -10,7 +10,6 @@ the CLI's Procfile/``meshpool.json`` start-command auto-detection.
 from __future__ import annotations
 
 import asyncio
-import asyncio
 import base64
 import time
 import types
@@ -22,6 +21,7 @@ from meshpool.agent import runtime
 from meshpool.cli.main import _detect_start_cmd
 from meshpool.common.models import Deployment, Replica
 from meshpool.common.transport import HttpTransport
+from meshpool.hosting.frameworks import infer_app, prepare_app
 from meshpool.hosting import site
 from meshpool.hosting.engine import HostingManager
 
@@ -274,6 +274,39 @@ def test_detect_start_cmd_static_site_returns_empty(tmp_path):
     assert _detect_start_cmd(tmp_path) == ""
 
 
+def test_framework_detection_writes_vite_static_config(tmp_path, monkeypatch):
+    (tmp_path / "package.json").write_text(
+        '{"scripts":{"build":"vite build"},"devDependencies":{"vite":"latest"}}',
+        encoding="utf-8")
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "index.html").write_text("<h1>built</h1>", encoding="utf-8")
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("meshpool.hosting.frameworks.subprocess.run", fake_run)
+    plan = prepare_app(tmp_path)
+    assert plan.kind == "site"
+    assert plan.framework == "vite"
+    assert plan.deploy_dir == tmp_path / "dist"
+    assert calls and calls[0][0][0] == "npm run build"
+    manifest = (tmp_path / "meshpool.json").read_text(encoding="utf-8")
+    assert '"framework": "vite"' in manifest
+    assert '"output": "dist"' in manifest
+
+
+def test_framework_detection_fastapi_start_cmd(tmp_path):
+    (tmp_path / "requirements.txt").write_text("fastapi\nuvicorn\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("from fastapi import FastAPI\napp = FastAPI()\n",
+                                     encoding="utf-8")
+    plan = infer_app(tmp_path)
+    assert plan.kind == "proc"
+    assert plan.framework == "fastapi"
+    assert "uvicorn app:app" in plan.start_cmd
+
+
 # --------------------------- session affinity ------------------------------ #
 def _manager_with_deployment(dep) -> HostingManager:
     class FakeStore:
@@ -375,6 +408,117 @@ def test_remove_unknown_deployment_returns_false_and_touches_nothing():
     assert stopped == [] and deleted == []
 
 
+# --------------------------- blue/green + health --------------------------- #
+def _manager_for_rollout(old_dep):
+    records: dict[str, Deployment] = {old_dep.id: old_dep}
+    stopped: list[str] = []
+    started: list[str] = []
+
+    class FakeStore:
+        def get_deployment(self, dep_id):
+            return records.get(dep_id)
+
+        def put_deployment(self, dep):
+            records[dep.id] = dep.model_copy(deep=True)
+
+        def list_deployments(self):
+            return list(records.values())
+
+    class FakeRegistry:
+        def schedulable_nodes(self):
+            return [
+                types.SimpleNamespace(id="n1", name="node-1",
+                                      provides=lambda svc: svc == "hosting",
+                                      donatable_cpu_slots=lambda: 4),
+                types.SimpleNamespace(id="n2", name="node-2",
+                                      provides=lambda svc: svc == "hosting",
+                                      donatable_cpu_slots=lambda: 4),
+            ]
+
+        def get(self, node_id):
+            return types.SimpleNamespace(id=node_id)
+
+        def online(self):
+            return self.schedulable_nodes()
+
+    class FakeTransport:
+        async def call(self, node_id, method, payload, timeout=None):
+            if method == "start_replica":
+                started.append(payload["replica_id"])
+                return {"replica_id": payload["replica_id"], "url": f"http://{node_id}"}
+            if method == "stop_replica":
+                stopped.append(payload["replica_id"])
+            return {}
+
+    class FakeEvents:
+        def publish(self, *a, **k):
+            pass
+
+    mgr = object.__new__(HostingManager)
+    mgr.store = FakeStore()
+    mgr.registry = FakeRegistry()
+    mgr.transport = FakeTransport()
+    mgr.events = FakeEvents()
+    mgr.storage = None
+    mgr._rr = {}
+    mgr._lock = asyncio.Lock()
+    mgr._traffic = {}
+    mgr._autoscale = {}
+    return mgr, records, started, stopped
+
+
+def test_rollout_keeps_old_replicas_until_new_version_is_healthy(monkeypatch):
+    old_replica = Replica(id="old", node_id="n1", node_name="node-1",
+                          url="http://old", healthy=True)
+    old_dep = _dep_with([old_replica])
+    old_dep.replicas_desired = 1
+    mgr, records, started, stopped = _manager_for_rollout(old_dep)
+    seen_during_health = {}
+
+    async def healthy(replica):
+        seen_during_health["replicas"] = [r.id for r in records["dep-1"].replicas]
+        return True
+
+    monkeypatch.setattr(mgr, "_healthy", healthy)
+    monkeypatch.setenv("MESHPOOL_ROLLOUT_DRAIN_S", "0")
+    dep = asyncio.run(mgr.rollout("dep-1", "app", "site", 1, site={"index.html": b64("v2")}))
+    assert dep is not None
+    assert seen_during_health["replicas"] == ["old"]
+    assert records["dep-1"].replicas[0].id in started
+    assert stopped == ["old"]
+
+
+def test_rollout_failure_restores_old_replicas(monkeypatch):
+    old_replica = Replica(id="old", node_id="n1", node_name="node-1",
+                          url="http://old", healthy=True)
+    old_dep = _dep_with([old_replica])
+    old_dep.replicas_desired = 1
+    mgr, records, _started, stopped = _manager_for_rollout(old_dep)
+
+    async def unhealthy(_replica):
+        return False
+
+    monkeypatch.setattr(mgr, "_healthy", unhealthy)
+    dep = asyncio.run(mgr.rollout("dep-1", "app", "site", 1, site={"index.html": b64("v2")}))
+    assert dep is not None
+    assert records["dep-1"].replicas == [old_replica]
+    assert records["dep-1"].status == "running"
+    assert stopped and stopped != ["old"]
+
+
+def test_autoscale_raises_desired_replicas_on_slow_real_requests():
+    old_dep = _dep_with([Replica(id="r1", node_id="n1", node_name="node-1",
+                                 url="http://one", healthy=True)])
+    old_dep.replicas_desired = 1
+    mgr, records, _started, _stopped = _manager_for_rollout(old_dep)
+    mgr._set_autoscale("dep-1", replicas=1, min_replicas=1, max_replicas=3)
+    for _ in range(12):
+        mgr.record_request("dep-1", 200, 400.0)
+    changed = asyncio.run(mgr._autoscale_deployment(records["dep-1"]))
+    assert changed is True
+    assert records["dep-1"].replicas_desired == 2
+
+
 # --------------------------- header passthrough ---------------------------- #
 def test_http_transport_proxy_forwards_request_and_response_headers():
     captured = {}
@@ -398,4 +542,3 @@ def test_http_transport_proxy_forwards_request_and_response_headers():
     # and the app's own response headers (Set-Cookie!) come back for the browser
     assert res.status_code == 200
     assert res.headers.get("set-cookie") == "sid=abc; Path=/"
-

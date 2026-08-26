@@ -171,6 +171,12 @@ def test_ledger_labels_credit_totals_as_measured():
     assert "mesh-seconds (measured)" in r.output
 
 
+def test_deploy_custom_domain_fails_as_unavailable():
+    r = runner.invoke(app, ["deploy", "hello", "--domain", "app.example.com"])
+    assert r.exit_code == 2, r.output
+    assert "custom domains are not available" in r.output
+
+
 # ---------------------------------------------------------------------------
 # Task 1: --control-plane global flag
 # ---------------------------------------------------------------------------

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import time
 from collections import Counter
 from typing import Optional
 
@@ -39,6 +41,8 @@ class HostingManager:
         self.transport = transport
         self._rr: dict[str, int] = {}   # deployment_id -> round-robin cursor
         self._lock = asyncio.Lock()     # serialize deploy/remove/reconcile mutations
+        self._traffic: dict[str, list[tuple[float, int, float]]] = {}
+        self._autoscale: dict[str, dict[str, int]] = {}
         # Set post-construction (lifespan) to the pooled StorageManager. A LARGE app's
         # bundle lives in the pool (content-addressed, chunked, replicated) and is
         # hydrated from here on each replica start instead of travelling inline.
@@ -92,11 +96,14 @@ class HostingManager:
                      site: Optional[dict[str, str]] = None,
                      start_cmd: Optional[str] = None,
                      env: Optional[dict[str, str]] = None,
-                     site_blob_id: Optional[str] = None) -> Deployment:
+                     site_blob_id: Optional[str] = None,
+                     autoscale_min: Optional[int] = None,
+                     autoscale_max: Optional[int] = None) -> Deployment:
         dep = Deployment(id=new_id("dep"), name=name, app=app, site=site,
                          site_blob_id=site_blob_id,
                          start_cmd=start_cmd, env=env or {},
                          replicas_desired=max(1, replicas), owner=owner, status="deploying")
+        self._set_autoscale(dep.id, dep.replicas_desired, autoscale_min, autoscale_max)
         self.store.put_deployment(dep)
         self.events.publish("deploy", {"id": dep.id, "app": app, "replicas": replicas})
         async with self._lock:
@@ -105,6 +112,55 @@ class HostingManager:
         self.store.put_deployment(dep)
         log.info("deployed", dep=dep.id, app=app, placed=len(dep.replicas), desired=replicas)
         return dep
+
+    async def rollout(self, dep_id: str, name: str, app: str, replicas: int,
+                      owner: str = "default",
+                      site: Optional[dict[str, str]] = None,
+                      start_cmd: Optional[str] = None,
+                      env: Optional[dict[str, str]] = None,
+                      site_blob_id: Optional[str] = None,
+                      autoscale_min: Optional[int] = None,
+                      autoscale_max: Optional[int] = None) -> Optional[Deployment]:
+        """Blue/green update: start the new version, health-check it, then drain old.
+
+        The store keeps the old replica set until enough new replicas have passed
+        health checks. The proxy therefore continues serving the previous version
+        while the candidate boots, and only swaps traffic after the new pool is live.
+        """
+        async with self._lock:
+            old = self.store.get_deployment(dep_id)
+            if not old:
+                return None
+            old_replicas = list(old.replicas)
+            desired = max(1, replicas)
+            candidate = Deployment(
+                id=old.id, name=name, app=app, site=site, site_blob_id=site_blob_id,
+                start_cmd=start_cmd, env=env or {}, replicas_desired=desired,
+                owner=owner, status="deploying")
+            old.status = "rolling_out"
+            self.store.put_deployment(old)
+            new_replicas = await self._start_replicas(candidate, desired, persist=False)
+            healthy_new = [r for r in new_replicas if r.healthy]
+            if len(healthy_new) < desired:
+                for r in new_replicas:
+                    await self._stop_replica(r)
+                old.status = "running" if any(r.healthy for r in old_replicas) else "degraded"
+                self.store.put_deployment(old)
+                self.events.publish("rollout_failed", {"id": dep_id, "healthy": len(healthy_new),
+                                                       "desired": desired})
+                return old
+            candidate.replicas = healthy_new
+            candidate.status = "running"
+            self._set_autoscale(dep_id, desired, autoscale_min, autoscale_max)
+            self.store.put_deployment(candidate)
+            self.events.publish("rollout", {"id": dep_id, "replicas": desired})
+
+        drain_s = float(os.environ.get("MESHPOOL_ROLLOUT_DRAIN_S", "1.0"))
+        if drain_s > 0:
+            await asyncio.sleep(drain_s)
+        for r in old_replicas:
+            await self._stop_replica(r)
+        return candidate
 
     async def remove(self, dep_id: str) -> bool:
         async with self._lock:
@@ -144,12 +200,16 @@ class HostingManager:
         missing = dep.replicas_desired - len(dep.replicas)
         if missing <= 0:
             return 0
+        return len(await self._start_replicas(dep, missing, persist=True))
+
+    async def _start_replicas(self, dep: Deployment, count: int,
+                              persist: bool = True) -> list[Replica]:
         site = await self._hydrate_site(dep)
-        placed = 0
-        for node in self._placement(dep, missing):
+        placed: list[Replica] = []
+        for node in self._placement(dep, count):
+            replica_id = new_id("rep")
             try:
-                payload = {"deployment_id": dep.id, "replica_id": new_id("rep"),
-                           "app": dep.app}
+                payload = {"deployment_id": dep.id, "replica_id": replica_id, "app": dep.app}
                 if site:
                     payload["site"] = site
                 if dep.start_cmd:
@@ -157,15 +217,32 @@ class HostingManager:
                 if dep.env:
                     payload["env"] = dep.env
                 body = await self.transport.call(node.id, "start_replica", payload, timeout=8.0)
-                dep.replicas.append(Replica(
+                replica = Replica(
                     id=body["replica_id"], node_id=node.id, node_name=node.name,
-                    url=body["url"], healthy=True))
-                placed += 1
+                    url=body["url"], healthy=False)
+                replica.healthy = await self._healthy(replica)
+                if replica.healthy:
+                    dep.replicas.append(replica)
+                    placed.append(replica)
+                else:
+                    await self._stop_replica(replica)
             except Exception as exc:  # noqa: BLE001
                 log.warning("replica start failed", node=node.id, err=str(exc)[:120])
-        if placed:
+        if placed and persist:
             self.store.put_deployment(dep)
         return placed
+
+    async def _scale_down(self, dep: Deployment, desired: int) -> int:
+        desired = max(1, desired)
+        if len(dep.replicas) <= desired:
+            return 0
+        extra = sorted(dep.replicas, key=lambda r: (r.healthy, r.started_ms))[:len(dep.replicas) - desired]
+        for r in extra:
+            await self._stop_replica(r)
+        dep.replicas = [r for r in dep.replicas if r not in extra]
+        dep.replicas_desired = desired
+        self.store.put_deployment(dep)
+        return len(extra)
 
     async def _hydrate_site(self, dep: Deployment) -> Optional[dict[str, str]]:
         """Return the site map to ship to a replica. A small app carries its bundle
@@ -242,6 +319,45 @@ class HostingManager:
                 self.store.put_deployment(dep)
                 self.events.publish("replica_lost", {"id": dep.id, "node": node_id})
 
+    def _set_autoscale(self, dep_id: str, replicas: int,
+                       min_replicas: Optional[int], max_replicas: Optional[int]) -> None:
+        mn = replicas if min_replicas is None else max(1, min_replicas)
+        mx = replicas if max_replicas is None else max(mn, max_replicas)
+        self._autoscale[dep_id] = {"min": mn, "max": mx}
+
+    def record_request(self, dep_id: str, status_code: int, duration_ms: float) -> None:
+        now = time.time()
+        bucket = self._traffic.setdefault(dep_id, [])
+        bucket.append((now, int(status_code), float(duration_ms)))
+        cutoff = now - 120.0
+        del bucket[:-200]
+        while bucket and bucket[0][0] < cutoff:
+            bucket.pop(0)
+
+    async def _autoscale_deployment(self, dep: Deployment) -> bool:
+        cfg = self._autoscale.get(dep.id)
+        if not cfg:
+            return False
+        now = time.time()
+        recent = [x for x in self._traffic.get(dep.id, []) if now - x[0] <= 30.0]
+        healthy = sum(1 for r in dep.replicas if r.healthy)
+        if len(recent) >= max(10, healthy * 8):
+            avg_ms = sum(x[2] for x in recent) / len(recent)
+            errors = sum(1 for _ts, status, _dur in recent if status >= 500)
+            if (avg_ms > 250.0 or errors) and dep.replicas_desired < cfg["max"]:
+                dep.replicas_desired += 1
+                self.events.publish("autoscale", {"id": dep.id, "desired": dep.replicas_desired,
+                                                  "reason": "traffic"})
+                self.store.put_deployment(dep)
+                return True
+        idle_for = (now - self._traffic.get(dep.id, [(dep.created_ms / 1000.0, 200, 0.0)])[-1][0])
+        if idle_for > 120.0 and dep.replicas_desired > cfg["min"]:
+            await self._scale_down(dep, dep.replicas_desired - 1)
+            self.events.publish("autoscale", {"id": dep.id, "desired": dep.replicas_desired,
+                                              "reason": "idle"})
+            return True
+        return False
+
     async def _reconcile(self) -> None:
         live = {n.id for n in self.registry.online()}
         for dep in self.store.list_deployments():
@@ -255,6 +371,8 @@ class HostingManager:
                 h = await self._healthy(r)
                 if h != r.healthy:
                     r.healthy, changed = h, True
+            if await self._autoscale_deployment(dep):
+                changed = True
             # self-heal back to desired replica count (failover / autoscale)
             if len([r for r in dep.replicas if r.healthy]) < dep.replicas_desired:
                 if await self._scale_up(dep):
