@@ -28,6 +28,7 @@ reference permutation.
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
@@ -201,6 +202,7 @@ def _layer_index(name: str) -> Optional[int]:
         return None
 
 
+@contextlib.contextmanager
 def _open_reader(path: str):
     """``GGUFReader`` with one exception type on failure.
 
@@ -211,12 +213,20 @@ def _open_reader(path: str):
     from a half-downloaded file would otherwise take down the scheduler.
     """
     gguf = _require_gguf()
+    reader = None
     try:
-        return gguf.GGUFReader(path, "r")
+        reader = gguf.GGUFReader(path, "r")
     except GGUFUnsupported:
         raise
     except Exception as exc:
         raise GGUFUnsupported(f"cannot read GGUF {path!r}: {exc}") from exc
+    try:
+        yield reader
+    finally:
+        if reader is not None:
+            mm = getattr(getattr(reader, "data", None), "_mmap", None)
+            if mm is not None:
+                mm.close()
 
 
 def read_info(path: str) -> GGUFInfo:
@@ -225,109 +235,111 @@ def read_info(path: str) -> GGUFInfo:
     Cheap enough to call on the control plane for placement decisions: it reads
     the header and tensor directory, never the weights.
     """
-    reader = _open_reader(path)
-    arch = _arch(reader)
+    with _open_reader(path) as reader:
+        arch = _arch(reader)
 
-    def a(suffix, default=None):
-        return _field(reader, f"{arch}.{suffix}", default)
+        def a(suffix, default=None):
+            return _field(reader, f"{arch}.{suffix}", default)
 
-    n_layer = a("block_count")
-    d_model = a("embedding_length")
-    n_head = a("attention.head_count")
-    if n_layer is None or d_model is None or n_head is None:
-        raise GGUFUnsupported(
-            f"GGUF '{arch}' is missing block_count/embedding_length/head_count; "
-            f"MeshPool cannot determine its geometry")
+        n_layer = a("block_count")
+        d_model = a("embedding_length")
+        n_head = a("attention.head_count")
+        if n_layer is None or d_model is None or n_head is None:
+            raise GGUFUnsupported(
+                f"GGUF '{arch}' is missing block_count/embedding_length/head_count; "
+                f"MeshPool cannot determine its geometry")
 
-    n_kv_head = a("attention.head_count_kv", n_head)
-    d_ff = a("feed_forward_length")
-    tensors = {t.name: t for t in reader.tensors}
-    if d_ff is None:
-        gate = tensors.get("blk.0.ffn_gate.weight") or tensors.get("blk.0.ffn_up.weight")
-        if gate is None and a("expert_feed_forward_length") is not None:
-            d_ff = int(a("expert_feed_forward_length"))
-        elif gate is None:
-            raise GGUFUnsupported(f"GGUF '{arch}' has no feed_forward_length and no ffn tensors")
+        n_kv_head = a("attention.head_count_kv", n_head)
+        d_ff = a("feed_forward_length")
+        tensors = {t.name: t for t in reader.tensors}
+        if d_ff is None:
+            gate = tensors.get("blk.0.ffn_gate.weight") or tensors.get("blk.0.ffn_up.weight")
+            if gate is None and a("expert_feed_forward_length") is not None:
+                d_ff = int(a("expert_feed_forward_length"))
+            elif gate is None:
+                raise GGUFUnsupported(f"GGUF '{arch}' has no feed_forward_length and no ffn tensors")
+            else:
+                d_ff = int(gate.data.shape[0])
+
+        vocab = _field(reader, "tokenizer.ggml.tokens")
+        if vocab is None:
+            embd = tensors.get("token_embd.weight")
+            if embd is None:
+                raise GGUFUnsupported("GGUF has neither a tokenizer vocab nor token_embd.weight")
+            vocab_size = int(embd.data.shape[0])
         else:
-            d_ff = int(gate.data.shape[0])
+            vocab_size = len(reader.fields["tokenizer.ggml.tokens"].data)
 
-    vocab = _field(reader, "tokenizer.ggml.tokens")
-    if vocab is None:
-        embd = tensors.get("token_embd.weight")
-        if embd is None:
-            raise GGUFUnsupported("GGUF has neither a tokenizer vocab nor token_embd.weight")
-        vocab_size = int(embd.data.shape[0])
-    else:
-        vocab_size = len(reader.fields["tokenizer.ggml.tokens"].data)
+        moe_meta = _moe_metadata(reader, arch)
+        expert_count = int(moe_meta["expert_count"] or 0)
+        expert_used_count = int(moe_meta["expert_used_count"] or 0)
+        cfg = ModelConfig(
+            name=str(_field(reader, "general.name") or arch),
+            vocab_size=int(vocab_size),
+            d_model=int(d_model),
+            n_head=int(n_head),
+            n_kv_head=int(n_kv_head),
+            n_layer=int(n_layer),
+            block_size=int(a("context_length", 2048) or 2048),
+            d_ff=int(d_ff),
+            architecture="llama",
+            rope_theta=float(a("rope.freq_base", 10000.0) or 10000.0),
+            rms_norm_eps=float(a("attention.layer_norm_rms_epsilon", 1e-5) or 1e-5),
+            expert_count=expert_count,
+            expert_used_count=expert_used_count,
+            expert_feed_forward_length=(
+                int(moe_meta["expert_feed_forward_length"])
+                if moe_meta["expert_feed_forward_length"] is not None else None),
+            expert_shared_feed_forward_length=(
+                int(moe_meta["expert_shared_feed_forward_length"])
+                if moe_meta["expert_shared_feed_forward_length"] is not None else None),
+        )
 
-    moe_meta = _moe_metadata(reader, arch)
-    expert_count = int(moe_meta["expert_count"] or 0)
-    expert_used_count = int(moe_meta["expert_used_count"] or 0)
-    cfg = ModelConfig(
-        name=str(_field(reader, "general.name") or arch),
-        vocab_size=int(vocab_size),
-        d_model=int(d_model),
-        n_head=int(n_head),
-        n_kv_head=int(n_kv_head),
-        n_layer=int(n_layer),
-        block_size=int(a("context_length", 2048) or 2048),
-        d_ff=int(d_ff),
-        architecture="llama",
-        rope_theta=float(a("rope.freq_base", 10000.0) or 10000.0),
-        rms_norm_eps=float(a("attention.layer_norm_rms_epsilon", 1e-5) or 1e-5),
-        expert_count=expert_count,
-        expert_used_count=expert_used_count,
-        expert_feed_forward_length=(
-            int(moe_meta["expert_feed_forward_length"])
-            if moe_meta["expert_feed_forward_length"] is not None else None),
-        expert_shared_feed_forward_length=(
-            int(moe_meta["expert_shared_feed_forward_length"])
-            if moe_meta["expert_shared_feed_forward_length"] is not None else None),
-    )
+        layer_bytes = [0] * int(n_layer)
+        moe_tensor_names: list[list[str]] = [[] for _ in range(int(n_layer))]
+        quantizations: dict[str, int] = {}
+        total = 0
+        for name, t in tensors.items():
+            nbytes = int(t.n_bytes)
+            total += nbytes
+            qname = t.tensor_type.name
+            quantizations[qname] = quantizations.get(qname, 0) + nbytes
+            idx = _layer_index(name)
+            if idx is not None and 0 <= idx < len(layer_bytes):
+                layer_bytes[idx] += nbytes
+                if _is_moe_tensor(name):
+                    moe_tensor_names[idx].append(name)
 
-    layer_bytes = [0] * int(n_layer)
-    moe_tensor_names: list[list[str]] = [[] for _ in range(int(n_layer))]
-    quantizations: dict[str, int] = {}
-    total = 0
-    for name, t in tensors.items():
-        nbytes = int(t.n_bytes)
-        total += nbytes
-        qname = t.tensor_type.name
-        quantizations[qname] = quantizations.get(qname, 0) + nbytes
-        idx = _layer_index(name)
-        if idx is not None and 0 <= idx < len(layer_bytes):
-            layer_bytes[idx] += nbytes
-            if _is_moe_tensor(name):
-                moe_tensor_names[idx].append(name)
+        moe_layers = []
+        for idx, names in enumerate(moe_tensor_names):
+            actual_experts = expert_count
+            for name in names:
+                if any(name.endswith(s) for s in _MOE_EXPERT_SUFFIXES):
+                    actual_experts = int(tensors[name].data.shape[0])
+                    break
+            moe_layers.append(GGUFLayerMoEInfo(
+                layer=idx,
+                is_moe=bool(names),
+                expert_count=int(actual_experts or 0),
+                expert_used_count=int(expert_used_count or (1 if names else 0)),
+                bytes=int(layer_bytes[idx]),
+                tensor_names=tuple(sorted(names))))
+        if expert_count > 0 and not any(m.is_moe for m in moe_layers):
+            raise GGUFUnsupported(
+                f"GGUF '{arch}' declares expert_count={expert_count} but has no MoE expert tensors")
 
-    moe_layers = []
-    for idx, names in enumerate(moe_tensor_names):
-        actual_experts = expert_count
-        for name in names:
-            if any(name.endswith(s) for s in _MOE_EXPERT_SUFFIXES):
-                actual_experts = int(tensors[name].data.shape[0])
-                break
-        moe_layers.append(GGUFLayerMoEInfo(
-            layer=idx,
-            is_moe=bool(names),
-            expert_count=int(actual_experts or 0),
-            expert_used_count=int(expert_used_count or (1 if names else 0)),
-            bytes=int(layer_bytes[idx]),
-            tensor_names=tuple(sorted(names))))
-    if expert_count > 0 and not any(m.is_moe for m in moe_layers):
-        raise GGUFUnsupported(
-            f"GGUF '{arch}' declares expert_count={expert_count} but has no MoE expert tensors")
-
-    info = GGUFInfo(
-        path=path,
-        architecture=arch,
-        config=cfg,
-        tied_embeddings="output.weight" not in tensors,
-        quantizations=quantizations,
-        layer_bytes=layer_bytes,
-        total_bytes=total,
-        moe_layers=tuple(moe_layers),
-    )
+        tied_embeddings = "output.weight" not in tensors
+        info = GGUFInfo(
+            path=path,
+            architecture=arch,
+            config=cfg,
+            tied_embeddings=tied_embeddings,
+            quantizations=quantizations,
+            layer_bytes=layer_bytes,
+            total_bytes=total,
+            moe_layers=tuple(moe_layers),
+        )
+        del tensors
     # per_layer_mb drives placement, so derive it from the file rather than the
     # simulated default the toy model uses.
     object.__setattr__(info, "config", _with_per_layer_mb(
@@ -351,14 +363,14 @@ def _dequant(gguf, tensor) -> np.ndarray:
     data = tensor.data
     qtype = tensor.tensor_type
     if qtype in (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16):
-        return np.asarray(data, dtype=np.float32)
+        return np.array(data, dtype=np.float32, copy=True)
     try:
         out = gguf.quants.dequantize(data, qtype)
     except Exception as exc:
         raise GGUFUnsupported(
             f"tensor {tensor.name!r} uses quantization {qtype.name}, which this "
             f"build of the gguf package cannot dequantize: {exc}") from exc
-    return np.asarray(out, dtype=np.float32)
+    return np.array(out, dtype=np.float32, copy=True)
 
 
 def load_params(path: str, start: int, end: int, is_first: bool, is_last: bool,
@@ -376,61 +388,62 @@ def load_params(path: str, start: int, end: int, is_first: bool, is_last: bool,
         raise ValueError(
             f"layer range [{start}, {end}) is outside this model's 0..{cfg.n_layer}")
 
-    reader = _open_reader(path)
-    tensors = {t.name: t for t in reader.tensors}
-    permute = info.architecture in _ROPE_PERMUTED_ARCHES
+    with _open_reader(path) as reader:
+        tensors = {t.name: t for t in reader.tensors}
+        permute = info.architecture in _ROPE_PERMUTED_ARCHES
 
-    def take(name: str) -> np.ndarray:
-        t = tensors.get(name)
-        if t is None:
-            raise GGUFUnsupported(
-                f"checkpoint is missing tensor {name!r}; MeshPool cannot run a "
-                f"partial '{info.architecture}' model")
-        return _dequant(gguf, t)
+        def take(name: str) -> np.ndarray:
+            t = tensors.get(name)
+            if t is None:
+                raise GGUFUnsupported(
+                    f"checkpoint is missing tensor {name!r}; MeshPool cannot run a "
+                    f"partial '{info.architecture}' model")
+            return _dequant(gguf, t)
 
-    P: dict[str, np.ndarray] = {}
-    for i in range(start, end):
-        is_moe = bool(info.moe_layers and info.moe_layers[i].is_moe)
-        for suffix, param, transpose in _ATTN_LAYER_MAP:
-            w = take(f"blk.{i}.{suffix}")
-            if permute and suffix == "attn_q.weight":
-                w = unpermute_rope(w, cfg.n_head)
-            elif permute and suffix == "attn_k.weight":
-                w = unpermute_rope(w, cfg.kv_heads)
-            P[f"h{i}.{param}"] = np.ascontiguousarray(w.T if transpose else w,
-                                                      dtype=np.float32)
-        if is_moe:
-            router = take(f"blk.{i}.ffn_gate_inp.weight")
-            P[f"h{i}.mlp.Wrouter"] = np.ascontiguousarray(router.T, dtype=np.float32)
-            for suffix, param in (
-                ("ffn_gate_exps.weight", "Wgate_exps"),
-                ("ffn_up_exps.weight", "Wup_exps"),
-                ("ffn_down_exps.weight", "Wdown_exps"),
-            ):
+        P: dict[str, np.ndarray] = {}
+        for i in range(start, end):
+            is_moe = bool(info.moe_layers and info.moe_layers[i].is_moe)
+            for suffix, param, transpose in _ATTN_LAYER_MAP:
                 w = take(f"blk.{i}.{suffix}")
-                P[f"h{i}.mlp.{param}"] = np.ascontiguousarray(
-                    np.swapaxes(w, -1, -2), dtype=np.float32)
-            for suffix, param in (
-                ("ffn_gate_shexp.weight", "Wgate_shexp"),
-                ("ffn_up_shexp.weight", "Wup_shexp"),
-                ("ffn_down_shexp.weight", "Wdown_shexp"),
-            ):
-                name = f"blk.{i}.{suffix}"
-                if name in tensors:
-                    w = take(name)
-                    P[f"h{i}.mlp.{param}"] = np.ascontiguousarray(w.T, dtype=np.float32)
-        else:
-            for suffix, param, transpose in _DENSE_FFN_MAP:
-                w = take(f"blk.{i}.{suffix}")
+                if permute and suffix == "attn_q.weight":
+                    w = unpermute_rope(w, cfg.n_head)
+                elif permute and suffix == "attn_k.weight":
+                    w = unpermute_rope(w, cfg.kv_heads)
                 P[f"h{i}.{param}"] = np.ascontiguousarray(w.T if transpose else w,
                                                           dtype=np.float32)
+            if is_moe:
+                router = take(f"blk.{i}.ffn_gate_inp.weight")
+                P[f"h{i}.mlp.Wrouter"] = np.ascontiguousarray(router.T, dtype=np.float32)
+                for suffix, param in (
+                    ("ffn_gate_exps.weight", "Wgate_exps"),
+                    ("ffn_up_exps.weight", "Wup_exps"),
+                    ("ffn_down_exps.weight", "Wdown_exps"),
+                ):
+                    w = take(f"blk.{i}.{suffix}")
+                    P[f"h{i}.mlp.{param}"] = np.ascontiguousarray(
+                        np.swapaxes(w, -1, -2), dtype=np.float32)
+                for suffix, param in (
+                    ("ffn_gate_shexp.weight", "Wgate_shexp"),
+                    ("ffn_up_shexp.weight", "Wup_shexp"),
+                    ("ffn_down_shexp.weight", "Wdown_shexp"),
+                ):
+                    name = f"blk.{i}.{suffix}"
+                    if name in tensors:
+                        w = take(name)
+                        P[f"h{i}.mlp.{param}"] = np.ascontiguousarray(w.T, dtype=np.float32)
+            else:
+                for suffix, param, transpose in _DENSE_FFN_MAP:
+                    w = take(f"blk.{i}.{suffix}")
+                    P[f"h{i}.{param}"] = np.ascontiguousarray(w.T if transpose else w,
+                                                              dtype=np.float32)
 
-    if is_first or is_last:
-        P["wte"] = take("token_embd.weight")
-    if is_last:
-        P["lnf.g"] = take("output_norm.weight")
-        if not info.tied_embeddings:
-            P["out"] = take("output.weight")
+        if is_first or is_last:
+            P["wte"] = take("token_embd.weight")
+        if is_last:
+            P["lnf.g"] = take("output_norm.weight")
+            if not info.tied_embeddings:
+                P["out"] = take("output.weight")
+        del tensors
     return P
 
 
@@ -447,31 +460,30 @@ def read_vocab(path: str) -> dict[str, Any]:
     to do with an unsupported tokenizer model instead of failing at import time.
     """
     gguf = _require_gguf()
-    reader = _open_reader(path)
+    with _open_reader(path) as reader:
+        def _list(key: str) -> list:
+            f = reader.fields.get(key)
+            if f is None:
+                return []
+            return [f.contents(i) for i in range(len(f.data))]
 
-    def _list(key: str) -> list:
-        f = reader.fields.get(key)
-        if f is None:
-            return []
-        return [f.contents(i) for i in range(len(f.data))]
-
-    tokens = _list("tokenizer.ggml.tokens")
-    return {
-        "model": str(_field(reader, "tokenizer.ggml.model") or ""),
-        "pre": str(_field(reader, "tokenizer.ggml.pre") or ""),
-        "tokens": [t if isinstance(t, str) else str(t) for t in tokens],
-        "scores": _list("tokenizer.ggml.scores"),
-        "token_type": _list("tokenizer.ggml.token_type"),
-        "merges": [m if isinstance(m, str) else str(m)
-                   for m in _list("tokenizer.ggml.merges")],
-        "bos_id": _field(reader, "tokenizer.ggml.bos_token_id"),
-        "eos_id": _field(reader, "tokenizer.ggml.eos_token_id"),
-        "add_bos": bool(_field(reader, "tokenizer.ggml.add_bos_token", True)),
-        "remove_extra_whitespaces": bool(
-            _field(reader, "tokenizer.ggml.remove_extra_whitespaces", False)),
-        "add_space_prefix": bool(
-            _field(reader, "tokenizer.ggml.add_space_prefix", True)),
-    }
+        tokens = _list("tokenizer.ggml.tokens")
+        return {
+            "model": str(_field(reader, "tokenizer.ggml.model") or ""),
+            "pre": str(_field(reader, "tokenizer.ggml.pre") or ""),
+            "tokens": [t if isinstance(t, str) else str(t) for t in tokens],
+            "scores": _list("tokenizer.ggml.scores"),
+            "token_type": _list("tokenizer.ggml.token_type"),
+            "merges": [m if isinstance(m, str) else str(m)
+                       for m in _list("tokenizer.ggml.merges")],
+            "bos_id": _field(reader, "tokenizer.ggml.bos_token_id"),
+            "eos_id": _field(reader, "tokenizer.ggml.eos_token_id"),
+            "add_bos": bool(_field(reader, "tokenizer.ggml.add_bos_token", True)),
+            "remove_extra_whitespaces": bool(
+                _field(reader, "tokenizer.ggml.remove_extra_whitespaces", False)),
+            "add_space_prefix": bool(
+                _field(reader, "tokenizer.ggml.add_space_prefix", True)),
+        }
 
 
 @functools.lru_cache(maxsize=8)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -71,7 +72,7 @@ def _loaded_moe_param_owners(path: str, info: G.GGUFInfo, parts: list[LayerAssig
 
 def main() -> int:  # noqa: C901
     ok = True
-    work = ROOT / ".meshpool_moe_gate"
+    work = Path(tempfile.mkdtemp(prefix="meshpool_moe_gate_"))
     try:
         print("== honest scope ==")
         print("  real GGUF format + measured tensor bytes + layer-range sharding")
@@ -79,9 +80,6 @@ def main() -> int:  # noqa: C901
 
         print("\n== test 1: write and parse a real MoE GGUF checkpoint ==")
         from gguf_fixtures import build_moe_llama_gguf
-        if work.exists():
-            shutil.rmtree(work)
-        work.mkdir()
         path = str(work / "moe.gguf")
         build_moe_llama_gguf(
             path, n_layer=6, d_model=32, n_head=4, n_kv_head=2, d_ff=32,
@@ -166,7 +164,7 @@ def main() -> int:  # noqa: C901
         import traceback
         traceback.print_exc()
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(work)
     return 0 if ok else 1
 
 

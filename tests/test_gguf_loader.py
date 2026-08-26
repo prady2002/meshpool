@@ -18,8 +18,12 @@ The assertions that matter most:
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
+import shutil
+import tempfile
 
 from gguf_fixtures import build_llama_gguf, build_moe_llama_gguf, permute_rope_reference
 from meshpool.inference import gguf_loader as G
@@ -181,6 +185,24 @@ class TestMoEMetadata:
             vocab_size=64, dense_layers=(0, 1))
         with pytest.raises(G.GGUFUnsupported, match="declares expert_count=4"):
             G.read_info(p)
+
+    def test_loader_public_apis_release_windows_memmap_locks(self):
+        tmpdir = tempfile.mkdtemp(prefix="meshpool_gguf_lock_")
+        try:
+            p = str(Path(tmpdir) / "lock.gguf")
+            build_moe_llama_gguf(
+                p, n_layer=3, d_model=32, n_head=4, n_kv_head=2, d_ff=32,
+                expert_count=2, expert_used_count=1, expert_ff=64, shared_ff=16,
+                vocab_size=64, dense_layers=(0,))
+            info = G.read_info(p)
+            params = G.load_params(p, 1, 2, False, False, info=info)
+            vocab = G.read_vocab(p)
+            assert params and vocab["tokens"]
+            shutil.rmtree(tmpdir)
+        except Exception:
+            if Path(tmpdir).exists():
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            raise
 
 
 class TestPartialLoad:
