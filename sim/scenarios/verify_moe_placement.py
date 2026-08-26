@@ -24,6 +24,16 @@ from meshpool.controlplane.scheduler import explain_layer_bytes_fit, topology_pa
 from meshpool.inference import gguf_loader as G  # noqa: E402
 from meshpool.inference import model as M  # noqa: E402
 
+MOE_PARAM_SUFFIXES = {
+    "mlp.Wrouter",
+    "mlp.Wgate_exps",
+    "mlp.Wup_exps",
+    "mlp.Wdown_exps",
+    "mlp.Wgate_shexp",
+    "mlp.Wup_shexp",
+    "mlp.Wdown_shexp",
+}
+
 
 def _node(nid: str, ram_mb: int = 2) -> Node:
     return Node(
@@ -44,6 +54,21 @@ def _run_partition(path: str, info: G.GGUFInfo, parts: list[LayerAssignment], to
     return np.asarray(h, dtype=np.float32)
 
 
+def _loaded_moe_param_owners(path: str, info: G.GGUFInfo, parts: list[LayerAssignment]) -> dict[int, dict[str, set[str]]]:
+    owners: dict[int, dict[str, set[str]]] = {}
+    for p in parts:
+        params = G.load_params(path, p.start_layer, p.end_layer, p.is_first, p.is_last, info=info)
+        for name in params:
+            if not name.startswith("h"):
+                continue
+            layer_text, suffix = name.split(".", 1)
+            if suffix not in MOE_PARAM_SUFFIXES:
+                continue
+            layer = int(layer_text[1:])
+            owners.setdefault(layer, {}).setdefault(suffix, set()).add(p.node_id)
+    return owners
+
+
 def main() -> int:  # noqa: C901
     ok = True
     work = ROOT / ".meshpool_moe_gate"
@@ -61,7 +86,7 @@ def main() -> int:  # noqa: C901
         build_moe_llama_gguf(
             path, n_layer=6, d_model=32, n_head=4, n_kv_head=2, d_ff=32,
             expert_count=4, expert_used_count=2, expert_ff=768, shared_ff=16,
-            vocab_size=64, dense_layers=(0,))
+            vocab_size=128, dense_layers=(0,), seed=20240820)
         info = G.read_info(path)
         print(f"  {G.describe(info)}")
         print(f"  layer_bytes={info.layer_bytes}")
@@ -75,10 +100,20 @@ def main() -> int:  # noqa: C901
         parts = topology_partition_by_bytes(nodes, info.layer_bytes)
         assert parts, "checkpoint should fit this pool"
         G.validate_moe_expert_colocation(info, parts)
+        loaded_owners = _loaded_moe_param_owners(path, info, parts)
+        for m in info.moe_layers:
+            if not m.is_moe:
+                continue
+            per_param = loaded_owners.get(m.layer, {})
+            expected = {"mlp.Wrouter", "mlp.Wgate_exps", "mlp.Wup_exps", "mlp.Wdown_exps",
+                        "mlp.Wgate_shexp", "mlp.Wup_shexp", "mlp.Wdown_shexp"}
+            assert expected.issubset(per_param), f"MoE layer {m.layer} missing loaded params: {expected - set(per_param)}"
+            layer_nodes = set().union(*per_param.values())
+            assert len(layer_nodes) == 1, f"MoE layer {m.layer} loaded params split across {sorted(layer_nodes)}"
         for p in parts:
             used = G.layer_span_bytes(info, p.start_layer, p.end_layer)
             print(f"  {p.node_id}: layers [{p.start_layer}:{p.end_layer}) -> {used} bytes")
-        print("  PASS: every MoE layer's router, experts, and shared experts have exactly one node owner")
+        print("  PASS: every MoE layer's loaded router, experts, and shared experts have exactly one node owner")
 
         print("\n== test 3: placement is byte-balanced, not layer-balanced ==")
         cap = int(2 * 0.8 * 1024 * 1024)
@@ -109,15 +144,19 @@ def main() -> int:  # noqa: C901
         print("\n== test 5: sharded MoE generation is bit-exact vs single process at temperature 0 ==")
         prompt = [1, 5, 9, 13]
         full = G.load_full_params(path, info)
+        single_logits = M.forward_full(full, info.config, prompt)
+        sharded_logits = _run_partition(path, info, parts, prompt)
+        max_delta = float(np.max(np.abs(sharded_logits - single_logits)))
+        print(f"  logits max|delta|={max_delta:.9g}")
+        assert np.array_equal(sharded_logits, single_logits), f"logits differ; max|delta|={max_delta}"
         single = M.generate_with(lambda ctx: M.forward_full(full, info.config, ctx), info.config,
-                                 prompt, max_new_tokens=4, temperature=0.0)
+                                 prompt, max_new_tokens=6, temperature=0.0)
         sharded = M.generate_with(lambda ctx: _run_partition(path, info, parts, ctx), info.config,
-                                  prompt, max_new_tokens=4, temperature=0.0)
+                                  prompt, max_new_tokens=6, temperature=0.0)
         print(f"  single={single}")
         print(f"  sharded={sharded}")
         assert sharded == single
-        logits = _run_partition(path, info, parts, prompt)
-        assert np.isfinite(logits).all() and logits.std() > 1e-6
+        assert len(set(single)) > 1, f"degenerate output {single}; equality proves nothing"
         print("  PASS: MoE layer-range sharding is mathematically identical")
 
         print("\nALL MOE PLACEMENT CHECKS PASSED")

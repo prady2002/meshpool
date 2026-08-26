@@ -28,7 +28,7 @@ def moe_ckpt(tmp_path_factory):
     build_moe_llama_gguf(
         path, n_layer=6, d_model=32, n_head=4, n_kv_head=2, d_ff=32,
         expert_count=4, expert_used_count=2, expert_ff=768, shared_ff=16,
-        vocab_size=64, dense_layers=(0,))
+        vocab_size=128, dense_layers=(0,), seed=20240820)
     return path, G.read_info(path)
 
 
@@ -69,6 +69,31 @@ def test_byte_partitioner_balances_non_uniform_layers(moe_ckpt):
     assert any(G.layer_span_bytes(info, a, b) > cap for a, b in naive)
 
 
+def test_partition_loaded_params_keep_moe_layer_experts_together(moe_ckpt):
+    path, info = moe_ckpt
+    parts = topology_partition_by_bytes(
+        [_node("n1"), _node("n2"), _node("n3"), _node("n4"), _node("n5")],
+        info.layer_bytes)
+    owners: dict[int, dict[str, set[str]]] = {}
+    expected = {"mlp.Wrouter", "mlp.Wgate_exps", "mlp.Wup_exps", "mlp.Wdown_exps",
+                "mlp.Wgate_shexp", "mlp.Wup_shexp", "mlp.Wdown_shexp"}
+    for p in parts:
+        params = G.load_params(path, p.start_layer, p.end_layer,
+                               p.is_first, p.is_last, info=info)
+        for name in params:
+            if not name.startswith("h"):
+                continue
+            layer_text, suffix = name.split(".", 1)
+            if suffix not in expected:
+                continue
+            owners.setdefault(int(layer_text[1:]), {}).setdefault(suffix, set()).add(p.node_id)
+    for m in info.moe_layers:
+        if not m.is_moe:
+            continue
+        assert expected.issubset(owners[m.layer])
+        assert len(set().union(*owners[m.layer].values())) == 1
+
+
 def test_pool_too_small_fails_honestly(moe_ckpt):
     _path, info = moe_ckpt
     nodes = [_node("n1", ram_mb=1)]
@@ -93,8 +118,9 @@ def test_moe_sharded_generation_is_bit_exact(moe_ckpt):
     cfg = info.config
     full = G.load_full_params(path, info)
     prompt = [1, 5, 9, 13]
+    single_logits = M.forward_full(full, cfg, prompt)
     reference = M.generate_with(lambda ctx: M.forward_full(full, cfg, ctx), cfg,
-                                prompt, max_new_tokens=4, temperature=0.0)
+                                prompt, max_new_tokens=6, temperature=0.0)
 
     parts = topology_partition_by_bytes(
         [_node("n1"), _node("n2"), _node("n3"), _node("n4"), _node("n5")],
@@ -112,11 +138,11 @@ def test_moe_sharded_generation_is_bit_exact(moe_ckpt):
             is_tokens = False
         return np.asarray(h, dtype=np.float32)
 
-    sharded = M.generate_with(run, cfg, prompt, max_new_tokens=4, temperature=0.0)
+    sharded_logits = run(prompt)
+    assert np.array_equal(sharded_logits, single_logits)
+    sharded = M.generate_with(run, cfg, prompt, max_new_tokens=6, temperature=0.0)
     assert sharded == reference
-    logits = run(prompt)
-    assert np.isfinite(logits).all()
-    assert logits.std() > 1e-6
+    assert len(set(reference)) > 1
 
 
 def test_gguf_backend_uses_measured_layer_bytes(moe_ckpt):
