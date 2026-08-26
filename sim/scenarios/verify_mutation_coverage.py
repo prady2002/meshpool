@@ -139,6 +139,48 @@ MUTATIONS = [
             "that asserts the identity total_charged == gross_earnings + platform_fee."
         ),
     },
+    {
+        "id": "wasm-fuel-budget-inflated",
+        "path": "meshpool/functions/wasm.py",
+        "old": b"store.set_fuel(limits.fuel)",
+        "new": b"store.set_fuel(limits.fuel * 1000)",
+        "cmd": [sys.executable, "sim/scenarios/verify_user_wasm.py"],
+        "why": (
+            "Guest code gets a thousand times the CPU it was sold. Every honest "
+            "function still returns the same answer, so functional tests are blind to "
+            "it, and a runaway loop is eventually still stopped -- by the wall-clock "
+            "watchdog instead of the fuel meter. Detecting it requires asserting "
+            "*which* limit fired, not merely that something did. Contributors were "
+            "promised a bounded share of their machine."
+        ),
+    },
+    {
+        "id": "wasm-memory-cap-inflated",
+        "path": "meshpool/functions/wasm.py",
+        "old": b"store.set_limits(memory_size=limits.memory_bytes)",
+        "new": b"store.set_limits(memory_size=limits.memory_bytes * 1000)",
+        "cmd": [sys.executable, "sim/scenarios/verify_user_wasm.py"],
+        "why": (
+            "The 256 MB memory ceiling becomes 256 GB, so one hostile function can "
+            "swap a donated laptop to death. memory.grow succeeding more often never "
+            "makes a correct function fail, which is precisely why only a test that "
+            "deliberately allocates past the cap can see this."
+        ),
+    },
+    {
+        "id": "wasm-filesystem-preopened",
+        "path": "meshpool/functions/wasm.py",
+        "old": b"# NOTE: no preopen_dir call. That omission *is* the filesystem sandbox.",
+        "new": b'wasi.preopen_dir(".", "/")',
+        "cmd": [sys.executable, "sim/scenarios/verify_user_wasm.py"],
+        "why": (
+            "Hands the guest a real preopened directory rooted at the agent's working "
+            "directory, so path_open starts succeeding and untrusted code can read and "
+            "write the host's files. The filesystem sandbox here is an *omission* -- "
+            "nothing in the source says 'deny' -- so only a test that actively tries "
+            "to open a file can notice when the omission stops being true."
+        ),
+    },
 ]
 
 
@@ -202,7 +244,10 @@ def main() -> int:
                 tail = proc.stdout.decode("utf-8", "replace").strip().splitlines()[-6:]
                 print("   [SURVIVED] the guarding gate passed on broken code")
                 for line in tail:
-                    print(f"      | {line[:120]}")
+                    # Gate output carries arbitrary bytes; never let printing it
+                    # crash the harness and mask the finding it just made.
+                    safe = line[:120].encode("ascii", "replace").decode("ascii")
+                    print(f"      | {safe}")
             else:
                 print(f"   [caught] guarding gate failed as required "
                       f"(exit {proc.returncode})")

@@ -203,6 +203,90 @@ def _wait_job(cp: str, job_id: str, timeout: float = 120.0) -> dict:
     return last
 
 
+def _grow_module(pages: int) -> bytes:
+    """Try to grow linear memory by ``pages`` and print 1 if allowed, 0 if refused."""
+    return _wat(f"""
+(module
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "_start")
+    (local $g i32)
+    (local.set $g (memory.grow (i32.const {pages})))
+    (i32.store (i32.const 500)
+      (i32.add (i32.const 48) (i32.ne (local.get $g) (i32.const -1))))
+    (i32.store (i32.const 0) (i32.const 500))
+    (i32.store (i32.const 4) (i32.const 1))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 16)))))
+""")
+
+
+def _check_resource_limits() -> bool:
+    """The two ceilings that protect a donated machine must actually bind.
+
+    Both of these were unenforced by any test until a mutation exposed them:
+    multiplying the fuel budget by 1000, and multiplying the memory cap by 1000,
+    each left this gate completely green.
+
+    The reason is instructive. An honest function returns the identical answer
+    under either budget, so nothing functional notices. And a runaway loop is
+    still stopped either way -- by the wall-clock watchdog instead of the fuel
+    meter -- so a test asserting only "it was stopped" cannot tell an enforced
+    limit from an abandoned one. The assertions below therefore pin down *which*
+    ceiling fired, and pair every refusal with an acceptance proving the boundary
+    sits where it was configured rather than somewhere convenient.
+    """
+    from meshpool.functions.wasm import FunctionError, Limits, run
+
+    ok = True
+    page = 64 * 1024
+    generous_clock, tiny_fuel = 60.0, 1_000_000
+
+    # -- fuel: a spin loop must die on instructions, with time to spare -------
+    try:
+        run(_spin_module(), {}, Limits(fuel=tiny_fuel, wall_timeout_s=generous_clock))
+        ok = check("a runaway loop is stopped by the fuel meter", False,
+                   "it ran to completion")
+    except FunctionError as exc:
+        ok = check("a runaway loop is stopped by the fuel meter",
+                   exc.kind == "fuel",
+                   f"stopped by {exc.kind!r} instead, with {generous_clock}s of "
+                   f"wall clock still unused — the CPU budget is not binding") and ok
+
+    # -- control: the wall clock is a *separate* mechanism, and still works ---
+    try:
+        run(_spin_module(), {}, Limits(fuel=10**18, wall_timeout_s=0.5))
+        ok = check("the wall clock stops what fuel does not", False,
+                   "it ran to completion")
+    except FunctionError as exc:
+        ok = check("the wall clock stops what fuel does not",
+                   exc.kind == "timeout",
+                   f"got {exc.kind!r}; the two limits are not distinguishable, so "
+                   f"either one could rot unnoticed") and ok
+
+    # -- fuel is metered, not merely capped ----------------------------------
+    res = run(_triple_module(), {"x": 7}, Limits(fuel=500_000_000, wall_timeout_s=30))
+    ok = check("an honest function reports real fuel consumption",
+               res.value == {"tripled": 21} and 0 < res.fuel_used < 500_000_000,
+               f"value={res.value!r} fuel_used={res.fuel_used}") and ok
+
+    # -- memory: the cap binds exactly where it was set -----------------------
+    # 96 pages = 6 MiB of growth. Refused under an 4 MiB ceiling, allowed under
+    # a 64 MiB one. Testing only the refusal would pass on a cap of zero; testing
+    # only the acceptance would pass on no cap at all.
+    grow = _grow_module(96)
+    denied = run(grow, {}, Limits(memory_bytes=4 * page * 16, wall_timeout_s=30))
+    ok = check("growing past the memory ceiling is refused",
+               denied.value == 0,
+               f"guest grew by 6 MiB under a 4 MiB cap (returned {denied.value!r})") and ok
+    allowed = run(grow, {}, Limits(memory_bytes=64 * page * 16, wall_timeout_s=30))
+    ok = check("growing within the memory ceiling is allowed",
+               allowed.value == 1,
+               f"guest was refused 6 MiB under a 64 MiB cap (returned "
+               f"{allowed.value!r}) — the cap is not where it was configured") and ok
+    return ok
+
+
 def main() -> int:  # noqa: C901
     try:
         import wasmtime  # noqa: F401
@@ -211,6 +295,10 @@ def main() -> int:  # noqa: C901
         return 0
 
     print("== verifying: a user's own WASM code runs across the mesh ==", flush=True)
+
+    print("\n-- resource ceilings bind before any cluster is involved --")
+    if not _check_resource_limits():
+        return 1
 
     h = Harness(n_agents=3, cp_port=CP_PORT, scale="home", data_dir=str(DATA))
     try:
