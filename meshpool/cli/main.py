@@ -11,7 +11,7 @@ import os
 import json
 import hashlib
 from pathlib import Path
-from typing import Optional
+from typing import Any, Iterable, Optional
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -27,6 +27,11 @@ console = Console()
 
 # Module-level override set by the --control-plane global flag; None means "not set".
 _override_url: Optional[str] = None
+_CONFIG_ENV = "MESHPOOL_CLI_CONFIG"
+
+
+class _UnavailableBackend(RuntimeError):
+    """Raised when a command maps to a product surface this build cannot serve."""
 
 
 @app.callback()
@@ -60,46 +65,87 @@ def base_url() -> str:
     """Return the control-plane base URL.
 
     Precedence: ``--control-plane`` flag > ``MESHPOOL_CONTROL_PLANE_URL`` env var >
-    built-in default (``http://127.0.0.1:8080``).
+    saved ``meshpool login`` control plane > built-in default (``http://127.0.0.1:8080``).
     """
     if _override_url is not None:
         return _override_url.rstrip("/")
-    return os.environ.get("MESHPOOL_CONTROL_PLANE_URL", "http://127.0.0.1:8080").rstrip("/")
+    env_url = os.environ.get("MESHPOOL_CONTROL_PLANE_URL")
+    if env_url:
+        return env_url.rstrip("/")
+    cfg_url = str(_load_config().get("control_plane") or "")
+    if cfg_url:
+        return cfg_url.rstrip("/")
+    return "http://127.0.0.1:8080"
 
 
 def _get(path: str) -> dict:
-    r = httpx.get(f"{base_url()}{path}", timeout=30)
+    r = httpx.get(f"{base_url()}{path}", headers=_auth_headers(), timeout=30)
     r.raise_for_status()
     return r.json()
 
 
 def _post(path: str, body: Optional[dict] = None) -> dict:
-    r = httpx.post(f"{base_url()}{path}", json=body or {}, timeout=120)
+    r = httpx.post(f"{base_url()}{path}", json=body or {}, headers=_auth_headers(), timeout=120)
     r.raise_for_status()
     return r.json()
 
 
 def _delete(path: str) -> dict:
-    r = httpx.request("DELETE", f"{base_url()}{path}", timeout=30)
+    r = httpx.request("DELETE", f"{base_url()}{path}", headers=_auth_headers(), timeout=30)
     r.raise_for_status()
     return r.json()
 
 
 def _post_bytes(path: str, data: bytes, content_type: str = "application/octet-stream") -> dict:
     r = httpx.post(f"{base_url()}{path}", content=data,
-                   headers={"Content-Type": content_type}, timeout=300)
+                   headers={**_auth_headers(), "Content-Type": content_type}, timeout=300)
     r.raise_for_status()
     return r.json()
 
 
 def _get_bytes(path: str) -> bytes:
-    r = httpx.get(f"{base_url()}{path}", timeout=300)
+    r = httpx.get(f"{base_url()}{path}", headers=_auth_headers(), timeout=300)
     r.raise_for_status()
     return r.content
 
 
+def _config_path() -> Path:
+    return Path(os.environ.get(_CONFIG_ENV, "") or (Path.home() / ".meshpool" / "config.json"))
+
+
+def _load_config() -> dict[str, Any]:
+    path = _config_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_config(data: dict[str, Any]) -> None:
+    path = _config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _session_token() -> str:
+    return os.environ.get("MESHPOOL_SESSION", "") or str(_load_config().get("session_token") or "")
+
+
+def _auth_headers() -> dict[str, str]:
+    token = _session_token()
+    return {"X-MeshPool-Session": token, "Authorization": f"Bearer {token}"} if token else {}
+
+
 def _fail(exc: Exception) -> None:
     detail = str(exc)
+    if isinstance(exc, _UnavailableBackend):
+        console.print(f"[bold red]unavailable:[/] {detail}")
+        raise typer.Exit(2)
     if isinstance(exc, httpx.HTTPStatusError):
         try:
             detail = exc.response.json().get("detail", detail)
@@ -107,6 +153,61 @@ def _fail(exc: Exception) -> None:
             detail = exc.response.text
     console.print(f"[bold red]error:[/] {detail}")
     raise typer.Exit(1)
+
+
+def _tiered(value: Any, unit: str, tier: str) -> str:
+    return f"{value} {unit} ({tier})"
+
+
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    parsed = urlparse(uri)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError("expected s3://bucket/key")
+    key = parsed.path.lstrip("/")
+    if not key:
+        raise ValueError("expected s3://bucket/key")
+    return parsed.netloc, key
+
+
+def _iter_files(root: Path) -> Iterable[tuple[Path, str]]:
+    if root.is_file():
+        yield root, root.name
+        return
+    if root.is_dir():
+        for item in sorted(p for p in root.rglob("*") if p.is_file()):
+            yield item, item.relative_to(root).as_posix()
+        return
+    raise FileNotFoundError(str(root))
+
+
+@app.command()
+def login(
+    browser: bool = typer.Option(
+        False,
+        "--browser",
+        help="Use hosted browser OAuth when available; local control planes use loopback login.",
+    ),
+) -> None:
+    """Create and save a MeshPool session token with no key copy/paste."""
+    if browser:
+        _fail(_UnavailableBackend(
+            "browser OAuth is not available in this build; using no-copy local login is supported "
+            "with `meshpool login` against a loopback control plane"
+        ))
+    try:
+        r = httpx.post(f"{base_url()}/api/v1/auth/local", json={}, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
+    token = str(data.get("session_token") or "")
+    if not token:
+        _fail(RuntimeError("/api/v1/auth/local did not return a session_token"))
+    cfg = _load_config()
+    cfg.update({"control_plane": base_url(), "owner": data.get("owner"), "session_token": token})
+    _save_config(cfg)
+    console.print(f"[green]logged in[/] {data.get('owner', 'local')} at {base_url()}")
+    console.print("[dim]token stored locally; use MESHPOOL_SESSION to override for automation[/]")
 
 
 # --------------------------------------------------------------------------- #
@@ -125,12 +226,16 @@ def nodes() -> None:
         cap = n["capability"]
         status = n["status"]
         color = {"online": "green", "draining": "yellow"}.get(status, "red")
-        t.add_row(n["name"], f"[{color}]{status}[/]", str(cap["cpu_cores"]),
-                  f"{cap['ram_mb'] / 1024:.0f}", f"{n['headroom_cpu_pct']:.0f}%",
-                  f"{n['trust_score']:.2f}", n["owner"])
+        t.add_row(n["name"], f"[{color}]{status}[/]",
+                  _tiered(cap["cpu_cores"], "cores", "measured"),
+                  _tiered(f"{cap['ram_mb'] / 1024:.0f}", "GB", "measured"),
+                  _tiered(f"{n['headroom_cpu_pct']:.0f}", "% free", "measured"),
+                  _tiered(f"{n['trust_score']:.2f}", "trust", "measured"), n["owner"])
     console.print(t)
+    ram_gb = f"{s['total_ram_mb'] / 1024:.0f}"
     console.print(f"[dim]{s['online']}/{s['total_nodes']} online · "
-                  f"{s['total_cores']} cores · {s['total_ram_mb'] / 1024:.0f} GB pooled[/]")
+                  f"{_tiered(s['total_cores'], 'cores', 'measured')} · "
+                  f"{_tiered(ram_gb, 'GB pooled', 'measured')}[/]")
 
 
 @app.command()
@@ -161,6 +266,68 @@ def join(url: str = typer.Argument(..., help="control-plane URL, e.g. http://192
         f"  [dim]macOS/Linux[/] [green]bash deploy/join.sh --server {url} --token {token}[/]\n\n"
         f"The agent auto-detects this machine's LAN IP and self-registers.",
         title="join"))
+
+
+@app.command()
+def contribute() -> None:
+    """Become a node: print the real join commands for this control plane."""
+    try:
+        d = _get("/api/v1/onboarding")
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
+    console.print(Panel.fit(
+        f"[bold]Contribute this or another machine[/]\n\n"
+        "This command makes no earnings projection. Realized credits appear in "
+        "`meshpool ledger` after completed work.\n\n"
+        f"[dim]Windows[/]     [green]{d.get('join_windows', d['join_command'])}[/]\n"
+        f"[dim]macOS/Linux[/] [green]{d.get('join_unix', d['join_command'])}[/]",
+        title="contribute"))
+
+
+@app.command()
+def mesh(
+    watch: bool = typer.Option(False, "--watch", "-w", help="refresh until interrupted"),
+    interval: float = typer.Option(2.0, "--interval", min=0.5, help="seconds between refreshes"),
+) -> None:
+    """Show your live constellation from the real cluster endpoint."""
+    import time
+
+    def render() -> None:
+        data = _get("/api/v1/cluster")
+        s = data["summary"]
+        t = Table(title="Mesh constellation")
+        for c in ("node", "status", "route", "cpu free", "ram free", "trust"):
+            t.add_column(c)
+        for n in data.get("nodes", []):
+            status = n["status"]
+            color = {"online": "green", "draining": "yellow"}.get(status, "red")
+            t.add_row(
+                n["name"],
+                f"[{color}]{status}[/]",
+                str(n.get("reachable_via") or "direct"),
+                _tiered(f"{n.get('headroom_cpu_pct', 0):.0f}", "%", "measured"),
+                _tiered(_fmt_bytes(int(n.get("headroom_ram_mb", 0)) * 1024 * 1024),
+                        "free", "measured"),
+                _tiered(f"{n.get('trust_score', 0):.2f}", "trust", "measured"),
+            )
+        console.print(t)
+        ram_gb = f"{s['total_ram_mb'] / 1024:.0f}"
+        console.print(f"[dim]{s['online']}/{s['total_nodes']} online · "
+                      f"{_tiered(s['total_cores'], 'cores', 'measured')} · "
+                      f"{_tiered(ram_gb, 'GB pooled', 'measured')}[/]")
+
+    try:
+        if not watch:
+            render()
+            return
+        while True:
+            console.clear()
+            render()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        console.print("\n[dim]stopped[/]")
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
 
 
 # ---- batch --------------------------------------------------------------- #
@@ -311,6 +478,11 @@ def fn_deploy(module: str = typer.Argument(..., help="path to a .wasm module "
     if not p.is_file():
         console.print(f"[bold red]error:[/] no such file: {p}")
         raise typer.Exit(1)
+    if p.suffix.lower() != ".wasm":
+        _fail(_UnavailableBackend(
+            "Python-to-WASM function packaging is not available in this build; "
+            "compile a wasm32-wasip1 module and run `meshpool fn deploy ./handler.wasm`"
+        ))
     data = p.read_bytes()
     q = f"?name={quote(name)}" if name else ""
     try:
@@ -704,6 +876,68 @@ def storage_rm(blob_id: str = typer.Argument(...,
     console.print(f"[green]removed[/] [bold]{blob_id}[/]")
 
 
+# ---- S3-shaped storage --------------------------------------------------- #
+store_app = typer.Typer(help="Copy files to and from Mesh Store using s3:// URIs.")
+app.add_typer(store_app, name="store")
+
+
+@store_app.command("cp")
+def store_cp(
+    source: str = typer.Argument(..., help="local path or s3://bucket/key"),
+    dest: str = typer.Argument(..., help="local path or s3://bucket/key"),
+    recursive: bool = typer.Option(
+        False, "--recursive", "-r", help="accepted for compatibility; directories auto-copy"
+    ),
+    replication: int = typer.Option(2, "--replication", "-R", help="object replication factor"),
+) -> None:
+    """Copy real bytes through the Mesh Store; unsupported directions fail loudly."""
+    src_is_s3 = source.startswith("s3://")
+    dst_is_s3 = dest.startswith("s3://")
+    if src_is_s3 == dst_is_s3:
+        _fail(_UnavailableBackend(
+            "Mesh Store cp currently supports local -> s3:// and s3:// -> local only"
+        ))
+
+    try:
+        if dst_is_s3:
+            bucket, prefix = _parse_s3_uri(dest)
+            root = Path(source)
+            files = list(_iter_files(root))
+            _ = recursive
+            try:
+                _post(f"/api/v1/buckets/{quote(bucket, safe='')}")
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in (400, 409):
+                    raise
+            for path, rel in files:
+                key = prefix.rstrip("/")
+                if len(files) > 1 or root.is_dir():
+                    key = f"{key}/{rel}"
+                body = path.read_bytes()
+                _post_bytes(
+                    f"/api/v1/buckets/{quote(bucket, safe='')}/objects/{quote(key, safe='/')}"
+                    f"?replication={max(1, min(replication, 5))}",
+                    body,
+                )
+                console.print(f"[green]stored[/] {path} -> s3://{bucket}/{key} "
+                              f"({_tiered(_fmt_bytes(len(body)), 'stored', 'measured')})")
+            return
+
+        bucket, key = _parse_s3_uri(source)
+        data = _get_bytes(
+            f"/api/v1/buckets/{quote(bucket, safe='')}/objects/{quote(key, safe='/')}"
+        )
+        out = Path(dest)
+        if out.is_dir():
+            out = out / Path(key).name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(data)
+        console.print(f"[green]downloaded[/] s3://{bucket}/{key} -> {out} "
+                      f"({_tiered(_fmt_bytes(len(data)), 'stored', 'measured')})")
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
+
+
 # ---- inference ----------------------------------------------------------- #
 models_app = typer.Typer(help="Deploy and inspect sharded models.")
 app.add_typer(models_app, name="models")
@@ -760,12 +994,13 @@ def models_list() -> None:
         return
     if v.get("backend", "meshshard") != "meshshard":
         console.print(f"[bold]{v['model']}[/] · {v['backend']} · {v['replicas']} replica(s) · "
-                      f"status {v['status']} · tokens/sec {v.get('tokens_per_sec')}")
+                      f"status {v['status']} · "
+                      f"{_tiered(v.get('tokens_per_sec'), 'tokens/sec', 'measured')}")
         for s in v["stages"]:
             console.print(f"  [cyan]{s['node_name']}[/] full model")
     else:
         console.print(f"[bold]{v['model']}[/] · {v['n_layers']} layers · status {v['status']} · "
-                      f"tokens/sec {v.get('tokens_per_sec')}")
+                      f"{_tiered(v.get('tokens_per_sec'), 'tokens/sec', 'measured')}")
         for s in v["stages"]:
             console.print(f"  [cyan]{s['node_name']}[/] layers {s['first']}–{s['last']}")
 
@@ -825,6 +1060,137 @@ def models_upload(checkpoint: str = typer.Argument(...,
         console.print(f"  [cyan]{s['node_name']}[/] layers {s['first']}–{s['last']}")
 
 
+def _ensure_model(model: str) -> None:
+    try:
+        current = _get("/api/v1/models")
+        needs_deploy = not current.get("deployed") or current.get("model") != model
+        if needs_deploy:
+            console.print(f"[dim]deploying {model} before inference ...[/]")
+            _post("/api/v1/models", {"model": model})
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
+
+
+def _stream_openai_chat(model: str, prompt: str, tokens: int, temperature: float) -> tuple[int, str]:
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": tokens,
+        "temperature": temperature,
+        "stream": True,
+    }
+    seen = 0
+    content = ""
+    with httpx.stream(
+        "POST",
+        f"{base_url()}/v1/chat/completions",
+        json=payload,
+        headers={**_auth_headers(), "Accept": "text/event-stream"},
+        timeout=300,
+    ) as r:
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            data = line[6:].strip()
+            if data == "[DONE]":
+                break
+            chunk = json.loads(data)
+            delta = chunk["choices"][0].get("delta") or {}
+            text = delta.get("content") or ""
+            if text:
+                seen += 1
+                content += text
+                console.file.write(text)
+                console.file.flush()
+    console.file.write("\n")
+    console.file.flush()
+    return seen, content
+
+
+@app.command()
+def run(
+    model: str = typer.Argument(..., help="model id, e.g. nano-gpt or kimi-k2"),
+    prompt: str = typer.Argument(..., help="prompt text"),
+    tokens: int = typer.Option(48, "--tokens", "-n"),
+    temperature: float = typer.Option(0.8, "--temp"),
+) -> None:
+    """Run one prompt through the real OpenAI-compatible streaming endpoint."""
+    _ensure_model(model)
+    try:
+        chunks, text = _stream_openai_chat(model, prompt, tokens, temperature)
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
+    if not text:
+        console.print("[dim](empty)[/]")
+    console.print(f"[dim]{_tiered(chunks, 'stream chunks', 'measured')}[/]")
+
+
+@app.command()
+def serve(
+    model: str = typer.Argument(..., help="default model for proxied OpenAI requests"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(11435, "--port"),
+) -> None:
+    """Run a local OpenAI-compatible proxy; existing clients only change base_url."""
+    try:
+        from fastapi import FastAPI, Request
+        from fastapi.responses import Response, StreamingResponse
+        import uvicorn
+    except Exception as exc:  # noqa: BLE001
+        _fail(_UnavailableBackend(f"local OpenAI proxy dependencies are unavailable: {exc}"))
+
+    _ensure_model(model)
+    upstream = base_url()
+    proxy = FastAPI(title="MeshPool OpenAI-compatible local proxy")
+
+    async def _forward(method: str, path: str, request: Request):
+        body = None
+        if method != "GET" and request.headers.get("content-type", "").startswith(
+                "application/json"):
+            body = await request.json()
+        if isinstance(body, dict) and not body.get("model"):
+            body["model"] = model
+        headers = {**_auth_headers()}
+        if "authorization" in request.headers:
+            headers["Authorization"] = request.headers["authorization"]
+        client = httpx.AsyncClient(timeout=None)
+        req = client.build_request(method, f"{upstream}{path}", json=body, headers=headers)
+        resp = await client.send(req, stream=True)
+        ctype = resp.headers.get("content-type", "application/json")
+
+        async def _body():
+            try:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+
+        if "text/event-stream" in ctype:
+            return StreamingResponse(_body(), status_code=resp.status_code, media_type=ctype)
+        data = await resp.aread()
+        await resp.aclose()
+        await client.aclose()
+        return Response(content=data, status_code=resp.status_code, media_type=ctype)
+
+    @proxy.get("/v1/models")
+    async def _models(request: Request):
+        return await _forward("GET", "/v1/models", request)
+
+    @proxy.post("/v1/chat/completions")
+    async def _chat(request: Request):
+        return await _forward("POST", "/v1/chat/completions", request)
+
+    @proxy.post("/v1/completions")
+    async def _completions(request: Request):
+        return await _forward("POST", "/v1/completions", request)
+
+    console.print(f"[green]serving[/] OpenAI-compatible endpoint at http://{host}:{port}/v1")
+    console.print(f"[dim]upstream {upstream}; default model {model}[/]")
+    uvicorn.run(proxy, host=host, port=port, log_level="warning")
+
+
 @app.command()
 def chat(prompt: str = typer.Argument(..., help="prompt text"),
          tokens: int = typer.Option(48, "--tokens", "-n"),
@@ -837,7 +1203,8 @@ def chat(prompt: str = typer.Argument(..., help="prompt text"),
         _fail(exc)
     console.print(Panel(r["text"] or "[dim](empty)[/]", title=f"{r['model']}"))
     where = r.get("served_by") or f"{len(r['stages'])} pipeline stages"
-    tail = f"[dim]{r['tokens']} tokens · {r['tokens_per_sec']} tok/s · {where}"
+    tail = f"[dim]{_tiered(r['tokens'], 'tokens', 'measured')} · "
+    tail += f"{_tiered(r['tokens_per_sec'], 'tok/s', 'measured')} · {where}"
     if r.get("backend"):
         tail += f" · {r['backend']}"
     console.print(tail + "[/]")
@@ -891,7 +1258,9 @@ def ledger() -> None:
     for c in ("node", "owner", "donated", "consumed"):
         t.add_column(c)
     for row in d["by_node"]:
-        t.add_row(row["name"], row["owner"], f"{row['donated']:.1f}", f"{row['consumed']:.1f}")
+        t.add_row(row["name"], row["owner"],
+                  _tiered(f"{row['donated']:.1f}", "mesh-seconds", "measured"),
+                  _tiered(f"{row['consumed']:.1f}", "mesh-seconds", "measured"))
     console.print(t)
 
 

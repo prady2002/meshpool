@@ -48,6 +48,8 @@ def test_top_level_help_lists_storage_group():
     r = runner.invoke(app, ["--help"])
     assert r.exit_code == 0, r.output
     assert "storage" in r.output
+    for cmd in ("login", "run", "serve", "mesh", "contribute", "store"):
+        assert cmd in r.output
 
 
 def test_storage_group_exposes_put_get_ls_rm():
@@ -55,6 +57,49 @@ def test_storage_group_exposes_put_get_ls_rm():
     assert r.exit_code == 0, r.output
     for cmd in ("put", "get", "ls", "rm"):
         assert cmd in r.output, (cmd, r.output)
+
+
+def test_store_group_exposes_cp():
+    r = runner.invoke(app, ["store", "--help"])
+    assert r.exit_code == 0, r.output
+    assert "cp" in r.output
+
+
+def test_store_cp_rejects_s3_to_s3_as_unavailable():
+    r = runner.invoke(app, ["store", "cp", "s3://bucket/a", "s3://bucket/b"])
+    assert r.exit_code == 2, r.output
+    assert "supports local -> s3:// and s3:// -> local" in r.output
+
+
+def test_fn_deploy_python_fails_loudly():
+    with patch("pathlib.Path.is_file", return_value=True):
+        r = runner.invoke(app, ["fn", "deploy", "handler.py"])
+    assert r.exit_code == 2, r.output
+    assert "Python-to-WASM function packaging is not available" in r.output
+
+
+def test_run_uses_streaming_openai_endpoint():
+    with patch.object(cli_module, "_ensure_model") as ensure, \
+         patch.object(cli_module, "_stream_openai_chat", return_value=(3, "hello")) as stream:
+        r = runner.invoke(app, ["run", "nano-gpt", "hi", "--tokens", "3"])
+    assert r.exit_code == 0, r.output
+    ensure.assert_called_once_with("nano-gpt")
+    stream.assert_called_once_with("nano-gpt", "hi", 3, 0.8)
+    assert "stream chunks (measured)" in r.output
+
+
+def test_login_persists_local_session_without_copy_paste():
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"owner": "local-user", "session_token": "sess-123"}
+    with patch("httpx.post", return_value=response) as post, \
+         patch.object(cli_module, "_load_config", return_value={}), \
+         patch.object(cli_module, "_save_config") as save:
+        r = runner.invoke(app, ["--control-plane", "http://cp:8080", "login"])
+    assert r.exit_code == 0, r.output
+    assert post.call_args[0][0] == "http://cp:8080/api/v1/auth/local"
+    save.assert_called_once()
+    assert save.call_args[0][0]["session_token"] == "sess-123"
 
 
 def test_dag_group_exposes_submit_list_show():
@@ -102,6 +147,30 @@ def test_models_upload_missing_file_fails_before_any_upload():
     assert "no such file" in r.output
 
 
+def test_models_list_labels_throughput_tier():
+    with patch.object(cli_module, "_get", return_value={
+        "deployed": True,
+        "backend": "meshshard",
+        "model": "nano-gpt",
+        "n_layers": 8,
+        "status": "ready",
+        "tokens_per_sec": 12.3,
+        "stages": [],
+    }):
+        r = runner.invoke(app, ["models", "list"])
+    assert r.exit_code == 0, r.output
+    assert "tokens/sec (measured)" in r.output
+
+
+def test_ledger_labels_credit_totals_as_measured():
+    with patch.object(cli_module, "_get", return_value={
+        "by_node": [{"name": "node-a", "owner": "alice", "donated": 2.5, "consumed": 1.0}]
+    }):
+        r = runner.invoke(app, ["ledger"])
+    assert r.exit_code == 0, r.output
+    assert "mesh-seconds (measured)" in r.output
+
+
 # ---------------------------------------------------------------------------
 # Task 1: --control-plane global flag
 # ---------------------------------------------------------------------------
@@ -131,6 +200,17 @@ def test_control_plane_env_only(monkeypatch):
     assert mock_get.called, "httpx.get was not called"
     called_url: str = mock_get.call_args[0][0]
     assert "envhost:8888" in called_url, called_url
+
+
+def test_control_plane_saved_login_used_when_no_flag_or_env(monkeypatch):
+    """A prior `meshpool login` should make subsequent commands target that control plane."""
+    monkeypatch.delenv("MESHPOOL_CONTROL_PLANE_URL", raising=False)
+    with patch.object(cli_module, "_load_config",
+                      return_value={"control_plane": "http://saved:9999"}), \
+         patch("httpx.get", return_value=_mock_cluster()) as mock_get:
+        runner.invoke(app, ["nodes"])
+    called_url: str = mock_get.call_args[0][0]
+    assert "saved:9999" in called_url, called_url
 
 
 def test_control_plane_flag_overrides_env(monkeypatch):

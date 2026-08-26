@@ -15,6 +15,7 @@ Usage:  prompt_tokens + completion_tokens + total_tokens reported in every respo
 from __future__ import annotations
 
 import json
+import asyncio
 import time
 from typing import Callable, Optional
 
@@ -221,6 +222,18 @@ def _sse_chunk(comp_id: str, model: str, delta: dict,
     return f"data: {json.dumps(chunk)}\n\n"
 
 
+async def _stream_text_chunks(text: str):
+    """Yield small text deltas so OpenAI SDK consumers observe incremental output."""
+    if not text:
+        return
+    start = 0
+    for idx, ch in enumerate(text, start=1):
+        if ch.isspace() or idx - start >= 8 or idx == len(text):
+            yield text[start:idx]
+            start = idx
+            await asyncio.sleep(0)
+
+
 # ---------------------------------------------------------------------------
 # Route registration
 # ---------------------------------------------------------------------------
@@ -331,8 +344,8 @@ def register_openai_routes(app, cp_factory: Callable) -> None:  # noqa: C901
             async def _stream():
                 # Role delta
                 yield _sse_chunk(comp_id, out["model"], {"role": "assistant"})
-                # Content delta — full text in one chunk (no per-token streaming yet)
-                yield _sse_chunk(comp_id, out["model"], {"content": out["text"]})
+                async for text_chunk in _stream_text_chunks(out["text"]):
+                    yield _sse_chunk(comp_id, out["model"], {"content": text_chunk})
                 # Terminal chunk
                 yield _sse_chunk(comp_id, out["model"], {}, finish_reason=finish_reason)
                 yield "data: [DONE]\n\n"
@@ -406,13 +419,27 @@ def register_openai_routes(app, cp_factory: Callable) -> None:  # noqa: C901
 
         if req.stream:
             async def _stream():
-                chunk = {
+                async for text_chunk in _stream_text_chunks(out["text"]):
+                    chunk = {
+                        "id": comp_id,
+                        "object": "text_completion",
+                        "created": int(time.time()),
+                        "model": out["model"],
+                        "choices": [{
+                            "text": text_chunk,
+                            "index": 0,
+                            "logprobs": None,
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                terminal = {
                     "id": comp_id,
                     "object": "text_completion",
                     "created": int(time.time()),
                     "model": out["model"],
                     "choices": [{
-                        "text": out["text"],
+                        "text": "",
                         "index": 0,
                         "logprobs": None,
                         "finish_reason": finish_reason,
@@ -423,7 +450,7 @@ def register_openai_routes(app, cp_factory: Callable) -> None:  # noqa: C901
                         "total_tokens": total_tokens,
                     },
                 }
-                yield f"data: {json.dumps(chunk)}\n\n"
+                yield f"data: {json.dumps(terminal)}\n\n"
                 yield "data: [DONE]\n\n"
             return StreamingResponse(_stream(), media_type="text/event-stream")
 
