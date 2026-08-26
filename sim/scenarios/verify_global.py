@@ -226,27 +226,66 @@ def main() -> int:  # noqa: C901 — a deliberately end-to-end gate
         print("  PASS: distributed greedy output is bit-for-bit identical to single-machine")
 
         print("\n== test 5: kill a stage node -> re-partition, identical output ==")
-        names = [s["node_name"] for s in stages]
-        victim = names[-1]
+        # Which stage holder we kill decides what the correct answer *is*, so it
+        # cannot be left to incidental ordering. These profiles pool ~10 layer
+        # slots for an 8-layer model: losing the 16 GB node leaves strictly too
+        # little memory, and refusing to place is then correct behaviour, not a
+        # bug. Latency-aware ordering decides which node ends up holding the last
+        # stage, so `names[-1]` made this gate pass or fail on node ordering
+        # rather than on behaviour -- it went red here with "insufficient
+        # survivor capacity" while the engine was working exactly as designed.
+        #
+        # Prefer the last stage, because it owns the LM head and replacing it
+        # exercises the is_last hand-off; fall back to any stage holder whose
+        # loss the survivors can absorb. Only if no such victim exists do we
+        # assert the degrade path instead.
+        live = httpx.get(f"{cp}/api/v1/nodes", timeout=10).json()["nodes"]
+        cap_by_name = {n["name"]: _node_layer_cap(n) for n in live
+                       if n.get("status") == "online"}
+        total_cap = sum(cap_by_name.values())
+        stage_names = [s["node_name"] for s in stages]
+        viable = [nm for nm in stage_names
+                  if total_cap - cap_by_name.get(nm, 0) >= cfg.n_layer]
+        victim = stage_names[-1] if stage_names[-1] in viable else (
+            viable[-1] if viable else stage_names[-1])
         victim_idx = int(victim.split("-")[-1]) - 1
-        print(f"  killing {victim} (holds a pipeline stage) ...")
+        survivor_cap = total_cap - cap_by_name.get(victim, 0)
+        must_repartition = survivor_cap >= cfg.n_layer
+        print(f"  killing {victim} (holds a pipeline stage); survivors keep "
+              f"{survivor_cap} layer slots for a {cfg.n_layer}-layer model -> "
+              f"{'must re-partition' if must_repartition else 'must degrade cleanly'}")
         h.stop_agent(victim_idx)
         deadline = time.time() + 35
         repart = None
+        degraded = False
         while time.time() < deadline:
             v = httpx.get(f"{cp}/api/v1/models", timeout=10).json()
             if v.get("status") == "ready" and victim not in {s["node_name"] for s in v.get("stages", [])}:
                 repart = v
                 break
+            if v.get("status") == "degraded":
+                degraded = True
+                break
             time.sleep(1)
-        assert repart is not None, "model did not re-partition onto survivors in time"
-        cov = sorted((s["first"], s["last"]) for s in repart["stages"])
-        assert cov[0][0] == 0 and cov[-1][1] == cfg.n_layer, "layers not fully covered"
-        after_txt = httpx.post(f"{cp}/api/v1/inference/chat",
-                               json={"prompt": prompt, "max_new_tokens": 24, "temperature": 0.0},
-                               timeout=60).json()["text"]
-        assert after_txt == oracle, "output changed after re-partition (should be identical)"
-        print("  PASS: survived stage-node loss, re-sharded on survivors, identical output")
+
+        if not must_repartition:
+            # The honest complement: when the pool really cannot host the model,
+            # the deployment must say so rather than keep advertising a pipeline
+            # whose stages are gone.
+            assert degraded, (
+                f"survivors hold only {survivor_cap} of {cfg.n_layer} layer slots, "
+                f"so the model cannot be placed -- it must go degraded, not stay ready")
+            print("  PASS: survivors genuinely could not host the model; deployment "
+                  "degraded cleanly instead of advertising a dead pipeline")
+        else:
+            assert repart is not None, "model did not re-partition onto survivors in time"
+            cov = sorted((s["first"], s["last"]) for s in repart["stages"])
+            assert cov[0][0] == 0 and cov[-1][1] == cfg.n_layer, "layers not fully covered"
+            after_txt = httpx.post(f"{cp}/api/v1/inference/chat",
+                                   json={"prompt": prompt, "max_new_tokens": 24, "temperature": 0.0},
+                                   timeout=60).json()["text"]
+            assert after_txt == oracle, "output changed after re-partition (should be identical)"
+            print("  PASS: survived stage-node loss, re-sharded on survivors, identical output")
 
         print("\nALL GLOBAL (TUNNEL-ONLY) E2E CHECKS PASSED")
     except Exception as exc:  # noqa: BLE001
