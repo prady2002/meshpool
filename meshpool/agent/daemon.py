@@ -185,6 +185,27 @@ class ShardForwardRequest(BaseModel):
     truncate_to: Optional[int] = None
 
 
+class ShardBatchItem(BaseModel):
+    """One session's slice of a batched forward.
+
+    ``rows`` says how many leading rows of the request's flat ``data`` belong to this
+    item, so the whole batch travels as a single concatenated payload on one hop.
+    """
+
+    rows: int
+    pos_offset: int = 0
+    session: Optional[str] = None
+    use_cache: bool = False
+    truncate_to: Optional[int] = None
+
+
+class ShardBatchForwardRequest(BaseModel):
+    model_id: str
+    data: list
+    is_tokens: bool = False
+    items: list[ShardBatchItem]
+
+
 class ShardDropRequest(BaseModel):
     model_id: str
     session: str
@@ -297,6 +318,14 @@ class AgentState:
         self.replicas: dict[str, subprocess.Popen] = {}   # replica_id -> hosted app process
         self.replica_logs: dict[str, LogBuffer] = {}       # replica_id -> recent stdout/stderr
         self.shards: dict[str, CachedShard] = {}           # model_id -> pipeline stage
+        # Receiver-side hop accounting. `shard_hops` counts wide-area round trips this
+        # node actually served; `shard_rows` counts the sequence-steps carried inside
+        # them. Their ratio is the real batching factor, measured where the packets
+        # land rather than inferred from what the sender believes it sent -- which
+        # makes it an independent oracle for the batching gate and the honest number
+        # to surface on a node's activity panel.
+        self.shard_hops = 0
+        self.shard_rows = 0
         # Pooled object store: content-addressed blobs on donated disk (spec §P3).
         self.blobs = BlobStore(
             os.path.join(self.data_dir, "blobs"),
@@ -875,6 +904,8 @@ async def shard_forward(req: ShardForwardRequest) -> dict:
         raise HTTPException(status_code=503, detail="node draining (reclaimed by owner)")
 
     session = req.session if req.use_cache else None
+    state.shard_hops += 1
+    state.shard_rows += 1
     if req.truncate_to is not None and req.session:
         # Applied before computing, so a rejected speculative branch is gone before
         # the next one is written. Costs no extra round trip.
@@ -889,6 +920,80 @@ async def shard_forward(req: ShardForwardRequest) -> dict:
         # the prompt, so report it as such rather than as a 500.
         raise HTTPException(status_code=409, detail=f"cache state error: {exc}") from exc
     return {"data": out.tolist()}
+
+
+@app.post("/shard/forward_batch")
+async def shard_forward_batch(req: ShardBatchForwardRequest) -> dict:
+    """Run several sessions through this shard in one request.
+
+    This is the node-side half of continuous batching. Each item is computed
+    separately against its own KV cache -- exactly as an unbatched forward would be,
+    so a tenant's output never depends on who shared the batch -- but they all arrive
+    and leave on a single hop. On a wide-area mesh the hop is the expensive part, so B
+    tenants cost one ``(N-1) * RTT`` between them instead of B.
+    """
+    shard = state.shards.get(req.model_id)
+    if shard is None:
+        raise HTTPException(status_code=404, detail="shard not loaded on this node")
+    if state.donation.reclaimed:
+        raise HTTPException(status_code=503, detail="node draining (reclaimed by owner)")
+    if not req.items:
+        raise HTTPException(status_code=400, detail="batch must contain at least one item")
+
+    total = sum(int(i.rows) for i in req.items)
+    if any(int(i.rows) < 1 for i in req.items):
+        raise HTTPException(status_code=400, detail="every batch item needs rows >= 1")
+    if len(req.data) != total:
+        raise HTTPException(
+            status_code=400,
+            detail=f"payload has {len(req.data)} rows but items declare {total}")
+    named = [i.session for i in req.items if i.session]
+    if len(set(named)) != len(named):
+        # Two rows sharing one KV cache in a single call would append both to the
+        # same cache and interleave two conversations. Refuse rather than corrupt.
+        raise HTTPException(status_code=400,
+                            detail="batch items must use distinct sessions")
+
+    for item in req.items:
+        if item.truncate_to is not None and item.session:
+            shard.truncate(item.session, int(item.truncate_to))
+
+    # One hop carried len(items) sequence-steps. Counted after validation so a
+    # rejected malformed batch is not credited as work.
+    state.shard_hops += 1
+    state.shard_rows += len(req.items)
+
+    def _run() -> list:
+        outs, cursor = [], 0
+        for item in req.items:
+            rows = int(item.rows)
+            piece = req.data[cursor:cursor + rows]
+            cursor += rows
+            inp = piece if req.is_tokens else np.asarray(piece, dtype="float32")
+            session = item.session if item.use_cache else None
+            outs.append(shard.forward(inp, req.is_tokens, int(item.pos_offset), session))
+        return outs
+
+    try:
+        outs = await asyncio.get_running_loop().run_in_executor(None, _run)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=f"cache state error: {exc}") from exc
+
+    rows = [int(o.shape[0]) for o in outs]
+    return {"rows": rows, "data": np.concatenate(outs, axis=0).tolist()}
+
+
+@app.get("/shard/stats")
+async def shard_stats() -> dict:
+    """Hops this node actually served, and the work that rode inside them.
+
+    Counted at the receiver, so it cannot be inflated by a sender's bookkeeping.
+    ``mean_rows_per_hop`` above 1.0 means tenants really are sharing round trips.
+    """
+    hops, rows = state.shard_hops, state.shard_rows
+    return {"shard_hops": hops, "shard_rows": rows,
+            "mean_rows_per_hop": round(rows / hops, 4) if hops else 0.0,
+            "loaded": sorted(state.shards)}
 
 
 @app.post("/shard/drop")

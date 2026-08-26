@@ -209,6 +209,28 @@ def _check_credits(cp, owner: str) -> Optional[JSONResponse]:
     return None
 
 
+def _openai_finish_reason(out: dict, completion_tokens: int, max_tokens: int) -> str:
+    """Translate the engine's reason for stopping into OpenAI's vocabulary.
+
+    The engine knows precisely why generation ended; a token count does not. Deriving
+    the reason from ``completion_tokens >= max_tokens`` gets the important case exactly
+    backwards: when the model's context window cuts a reply short, the count falls
+    *below* max_tokens, so the naive rule reports ``"stop"`` -- which tells an OpenAI
+    client the reply is complete when it was truncated mid-sentence. Agent loops and
+    continuation logic then silently do the wrong thing.
+
+    OpenAI's schema only admits stop/length/tool_calls/content_filter, so a context
+    cut-off maps to ``"length"``: the completion was ended by a limit, not by the
+    model. The precise reason stays available on MeshPool's native response.
+    """
+    reason = out.get("finish_reason")
+    if reason in ("length", "context_window"):
+        return "length"
+    if reason == "stop":
+        return "stop"
+    return "length" if completion_tokens >= max_tokens else "stop"
+
+
 def _sse_chunk(comp_id: str, model: str, delta: dict,
                finish_reason: Optional[str] = None) -> str:
     """Encode one Server-Sent Events chat-completion chunk."""
@@ -338,7 +360,7 @@ def register_openai_routes(app, cp_factory: Callable) -> None:  # noqa: C901
         completion_tokens: int = out["tokens"]
         total_tokens = prompt_tokens + completion_tokens
         comp_id = f"chatcmpl-{now_ms()}"
-        finish_reason = "length" if completion_tokens >= req.max_tokens else "stop"
+        finish_reason = _openai_finish_reason(out, completion_tokens, req.max_tokens)
 
         if req.stream:
             async def _stream():
@@ -415,7 +437,7 @@ def register_openai_routes(app, cp_factory: Callable) -> None:  # noqa: C901
         completion_tokens = out["tokens"]
         total_tokens = prompt_tokens + completion_tokens
         comp_id = f"cmpl-{now_ms()}"
-        finish_reason = "length" if completion_tokens >= req.max_tokens else "stop"
+        finish_reason = _openai_finish_reason(out, completion_tokens, req.max_tokens)
 
         if req.stream:
             async def _stream():

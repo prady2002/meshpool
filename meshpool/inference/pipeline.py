@@ -93,6 +93,28 @@ class PipelineStats:
         }
 
 
+@dataclass
+class StageCall:
+    """One session's slice of a batched traversal.
+
+    A batched traversal carries several of these at once. They are independent —
+    different sessions, different positions, possibly different row counts (a prefill
+    riding alongside several one-row decodes) — and every stage keeps them apart by
+    routing each to its own KV cache.
+    """
+
+    session: Optional[str]
+    data: object
+    is_tokens: bool
+    pos_offset: int
+
+    @property
+    def rows(self) -> int:
+        if self.is_tokens:
+            return len(self.data)  # type: ignore[arg-type]
+        return int(np.asarray(self.data, dtype=np.float32).shape[0])
+
+
 class CachedShard:
     """One pipeline stage: a contiguous block of layers plus a per-session KV cache.
 
@@ -158,6 +180,27 @@ class CachedShard:
 
         x = KV.run_layers_cached(self.P, self.cfg, x, self.start, self.end, cache)
         return M.head(self.P, self.cfg, x) if self.is_last else x
+
+    def forward_batch(self, items: list["StageCall"]) -> list[np.ndarray]:
+        """Run several independent sessions through this stage in one call.
+
+        Each item is computed **separately**, against its own KV cache, by the very
+        same :meth:`forward` the unbatched path uses. That is deliberate. The
+        tempting alternative — stacking every item's rows into one big matmul — would
+        change the floating-point reduction order, so a request's output would depend
+        on who else happened to be in the batch with it. Batched output would then
+        differ from unbatched output, and ``verify_continuous_batching`` could not
+        assert token-identity. Reproducibility is worth more here than the matmul.
+
+        The saving batching actually delivers is therefore **not** compute: it is the
+        ``(N-1) * RTT`` term. B concurrent requests cost B traversals when run
+        separately and ONE when batched, because all B rides share the same hops.
+        On a wide-area mesh that term dominates, which is exactly why this is worth
+        doing — and it is the same trick speculative decoding plays across tokens,
+        played here across requests instead.
+        """
+        return [self.forward(it.data, it.is_tokens, it.pos_offset, it.session)
+                for it in items]
 
 
 def build_stages(cfg: M.ModelConfig, n_stages: int,
@@ -275,6 +318,71 @@ class Pipeline:
 
         self.stats.merge(st)
         return np.asarray(data, dtype=np.float32)
+
+    async def forward_batch(self, calls: list[StageCall]) -> list[np.ndarray]:
+        """One traversal carrying several sessions at once.
+
+        Returns one logits array per input call, in the order supplied.
+
+        This is the multi-tenant twin of :meth:`forward`. The wide-area cost of
+        decoding is ``sum(compute_i) + (N-1) * RTT``, and the RTT term is paid once
+        per *traversal*, not once per row. So B concurrent users decoding separately
+        pay ``B * (N-1) * RTT`` while the same B users batched pay ``(N-1) * RTT``
+        between them. On a mesh where RTT dominates, throughput therefore scales
+        close to linearly in B until compute becomes the binding constraint — which
+        is the whole reason a decentralised pipeline can serve more than one person
+        at a time without falling over.
+
+        Sessions must be distinct. Two rows sharing one KV cache inside a single
+        traversal would append both to the same cache and silently interleave two
+        conversations, so that is rejected rather than tolerated.
+        """
+        if not calls:
+            raise ValueError("forward_batch needs at least one call")
+        named = [c.session for c in calls if c.session is not None]
+        if len(set(named)) != len(named):
+            raise ValueError(
+                "every batch item needs a distinct session: two rows sharing one KV "
+                "cache in a single traversal would interleave their positions")
+
+        st = PipelineStats(traversals=1, positions_processed=sum(c.rows for c in calls))
+        current = list(calls)
+
+        for idx, stage in enumerate(self.stages):
+            if idx > 0:
+                nbytes = sum(int(np.asarray(c.data, dtype=np.float32).nbytes)
+                             for c in current)
+                delay = self.link.transit_s(nbytes)
+                st.hops += 1
+                st.wire_bytes += nbytes
+                # One delay for the whole batch, not one per item: the rows are
+                # concatenated onto a single hop. This is the saving being claimed.
+                st.link_seconds += delay
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+            t0 = time.perf_counter()
+            out = stage.forward_batch(current)
+            if inspect.isawaitable(out):
+                out = await out
+            if len(out) != len(current):
+                raise RuntimeError(
+                    f"stage {idx} returned {len(out)} results for {len(current)} "
+                    f"batch items")
+            st.compute_seconds += time.perf_counter() - t0
+            st.stage_calls += 1
+
+            if idx < len(self.stages) - 1:
+                for c, arr in zip(current, out):
+                    if c.session is not None:
+                        self.activation_cache.record(
+                            c.session, idx + 1, c.pos_offset,
+                            np.asarray(arr, dtype=np.float32))
+            current = [StageCall(c.session, arr, False, c.pos_offset)
+                       for c, arr in zip(current, out)]
+
+        self.stats.merge(st)
+        return [np.asarray(c.data, dtype=np.float32) for c in current]
 
 
 # --------------------------------------------------------------------------- #

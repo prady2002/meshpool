@@ -39,6 +39,36 @@ ROOT = Path(__file__).resolve().parents[2]
 # plausible -- the shape a real regression actually takes.
 MUTATIONS = [
     {
+        "id": "batching-degrades-to-serial",
+        "path": "meshpool/inference/batching.py",
+        "old": b"while self._queue and len(self._active) < self.max_batch:",
+        "new": b"while self._queue and len(self._active) < 1:",
+        "cmd": [sys.executable, "sim/scenarios/verify_continuous_batching.py"],
+        "why": (
+            "Serving one tenant per traversal is the failure mode continuous batching "
+            "exists to prevent, and it is invisible to every correctness check: every "
+            "answer stays token-identical, every request still succeeds, only the "
+            "wide-area round trips multiply by the number of tenants. The gate has to "
+            "notice that nobody shared a hop, which is why it asserts on mean_batch "
+            "and on hop counts measured at the receiving nodes rather than on output."
+        ),
+    },
+    {
+        "id": "truncation-reported-as-completion",
+        "path": "meshpool/controlplane/openai_api.py",
+        "old": b'    reason = out.get("finish_reason")',
+        "new": b"    reason = None",
+        "cmd": [sys.executable, "sim/scenarios/verify_continuous_batching.py"],
+        "why": (
+            "Falling back to the token-count rule looks harmless and is not: when the "
+            "context window cuts a reply short the count lands BELOW max_tokens, so "
+            "the rule reports finish_reason='stop' -- telling an unmodified OpenAI "
+            "client that a truncated reply is a finished one. Agent loops then stop "
+            "early and drop the rest of the answer. Nothing about the text itself "
+            "looks wrong, so only an explicit assertion on the reason can catch it."
+        ),
+    },
+    {
         "id": "spd-residual-sampling",
         "path": "meshpool/inference/spd.py",
         "old": b"emitted = sample_from_dist(_residual(p_i, q_i), rng)",

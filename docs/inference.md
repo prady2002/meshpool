@@ -155,6 +155,68 @@ would cost exactly the `(N-1) x RTT` that SPD exists to remove.
 Throughput is measured on real wall-clock time and reported as **tokens/sec** in the CLI,
 the dashboard, and the OpenAI response — never an invented target.
 
+### 3.3 Continuous batching, so one traversal serves several *tenants*
+
+SPD amortises `(N-1) x RTT` across the tokens of one request. Continuous batching
+(`inference/batching.py`) amortises the same term across **different users**, and the
+two compose: one traversal carries `B` tenants × `K+1` candidates, so the RTT term is
+divided by the product rather than by either factor alone.
+
+The mechanism is deliberately narrow. Rows are **not** stacked into a single matmul —
+that would change float reduction order, and a tenant's output would then depend on who
+happened to share its batch. Each item is computed separately against its own KV cache,
+exactly as an unbatched forward would be; the only thing that is shared is the hop. So
+the saving is purely the network term, which is also the term that dominates on a mesh.
+
+It is *continuous*, not static: admission runs at the top of every step, so a slot freed
+by a finished sequence is refilled on the next traversal rather than idling until the
+whole batch drains. This is what stops one 500-token request from making every 5-token
+request behind it wait.
+
+Three safeguards, because a batch is a place where tenants can leak into each other:
+
+- **Distinct sessions per traversal**, refused at three layers (`Pipeline.forward_batch`
+  raises, the agent endpoint returns 400, and a test asserts it). Two rows sharing one KV
+  cache would interleave two conversations.
+- **Capability negotiation.** `RemoteShard` probes `/shard/forward_batch` once per stage;
+  a node that answers 404/405/501 latches to per-item forwards and increments
+  `batch_fallbacks`, so degradation is visible rather than silent.
+- **Exact per-sequence attribution.** Traversals, hops, stage calls, positions and wire
+  bytes are attributed per request, not modelled — every inter-stage payload is
+  `[rows, d_model]` float32, so a sequence's wire share is exactly
+  `rows x d_model x 4 x (depth-1)`. Only `link_seconds`/`compute_seconds` are shared, and
+  those are split pro rata by rows and labelled as such in the code.
+
+Measured on the real 3-process cluster (`verify_continuous_batching.py`), 6 concurrent
+requests: **288 wide-area hops → 54** (81% fewer) and **2.5–3.6x aggregate tok/s**, with
+every reply token-identical to the same prompt run alone. The hop counts are read from
+`GET /shard/stats` on the agents themselves — counted where the packets land, so they
+cannot be inflated by the requester's own bookkeeping.
+
+### 3.4 Why a reply stopped
+
+`nano-gpt` uses **learned absolute** position embeddings, so the context window cannot
+slide without invalidating every cached key/value (see `kvcache.py`). Generation
+therefore stops at the window rather than silently returning stale numbers.
+
+That decision is correct, but it must be *reported*, and a token count cannot report it:
+when the window truncates a reply the count lands **below** `max_tokens`, so the natural
+rule `"length" if n >= max_tokens else "stop"` labels a cut-off answer as a finished one.
+An OpenAI client that continues on `length` and stops on `stop` then silently drops the
+rest of the response.
+
+So the reason is produced where the decision is made and carried outward:
+
+| Surface | Reached its token budget | Ran out of context |
+|---|---|---|
+| `POST /api/v1/inference/chat` | `finish_reason: "length"` | `finish_reason: "context_window"` |
+| `POST /v1/chat/completions` | `finish_reason: "length"` | `finish_reason: "length"` |
+
+OpenAI's schema admits only `stop`/`length`/`tool_calls`/`content_filter`, so a context
+cut-off maps to `length` — the completion *was* ended by a limit — while MeshPool's native
+response keeps the precise reason. Both are asserted by `verify_continuous_batching.py`,
+and reverting either is a permanent entry in the mutation catalog.
+
 ## 4. ✨ The correctness oracle
 
 This is the feature that makes distributed inference trustworthy.

@@ -654,6 +654,29 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   is pure loss when there is nothing to hide it behind. Output is token-identical to
   ordinary decoding in every case. Anyone quoting only the good number is quoting half
   the mechanism.
+- **Continuous batching only ever saves the network term — and we do not pretend
+  otherwise.** Batched rows are computed one at a time against their own KV caches rather
+  than stacked into a single matmul, because stacking would change float reduction order
+  and a tenant's output would then depend on who happened to share its batch. So the
+  compute cost of `B` tenants is still the compute cost of `B` tenants; only the hop is
+  shared. On a mesh that is the term worth attacking. Measured on a real 3-process
+  cluster (`verify_continuous_batching`, 6 concurrent requests): **288 wide-area hops →
+  54** and **2.5×–3.6× aggregate tok/s**, every reply token-identical to the same prompt
+  run alone. The hop counts come from `GET /shard/stats` on the agents — counted where
+  the packets land, not where they were sent from, so the requester's own accounting
+  cannot flatter it. Expect the ratio to fall as soon as compute, not latency, is the
+  binding constraint.
+- **A truncated answer is now reported as truncated.** `nano-gpt` uses learned absolute
+  position embeddings, so the context window cannot slide without invalidating every
+  cached key/value; generation stops at the window instead. That was always true — what
+  was wrong is that we *told clients it had finished normally*. The OpenAI surface derived
+  `finish_reason` from a token count, and a window cut-off lands **below** `max_tokens`,
+  so it reported `"stop"`. An unmodified OpenAI client, which continues on `length` and
+  stops on `stop`, would silently drop the rest of the reply. The reason is now produced
+  by the code that makes the decision (`context_window` on the native API, mapped to
+  `length` on the OpenAI one) and is pinned by a gate and by two mutation-catalog entries.
+  This was found by an acceptance gate asking for more tokens than could fit — not by
+  reading the code, which looked entirely reasonable.
 - **Link measurement is real, and it is rate-limited.** Node placement uses measured
   latency and bandwidth, never a number inferred from health-check payload sizes. The
   probe endpoints are necessarily unauthenticated (an agent measures its link before it

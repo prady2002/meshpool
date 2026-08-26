@@ -29,7 +29,12 @@ from typing import Any, Optional
 import numpy as np
 
 from . import model as M
-from .pipeline import LinkProfile, Pipeline
+from ..common.transport import TransportError
+from .pipeline import LinkProfile, Pipeline, StageCall
+
+# A node that does not know the batched hop answers with one of these. Anything
+# else is a real failure and must not be silently downgraded to the slow path.
+_BATCH_UNSUPPORTED_STATUS = frozenset({404, 405, 501})
 
 
 class RemoteShard:
@@ -50,6 +55,9 @@ class RemoteShard:
         self.timeout = timeout
         self._truncate_to: dict[str, int] = {}
         self._dropped: set[str] = set()
+        # None = not probed yet, True = node batches, False = latched to the fallback.
+        self._batch_supported: Optional[bool] = None
+        self.batch_fallbacks = 0
 
     # -- cache control: recorded now, transmitted with the next forward ------ #
     def truncate(self, session: str, length: int) -> None:
@@ -97,6 +105,78 @@ class RemoteShard:
         body = await self.transport.call(self.node_id, "shard/forward", payload,
                                          timeout=self.timeout)
         return np.asarray(body["data"], dtype=np.float32)
+
+    async def forward_batch(self, calls: list[StageCall]) -> list[np.ndarray]:
+        """Run several sessions through this stage in **one** request.
+
+        The whole point of batching on a wide-area mesh is that B concurrent tenants
+        share one set of hops instead of paying for B, so this must be a single round
+        trip. Issuing one ``shard/forward`` per item would preserve correctness and
+        destroy the entire benefit -- so if a node cannot batch, the fallback below is
+        recorded as a fallback rather than passed off as batching.
+        """
+        if not calls:
+            raise ValueError("forward_batch needs at least one call")
+        if self._batch_supported is False:
+            return await self._forward_batch_serially(calls)
+
+        is_tokens = calls[0].is_tokens
+        if any(c.is_tokens != is_tokens for c in calls):
+            raise ValueError("a batched hop cannot mix token and activation inputs")
+
+        items: list[dict[str, Any]] = []
+        flat: list[Any] = []
+        for c in calls:
+            entry: dict[str, Any] = {"rows": c.rows, "pos_offset": int(c.pos_offset)}
+            if c.session is not None:
+                entry["session"] = c.session
+                entry["use_cache"] = True
+                trunc = self._truncate_to.pop(c.session, None)
+                if trunc is not None:
+                    entry["truncate_to"] = int(trunc)
+            items.append(entry)
+            if is_tokens:
+                flat.extend(int(t) for t in c.data)  # type: ignore[union-attr]
+            else:
+                flat.extend(np.asarray(c.data, np.float32).tolist())
+
+        payload = {"model_id": self.model_id, "is_tokens": is_tokens,
+                   "items": items, "data": flat}
+        try:
+            body = await self.transport.call(self.node_id, "shard/forward_batch",
+                                             payload, timeout=self.timeout)
+        except TransportError as exc:
+            if exc.status not in _BATCH_UNSUPPORTED_STATUS:
+                raise
+            # An older node, or meshd. Latch it so the next traversal does not pay
+            # for a second discovery round trip, put back the truncations this
+            # attempt consumed, and serve the batch the slow-but-correct way.
+            self._batch_supported = False
+            for c, entry in zip(calls, items):
+                if "truncate_to" in entry and c.session is not None:
+                    self._truncate_to[c.session] = int(entry["truncate_to"])
+            return await self._forward_batch_serially(calls)
+
+        self._batch_supported = True
+        rows = [int(n) for n in body.get("rows", [c.rows for c in calls])]
+        if len(rows) != len(calls):
+            raise ValueError(
+                f"node returned {len(rows)} row counts for {len(calls)} batch items")
+        arr = np.asarray(body["data"], dtype=np.float32)
+        if int(arr.shape[0]) != sum(rows):
+            raise ValueError(
+                f"node returned {arr.shape[0]} rows, expected {sum(rows)}")
+        out, cursor = [], 0
+        for n in rows:
+            out.append(arr[cursor:cursor + n])
+            cursor += n
+        return out
+
+    async def _forward_batch_serially(self, calls: list[StageCall]) -> list[np.ndarray]:
+        """Correct fallback for a node that cannot batch. Costs one hop per item."""
+        self.batch_fallbacks += 1
+        return [await self.forward(c.data, c.is_tokens, c.pos_offset, c.session)
+                for c in calls]
 
 
 class RemotePipeline(Pipeline):

@@ -363,7 +363,7 @@ func (a *Agent) Reregister(ctx context.Context) bool {
 var unimplementedRoutes = []string{
 	"/policy",
 	"/start_replica", "/stop_replica", "/replica_logs",
-	"/shard/load", "/shard/forward", "/shard/drop", "/shard/unload",
+	"/shard/load", "/shard/forward", "/shard/forward_batch", "/shard/stats", "/shard/drop", "/shard/unload",
 	"/ollama/generate",
 }
 

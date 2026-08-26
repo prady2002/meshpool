@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import time
 from typing import Optional
 
@@ -34,6 +35,7 @@ from ..common.models import ModelDeployment, NodeStatus, new_id
 from ..common.transport import AgentTransport, TransportError
 from . import model as M
 from .adapters import BACKENDS, DEFAULT_BACKEND, get_backend
+from .batching import BatchRequest, ContinuousBatcher
 from .pipeline import generate_baseline
 from .remote import RemotePipeline, build_remote_stages
 from .spd import SelfDraft, speculative_generate
@@ -64,6 +66,14 @@ class InferenceManager:
         self.weight_group_pulls = 0
         self.weight_group_pushes = 0
         self.weight_group_cached = 0
+        # One continuous batcher per deployment, shared by every concurrent request.
+        #
+        # This is what turns the pipeline from single-tenant into multi-tenant. Each
+        # entry is keyed by (deployment id, partition fingerprint) so that a
+        # re-partition retires the old batcher instead of letting it keep talking to
+        # a stage that has moved.
+        self._batchers: dict[str, tuple[str, ContinuousBatcher, RemotePipeline]] = {}
+        self.max_batch = int(os.environ.get("MESHPOOL_MAX_BATCH", "8"))
 
     # --- queries --------------------------------------------------------- #
     def list(self) -> list[ModelDeployment]:
@@ -347,6 +357,7 @@ class InferenceManager:
                 pass
 
     async def remove(self, model_id: str) -> bool:
+        await self._retire_batcher(model_id)
         async with self._lock:
             dep = self.store.get_model(model_id)
             if not dep:
@@ -392,30 +403,28 @@ class InferenceManager:
 
         prompt_ids = tok.encode(prompt) or [tok.encode(" ")[0]]
 
-        pipe = RemotePipeline(cfg, build_remote_stages(self.transport, dep.id,
-                                                       dep.partition))
-        session = f"{dep.id}:{new_id('sess')}"
         use_spd = speculative and cfg.n_layer > draft_layers >= 1
+        batcher, pipe = await self._batcher_for(dep, cfg)
+        session = f"{dep.id}:{new_id('sess')}"
+
+        draft_factory = None
+        if use_spd:
+            # The draft runs on the *first stage's own layers*, which already live on
+            # one machine, so drafting costs zero extra wide-area hops. See
+            # meshpool/inference/spd.py for why this is exact and not approximate.
+            full_params = M.load_params(cfg)[0]
+            draft_factory = lambda: SelfDraft(cfg, full_params, draft_layers)  # noqa: E731
 
         t0 = time.perf_counter()
-        try:
-            if use_spd:
-                # The draft runs on the *first stage's own layers*, which already live
-                # on one machine, so drafting costs zero extra wide-area hops. See
-                # meshpool/inference/spd.py for why this is exact and not approximate.
-                draft = SelfDraft(cfg, M.load_params(cfg)[0], draft_layers)
-                generated, stats, spec = await speculative_generate(
-                    pipe, draft, prompt_ids, max_new_tokens, k=draft_k,
-                    temperature=temperature, seed=seed, session=session,
-                    chunked_prefill=chunked_prefill)
-            else:
-                generated, stats = await generate_baseline(
-                    pipe, prompt_ids, max_new_tokens, temperature=temperature,
-                    seed=seed, session=session, chunked_prefill=chunked_prefill)
-                spec = None
-        finally:
-            await pipe.flush()
+        result_b = await batcher.generate(BatchRequest(
+            prompt=prompt_ids, max_new_tokens=max_new_tokens, temperature=temperature,
+            seed=seed, session=session, chunked_prefill=chunked_prefill,
+            draft_factory=draft_factory, draft_k=draft_k))
         elapsed = max(1e-6, time.perf_counter() - t0)
+
+        generated = result_b.tokens
+        stats = result_b.stats
+        spec = result_b.spec
 
         tps = len(generated) / elapsed
         text = tok.decode(generated)
@@ -432,9 +441,19 @@ class InferenceManager:
             "prompt": prompt,
             "text": text,
             "tokens": len(generated),
+            "finish_reason": result_b.finish_reason,
             "tokens_per_sec": round(tps, 2),
             "elapsed_s": round(elapsed, 3),
             "pipeline": stats.as_dict(),
+            # How much of the wide-area cost this request shared with other tenants.
+            # mean_batch 1.0 means it ran alone; 4.0 means four requests split every
+            # round trip between them.
+            "batch": {
+                "mean_batch": round(result_b.mean_batch, 3),
+                "queued_s": round(result_b.queued_s, 4),
+                "ttft_s": round(result_b.ttft_s, 4),
+                "max_batch": batcher.max_batch,
+            },
             "stages": [
                 {"node_name": self._node_name(a.node_id),
                  "first": a.start_layer, "last": a.end_layer}
@@ -442,8 +461,46 @@ class InferenceManager:
             ],
         }
         if spec is not None:
-            result["speculative"] = spec.as_dict()
+            result["speculative"] = spec
         return result
+
+    @staticmethod
+    def _partition_fingerprint(dep: ModelDeployment) -> str:
+        return "|".join(f"{a.node_id}:{a.start_layer}-{a.end_layer}"
+                        for a in sorted(dep.partition, key=lambda a: a.start_layer))
+
+    async def _batcher_for(self, dep: ModelDeployment,
+                           cfg: M.ModelConfig) -> tuple[ContinuousBatcher, RemotePipeline]:
+        """The batcher every concurrent request for this deployment shares.
+
+        Sharing is the entire point: two users chatting at the same time must ride the
+        same traversals rather than each paying their own ``(N-1) * RTT``. The
+        fingerprint check retires a batcher whose partition has moved underneath it,
+        so a re-partition can never leave requests talking to a stage that no longer
+        holds those layers.
+        """
+        fp = self._partition_fingerprint(dep)
+        existing = self._batchers.get(dep.id)
+        if existing is not None:
+            if existing[0] == fp:
+                return existing[1], existing[2]
+            await self._retire_batcher(dep.id)
+        pipe = RemotePipeline(cfg, build_remote_stages(self.transport, dep.id,
+                                                       dep.partition))
+        batcher = ContinuousBatcher(pipe, max_batch=self.max_batch)
+        await batcher.start()
+        self._batchers[dep.id] = (fp, batcher, pipe)
+        return batcher, pipe
+
+    async def _retire_batcher(self, model_id: str) -> None:
+        entry = self._batchers.pop(model_id, None)
+        if entry is None:
+            return
+        _, batcher, pipe = entry
+        try:
+            await batcher.aclose()
+        finally:
+            await pipe.flush()
 
     async def _native_chat(self, dep: ModelDeployment, backend, prompt: str,
                            max_new_tokens: int, temperature: float) -> dict:
@@ -540,6 +597,10 @@ class InferenceManager:
                 loop.create_task(self._repartition(dep.id, node_id))
 
     async def _repartition(self, model_id: str, lost_node_id: str) -> None:
+        # A batcher holds RemoteShards pinned to the *old* stage nodes, one of which
+        # has just gone. Retire it before replanning so no in-flight or subsequent
+        # request can be handed a stage that no longer exists.
+        await self._retire_batcher(model_id)
         async with self._lock:
             dep = self.store.get_model(model_id)
             if not dep:
