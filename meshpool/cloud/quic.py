@@ -24,6 +24,7 @@ from cryptography.x509.oid import NameOID
 from ..common.identity import device_id_for_public_key, verify_signature
 from ..common.logging import get_logger
 from ..common.transport import AgentTransport, ProxyResult, TransportError, _BufferedStream
+from .nat import NAT_KEEPALIVE_S
 from .tunnel import CompositeTransport, TunnelHub, _params_to_list
 
 log = get_logger("quic")
@@ -32,7 +33,7 @@ ALPN = "meshpool-quic-v1"
 # Residential NAT UDP bindings can expire in ~15-30 s.  A 22 s QUIC keepalive is
 # deliberately in Tailscale's 20-26 s range: frequent enough to survive cheap home
 # routers, infrequent enough not to waste meaningful bandwidth.
-KEEPALIVE_S = 22.0
+KEEPALIVE_S = NAT_KEEPALIVE_S
 MAX_IDLE_TIMEOUT_S = 90.0
 
 

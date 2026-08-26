@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"meshd/internal/identity"
+	"meshd/internal/natprobe"
 
 	quic "github.com/quic-go/quic-go"
 )
@@ -31,7 +32,7 @@ const (
 
 	// Residential UDP NAT bindings can expire in ~15-30s.  Keepalives at 22s
 	// match Tailscale's 20-26s operating range and keep cheap home routers warm.
-	keepAlive = 22 * time.Second
+	keepAlive = natprobe.KeepAliveSeconds * time.Second
 	maxIdle   = 90 * time.Second
 )
 

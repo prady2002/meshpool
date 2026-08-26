@@ -481,6 +481,16 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   QUIC but proves a tunnel-only node still receives work. These are not real-internet
   success-rate claims; the product still budgets for permanent relay dependency on
   CGNAT/symmetric-NAT paths.
+- **NAT traversal is a measured classification plus relay plan, not a promise to punch
+  every home router.** MeshPool classifies peers from STUN-like observations
+  (reflexive mappings across reflectors and alternate-source replies), never from a
+  user-entered NAT type. The hard floor is explicit: symmetric-NAT to symmetric-NAT
+  hole punching is treated as **0%** and goes relay-first with no stall; mixed NATs use
+  a bounded attempt budget and a 22 s keepalive to match 15-30 s UDP binding timeouts.
+  Relay selection is lowest-RTT among public relays, and relay users remain eligible for
+  work and credit. Planning uses libp2p DCUtR's about 73% mixed-NAT success as a ceiling
+  and budgets **25-40%** permanent relay dependency for residential broadband, not the
+  much lower DERP rate reported by highly technical user bases.
 - **The S3 SigV4 signature binds a *claimed* payload digest, not the bytes we received.**
   `x-amz-content-sha256` is read from the header and used verbatim in the canonical
   request; the body is never hashed and compared. So a captured, signed `PUT` can be
