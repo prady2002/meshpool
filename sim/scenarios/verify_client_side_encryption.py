@@ -13,6 +13,7 @@ Non-vacuity:
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -21,7 +22,8 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from meshpool.storage.crypto import ClientKeyring, decrypt_object, encrypt_object  # noqa: E402
+from meshpool.storage.crypto import (  # noqa: E402
+    MAGIC, ClientKeyring, EncryptionError, decrypt_object, encrypt_object)
 from sim.harness import Harness  # noqa: E402
 
 MARKER = b"MESHPOOL-PLAINTEXT-MARKER-P5-ENCRYPTION-9f3b7d"
@@ -92,11 +94,82 @@ def _flip_stored_byte(root: Path, blob_id: str) -> Path:
     return path
 
 
+def _split_package(package: bytes) -> tuple[dict, bytes]:
+    """Split a package into its JSON header and ciphertext. Framing only, no crypto."""
+    header_len = int.from_bytes(package[len(MAGIC):len(MAGIC) + 4], "big")
+    start = len(MAGIC) + 4
+    end = start + header_len
+    return json.loads(package[start:end].decode("utf-8")), package[end:]
+
+
+def _join_package(header: dict, ciphertext: bytes) -> bytes:
+    blob = json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return MAGIC + len(blob).to_bytes(4, "big") + blob + ciphertext
+
+
+def _check_per_object_key_isolation(base: Path) -> None:
+    """One object's key must never open another object's bytes.
+
+    Absence of plaintext is necessary but nowhere near sufficient: a build that
+    hardcodes ``data_key = b"\\x00" * 32`` still encrypts, still decrypts, still
+    leaves no readable marker anywhere on disk -- and yet every object in the
+    system is readable by anyone, because the key is a constant in open-source
+    code. Every secrecy-only check stays green through that. This one does not.
+
+    Rather than re-deriving keys here -- test code that mirrors production crypto
+    tends to mirror its bugs too -- we exploit the AAD binding. Two objects
+    written to the same bucket/key/version share an identical AAD, so one
+    package's wrapped-key fields can be transplanted into the other's header and
+    will unwrap cleanly. What comes out is the *first* object's data key. It can
+    only decrypt the *second* object's ciphertext if the two objects share a key,
+    which is exactly the defect. Fresh keys make the transplant fail closed.
+    """
+    os.environ["MESHPOOL_CLIENT_KEY_PATH"] = str(base / "keyiso-root-key.json")
+    keyring = ClientKeyring()
+    shared = {"bucket": "private", "key": "same-object.bin",
+              "version_id": "00000000000000000000000000000001", "keyring": keyring}
+    first, _ = encrypt_object(b"FIRST-OBJECT-PLAINTEXT" * 8, **shared)
+    second_plain = b"SECOND-OBJECT-PLAINTEXT" * 8
+    second, _ = encrypt_object(second_plain, **shared)
+
+    # Positive control: both packages must decrypt normally, or a transplant that
+    # "fails" would prove nothing except that we corrupted the package framing.
+    assert decrypt_object(second, keyring=keyring) == second_plain, \
+        "control failed: an untouched package did not decrypt"
+    h_first, _ = _split_package(first)
+    h_second, ct_second = _split_package(second)
+    assert _join_package(h_second, ct_second) == second, \
+        "control failed: split/join is not byte-exact, so the transplant is untrustworthy"
+
+    spliced = dict(h_second)
+    spliced["data_key_nonce"] = h_first["data_key_nonce"]
+    spliced["wrapped_data_key"] = h_first["wrapped_data_key"]
+    assert spliced != h_second, "control failed: the two objects already share wrapped keys"
+    try:
+        leaked = decrypt_object(_join_package(spliced, ct_second), keyring=keyring)
+    except EncryptionError:
+        print("  PASS: object A's key cannot open object B — data keys are per-object")
+        return
+    detail = "recovering the exact plaintext" if leaked == second_plain else "producing output"
+    raise AssertionError(
+        f"one object's data key decrypted a different object, {detail}. Data keys are "
+        f"shared or constant, so encrypting at all buys nothing: whoever learns one "
+        f"key reads every object ever stored.")
+
+
 def main() -> int:
     ok = True
     base = Path(__file__).resolve().parent / "_data_client_side_encryption"
     plaintext = MARKER + b"|" + bytes(range(256)) * 32 + b"|" + MARKER
     print("== MeshPool Storage: client-side encryption gate ==")
+
+    print("\n== key isolation: each object gets its own data key ==")
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        _check_per_object_key_isolation(base)
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        print(f"  FAIL: {type(exc).__name__}: {exc}")
 
     plain_root = base / "plain"
     h_plain = Harness(n_agents=3, cp_port=8340, data_dir=str(plain_root / "cluster"))
