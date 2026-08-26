@@ -65,11 +65,15 @@ import hashlib
 import json
 import os
 import random
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
 from ..common.logging import get_logger
-from ..common.trust import ContributionLedger
+from ..common.models import now_ms
+from ..common.trust import (
+    BASE_STAKE_MULTIPLIER, SLASH_DESTINATION_OWNER, ContributionLedger,
+)
 
 log = get_logger("verification")
 
@@ -97,6 +101,11 @@ CONSECUTIVE_PASSES_TO_RELEASE: int = 3
 # Override via MESHPOOL_VERIFY_REDUNDANT_RATE env var (e.g. "1.0" for 100%).
 DEFAULT_REDUNDANT_RATE: float = float(
     os.environ.get("MESHPOOL_VERIFY_REDUNDANT_RATE", "0.25"))
+
+ESCROW_OWNER = "meshpool:heldback-escrow"
+THREE_MONTHS_MS = 90 * 24 * 60 * 60 * 1000
+NINE_MONTHS_MS = 270 * 24 * 60 * 60 * 1000
+MIN_HOLDBACK_EARNING = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +309,9 @@ class VerificationStats:
         self.degraded_no_secondary: int = 0
         self.degraded_secondary_error: int = 0
         self.degraded_no_tiebreak: int = 0
+        self.stake_slashed: float = 0.0
+        self.heldback_recorded: float = 0.0
+        self.heldback_released: float = 0.0
 
     def as_dict(self) -> dict:
         return {
@@ -312,7 +324,151 @@ class VerificationStats:
                 "secondary_error": self.degraded_secondary_error,
                 "no_tiebreak": self.degraded_no_tiebreak,
             },
+            "stake_slashed": self.stake_slashed,
+            "heldback_recorded": self.heldback_recorded,
+            "heldback_released": self.heldback_released,
         }
+
+
+class StakingEngine:
+    """Graduated staking and slashing for public-mesh fraud detection.
+
+    A brand-new node must risk roughly 20x the expected value of a job.  As the
+    TrustEngine records value-weighted Beta evidence, ``required_stake`` decays.
+    On detected fraud the stake is transferred to a real destination account via
+    a balanced ledger transfer; no credits are minted or destroyed.
+    """
+
+    def __init__(self, ledger: ContributionLedger, trust=None,
+                 destination_owner: str = SLASH_DESTINATION_OWNER) -> None:
+        self.ledger = ledger
+        self.trust = trust
+        self.destination_owner = destination_owner
+        self.locked_by_node: dict[str, dict[str, float | str]] = {}
+
+    def required_stake(self, node_id: str, expected_job_value: float) -> float:
+        if self.trust is not None:
+            return self.trust.required_stake(node_id, expected_job_value)
+        return max(0.0, expected_job_value) * BASE_STAKE_MULTIPLIER
+
+    def ensure_stake(self, node_id: str, owner: str, expected_job_value: float) -> float:
+        required = self.required_stake(node_id, expected_job_value)
+        state = self.locked_by_node.setdefault(node_id, {"owner": owner, "locked": 0.0})
+        state["owner"] = owner
+        state["locked"] = max(float(state.get("locked", 0.0)), required)
+        return required
+
+    def slash(self, node_id: str, expected_job_value: float = 0.0,
+              reason: str = "detected fraud") -> float:
+        state = self.locked_by_node.get(node_id)
+        owner = str(state.get("owner")) if state else f"dev:{node_id}"
+        locked = float(state.get("locked", 0.0)) if state else 0.0
+        amount = locked if locked > 0.0 else self.required_stake(node_id, expected_job_value)
+        if amount <= 0.0:
+            return 0.0
+        self.ledger.record_slash(owner, amount, self.destination_owner,
+                                 node_id=node_id, detail=reason)
+        if state is not None:
+            state["locked"] = 0.0
+        return amount
+
+
+class HeldBackEscrowEngine:
+    """Storj-style held-back escrow: 50% -> 25% -> 0% over nine months."""
+
+    def __init__(self, ledger: ContributionLedger, clock_ms=now_ms,
+                 escrow_owner: str = ESCROW_OWNER) -> None:
+        self.ledger = ledger
+        self.clock_ms = clock_ms
+        self.escrow_owner = escrow_owner
+        self.first_seen_ms: dict[str, int] = {}
+        self.held: dict[str, dict[str, float | str | int]] = {}
+
+    def holdback_rate(self, node_id: str, at_ms: Optional[int] = None) -> float:
+        now = self.clock_ms() if at_ms is None else int(at_ms)
+        first = self.first_seen_ms.setdefault(node_id, now)
+        age = max(0, now - first)
+        if age < THREE_MONTHS_MS:
+            return 0.50
+        if age < NINE_MONTHS_MS:
+            return 0.25
+        return 0.0
+
+    def record_earning(self, node_id: str, owner: str, amount: float,
+                       detail: str = "") -> tuple[float, float]:
+        amount = max(0.0, amount)
+        if amount < MIN_HOLDBACK_EARNING:
+            self.ledger.record_donation(node_id, owner, amount, detail=detail)
+            return amount, 0.0
+        rate = self.holdback_rate(node_id)
+        held_amount = amount * rate
+        immediate = amount - held_amount
+        if immediate > 0.0:
+            self.ledger.record_donation(node_id, owner, immediate, detail=detail)
+        if held_amount > 0.0:
+            self.ledger.record_donation(node_id, self.escrow_owner, held_amount,
+                                        detail=f"heldback:{owner}:{detail}")
+            state = self.held.setdefault(
+                node_id, {"owner": owner, "held": 0.0, "release_after_ms": 0})
+            state["owner"] = owner
+            state["held"] = float(state.get("held", 0.0)) + held_amount
+            state["release_after_ms"] = self.first_seen_ms[node_id] + NINE_MONTHS_MS
+        return immediate, held_amount
+
+    def release_due(self, node_id: str, at_ms: Optional[int] = None) -> float:
+        now = self.clock_ms() if at_ms is None else int(at_ms)
+        state = self.held.get(node_id)
+        if not state:
+            return 0.0
+        if now < int(state.get("release_after_ms", 0)):
+            return 0.0
+        amount = float(state.get("held", 0.0))
+        if amount <= 0.0:
+            return 0.0
+        owner = str(state.get("owner"))
+        self.ledger.record_transfer(self.escrow_owner, owner, amount,
+                                    detail="heldback escrow release",
+                                    node_id=node_id)
+        state["held"] = 0.0
+        return amount
+
+    def total_held(self) -> float:
+        return sum(float(s.get("held", 0.0)) for s in self.held.values())
+
+
+@dataclass(frozen=True)
+class BisectionVerdict:
+    first_disagreement: Optional[int]
+    rounds: int
+    localized: bool
+
+
+class InteractiveBisectionDispute:
+    """Truebit-style O(log N) dispute localization over committed step hashes."""
+
+    @staticmethod
+    def hash_step(value: Any) -> str:
+        return _result_digest(value)
+
+    def localize(self, claimant_trace: list[Any], challenger_trace: list[Any]) -> BisectionVerdict:
+        if len(claimant_trace) != len(challenger_trace):
+            raise ValueError("trace lengths differ")
+        if not claimant_trace:
+            return BisectionVerdict(None, 0, False)
+        c = [self.hash_step(v) for v in claimant_trace]
+        h = [self.hash_step(v) for v in challenger_trace]
+        if c[-1] == h[-1]:
+            return BisectionVerdict(None, 1, False)
+        lo, hi = 0, len(c) - 1
+        rounds = 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            rounds += 1
+            if c[mid] == h[mid]:
+                lo = mid + 1
+            else:
+                hi = mid
+        return BisectionVerdict(lo, rounds, True)
 
 
 # ---------------------------------------------------------------------------
@@ -357,10 +513,16 @@ class Verifier:
         self,
         ledger: Optional[ContributionLedger] = None,
         policy: Optional[VerificationPolicy] = None,
+        trust=None,
+        clock_ms=now_ms,
     ) -> None:
         self.policy = policy or VerificationPolicy()
         self.compute_escrow: Optional[ComputeEscrowEngine] = (
             ComputeEscrowEngine(ledger) if ledger is not None else None)
+        self.staking: Optional[StakingEngine] = (
+            StakingEngine(ledger, trust=trust) if ledger is not None else None)
+        self.heldback: Optional[HeldBackEscrowEngine] = (
+            HeldBackEscrowEngine(ledger, clock_ms=clock_ms) if ledger is not None else None)
         self.stats = VerificationStats()
 
     def digests_match(self, result_a: Any, result_b: Any) -> bool:
@@ -371,6 +533,11 @@ class Verifier:
         """Whether this unit should undergo redundant execution."""
         return self.policy.should_trigger_redundant(func, rng)
 
+    def ensure_stake(self, node_id: str, owner: str, expected_job_value: float) -> float:
+        if self.staking is None:
+            return 0.0
+        return self.staking.ensure_stake(node_id, owner, expected_job_value)
+
     def record_pass(self, node_id: str, owner: str) -> float:
         """Update escrow and stats for a verified-pass result."""
         self.stats.units_verified += 1
@@ -379,13 +546,26 @@ class Verifier:
             released = self.compute_escrow.on_verify_pass(node_id, owner)
         return released
 
-    def record_fail(self, node_id: str) -> float:
+    def record_fail(self, node_id: str, expected_job_value: float = 0.0) -> float:
         """Update escrow and stats for a verified-fail result."""
         self.stats.nodes_penalized += 1
         forfeited = 0.0
         if self.compute_escrow is not None:
             forfeited = self.compute_escrow.on_verify_fail(node_id)
+        if self.staking is not None:
+            self.stats.stake_slashed += self.staking.slash(
+                node_id, expected_job_value=expected_job_value)
         return forfeited
+
+    def record_earning(self, node_id: str, owner: str, amount: float,
+                       detail: str = "") -> tuple[float, float]:
+        if self.heldback is None:
+            return amount, 0.0
+        immediate, held = self.heldback.record_earning(node_id, owner, amount, detail)
+        self.stats.heldback_recorded += held
+        released = self.heldback.release_due(node_id)
+        self.stats.heldback_released += released
+        return immediate, held
 
     def as_dict(self) -> dict:
         """Serialisable snapshot for the /api/v1/verification endpoint."""
@@ -401,6 +581,19 @@ class Verifier:
                 "total_held": esc.total_held() if esc else 0.0,
                 "total_released": esc.total_released if esc else 0.0,
                 "total_forfeited": esc.total_forfeited if esc else 0.0,
+            },
+            "staking": {
+                "active": self.staking is not None,
+                "destination_owner": (
+                    self.staking.destination_owner if self.staking else SLASH_DESTINATION_OWNER),
+                "total_slashed": self.stats.stake_slashed,
+            },
+            "heldback": {
+                "active": self.heldback is not None,
+                "escrow_owner": self.heldback.escrow_owner if self.heldback else ESCROW_OWNER,
+                "total_held": self.heldback.total_held() if self.heldback else 0.0,
+                "total_recorded": self.stats.heldback_recorded,
+                "total_released": self.stats.heldback_released,
             },
             # The endpoint's Tier 0/1 branch returns this block, so omitting it
             # here would make the response *shape* depend on the deployment tier:

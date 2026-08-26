@@ -21,6 +21,8 @@ import base64
 import hashlib
 import json
 import os
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -120,6 +122,96 @@ class DeviceIdentity:
 def enrollment_challenge(device_id: str, ts_ms: int, nonce: str = "") -> bytes:
     """Canonical bytes a device signs at registration to prove key possession."""
     return f"meshpool-enroll:{device_id}:{ts_ms}:{nonce}".encode("utf-8")
+
+
+@dataclass(frozen=True)
+class HardwareTimingChallenge:
+    """Registration challenge bound to one Ed25519 device identity.
+
+    This is intentionally not KYC and not a "proof of one physical machine".
+    It is a serial CPU/memory timing toll that raises the cost of mass fake
+    identities while the Ed25519 signature binds the result to the device key.
+    """
+
+    device_id: str
+    ts_ms: int
+    nonce: str
+    iterations: int = 20_000
+    memory_kib: int = 256
+
+    def message(self) -> bytes:
+        return (
+            f"meshpool-hw-timing:{self.device_id}:{self.ts_ms}:{self.nonce}:"
+            f"{self.iterations}:{self.memory_kib}"
+        ).encode("utf-8")
+
+
+@dataclass(frozen=True)
+class HardwareTimingResponse:
+    digest: str
+    elapsed_ms: int
+    signature: str
+
+
+def hardware_timing_challenge(device_id: str, ts_ms: int, nonce: str = "",
+                              iterations: int = 20_000,
+                              memory_kib: int = 256) -> HardwareTimingChallenge:
+    return HardwareTimingChallenge(device_id=device_id, ts_ms=ts_ms, nonce=nonce,
+                                   iterations=iterations, memory_kib=memory_kib)
+
+
+def _timing_digest(challenge: HardwareTimingChallenge) -> str:
+    memory = bytearray(max(1, challenge.memory_kib) * 1024)
+    state = hashlib.sha256(challenge.message()).digest()
+    span = len(memory) - 32
+    for i in range(max(0, challenge.iterations)):
+        pos = int.from_bytes(state[:4], "little") % max(1, span)
+        memory[pos:pos + 32] = state
+        state = hashlib.sha256(
+            state + memory[pos:pos + 32] + i.to_bytes(8, "little")
+        ).digest()
+    return hashlib.sha256(state + bytes(memory[:64]) + bytes(memory[-64:])).hexdigest()
+
+
+def solve_hardware_timing_challenge(
+    identity: "DeviceIdentity", challenge: HardwareTimingChallenge
+) -> HardwareTimingResponse:
+    started = time.perf_counter()
+    digest = _timing_digest(challenge)
+    elapsed_ms = max(1, int((time.perf_counter() - started) * 1000))
+    payload = f"{challenge.message().decode('utf-8')}:{digest}:{elapsed_ms}".encode("utf-8")
+    return HardwareTimingResponse(
+        digest=digest,
+        elapsed_ms=elapsed_ms,
+        signature=identity.sign(payload),
+    )
+
+
+def verify_hardware_timing_response(
+    public_key_b64: str,
+    challenge: HardwareTimingChallenge,
+    response: HardwareTimingResponse,
+    now_ms_: int,
+    min_iterations: int = 1_000,
+    max_elapsed_ms: int = 120_000,
+) -> bool:
+    """Verify key binding, freshness and serial-work digest for Sybil resistance.
+
+    The elapsed time is only a sanity bound; a remote coordinator cannot prove a
+    unique physical device or stop a determined adversary from buying more CPUs.
+    """
+    if device_id_for_public_key(public_key_b64) != challenge.device_id:
+        return False
+    if not challenge_is_fresh(challenge.ts_ms, now_ms_):
+        return False
+    if challenge.iterations < min_iterations:
+        return False
+    if response.elapsed_ms <= 0 or response.elapsed_ms > max_elapsed_ms:
+        return False
+    if response.digest != _timing_digest(challenge):
+        return False
+    payload = f"{challenge.message().decode('utf-8')}:{response.digest}:{response.elapsed_ms}".encode("utf-8")
+    return verify_signature(public_key_b64, payload, response.signature)
 
 
 # Acceptance window for a signed enrollment/auth challenge. The signed ``ts_ms`` must

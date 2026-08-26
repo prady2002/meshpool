@@ -35,6 +35,7 @@ from ..common.auth import (
 from ..batch.engine import BatchManager
 from ..batch.dag import DagError, DagManager
 from ..cloud.tunnel import CompositeTransport, TunnelHub, HDR_NODE_TOKEN
+from ..cloud.quic import QuicFallbackTransport, QuicHub, start_quic_server
 from .accounts import AccountManager, MAX_ACTIVE_JOBS_PER_OWNER
 from .spend import SpendCapManager
 from .registry import EventBus, NodeRegistry, schedulable
@@ -116,7 +117,11 @@ class ControlPlane:
         # HTTP for LAN nodes — so a single pool serves both, and in a pure-LAN run
         # the hub stays empty and behaviour is byte-for-byte the old HttpTransport.
         self.hub = TunnelHub()
-        self.transport = CompositeTransport(self.hub, HttpTransport(self.registry, self.client))
+        self.quic_hub = QuicHub(self.registry)
+        self.tunnel_transport = CompositeTransport(
+            self.hub, HttpTransport(self.registry, self.client))
+        self.transport = QuicFallbackTransport(self.quic_hub, self.tunnel_transport)
+        self.quic_addr = ""
         # A tunnel-only node (it advertises the unreachable sentinel URL) can be
         # reached only while its reverse tunnel is attached. Teaching the registry
         # this keeps the schedulers from dispatching to a node that is "online" by
@@ -148,7 +153,7 @@ class ControlPlane:
         but whose tunnel is not (yet) attached.
         """
         if node.url == TUNNEL_SENTINEL_URL:
-            return self.hub.is_connected(node.id)
+            return self.quic_hub.is_connected(node.id) or self.hub.is_connected(node.id)
         return True
 
     async def reaper_loop(self) -> None:
@@ -182,6 +187,12 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         global CP
         CP = ControlPlane(settings)
+        quic_server = None
+        if settings.transport.lower() in ("auto", "quic"):
+            bind_host = "0.0.0.0" if settings.host in ("0.0.0.0", "::") else settings.host
+            quic_server = await start_quic_server(
+                bind_host, settings.quic_port, settings.data_dir, CP.quic_hub)
+            CP.quic_addr = f"{settings.advertise_host or settings.host}:{settings.quic_port}"
         # wire engines that depend on CP being constructed
         from ..hosting.engine import HostingManager
         from ..inference.engine import InferenceManager
@@ -211,9 +222,9 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
         # At lower tiers the verifier stays None and all guards in the engine fail-open,
         # so LAN behaviour is completely unchanged.
         if settings.trust_tier >= 2:
-            from .verification import ComputeEscrowEngine, Verifier, VerificationPolicy
+            from .verification import Verifier, VerificationPolicy
             _vp = VerificationPolicy()
-            CP.batch.verifier = Verifier(ledger=CP.ledger, policy=_vp)
+            CP.batch.verifier = Verifier(ledger=CP.ledger, policy=_vp, trust=CP.trust)
         # Audit interval from env so tests can shrink it.
         _audit_interval = float(os.environ.get("MESHPOOL_AUDIT_INTERVAL_S", "60"))
         tasks = [
@@ -228,6 +239,7 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
         adv = settings.control_plane_url
         log.info("control plane up", scale=settings.scale, tier=settings.trust_tier,
                  bind=f"{settings.host}:{settings.port}", advertise=adv,
+                 quic=CP.quic_addr or "disabled",
                  invite=CP.invite_token)
         if settings.host in ("0.0.0.0", "::"):
             print("\n" + "=" * 64, flush=True)
@@ -244,6 +256,8 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
         finally:
             for t in tasks:
                 t.cancel()
+            if quic_server is not None:
+                quic_server.close()
             await CP.client.aclose()
             CP.store.close()
 
@@ -1275,7 +1289,10 @@ def _register_routes(app: FastAPI) -> None:
             node = cp.registry.get(resp.node_id)
             if node:
                 cp.accounts.ensure_starter_grant(node.owner)
-        return resp.model_dump(mode="json")
+        out = resp.model_dump(mode="json")
+        if cp.quic_addr:
+            out["quic_addr"] = cp.quic_addr
+        return out
 
     @app.post("/api/v1/nodes/heartbeat")
     async def heartbeat(hb: Heartbeat) -> dict:
@@ -1442,9 +1459,17 @@ def _register_routes(app: FastAPI) -> None:
                 "nodes_penalized": 0,
                 "degraded": {"no_secondary": 0, "secondary_error": 0,
                              "no_tiebreak": 0},
+                "stake_slashed": 0.0,
+                "heldback_recorded": 0.0,
+                "heldback_released": 0.0,
             },
             "escrow": {"total_held": 0.0, "total_released": 0.0,
                        "total_forfeited": 0.0},
+            "staking": {"active": False, "destination_owner": "meshpool:slashing",
+                        "total_slashed": 0.0},
+            "heldback": {"active": False, "escrow_owner": "meshpool:heldback-escrow",
+                         "total_held": 0.0, "total_recorded": 0.0,
+                         "total_released": 0.0},
             "classification": {
                 "digest_verifiable": sorted(DIGEST_VERIFIABLE_FUNCS),
                 "oracle_verifiable": sorted(ORACLE_VERIFIABLE_FUNCS),
@@ -2505,7 +2530,10 @@ def _node_view(cp: ControlPlane, n) -> dict:
         "owner": n.owner,
         "device_id": n.device_id,
         "url": n.url,
-        "reachable_via": ("tunnel" if cp.hub.is_connected(n.id) else "direct"),
+        "reachable_via": (
+            cp.transport.path_for(n.id) if hasattr(cp.transport, "path_for")
+            else ("tunnel" if cp.hub.is_connected(n.id) else "direct")
+        ),
         "status": n.status.value if hasattr(n.status, "value") else n.status,
         "schedulable": schedulable(n),
         "capability": n.capability.model_dump(),

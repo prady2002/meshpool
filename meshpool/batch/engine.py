@@ -515,6 +515,9 @@ class BatchManager:
                     elapsed_s = max(0.001, float(unit.payload["_meshpool_billing_ms"]) / 1000.0)
                 except (TypeError, ValueError):
                     pass
+            cost = job.cpu_pct_per_unit * elapsed_s
+            if self.verifier is not None:
+                self.verifier.ensure_stake(node.id, node.owner, cost)
             # Track redundant-check verdict across both the oracle and redundant paths.
             # None = skipped/inconclusive; True = verified pass; False = primary lied.
             _redundant_verdict = None
@@ -538,7 +541,7 @@ class BatchManager:
                     expected = None
                 if expected is not None and not _results_match(expected, result):
                     self.spot_check_rejections += 1
-                    self.trust.record_verification(node.id, False)
+                    self.trust.record_verification(node.id, False, work_value=cost)
                     self.trust.record_task_result(node.id, False)
                     self._unit_failed_nodes.setdefault(unit.id, set()).add(node.id)
                     unit.status = UnitStatus.PENDING   # retry on a different node
@@ -547,9 +550,9 @@ class BatchManager:
                                 node=node.id, func=job.func)
                     # Escrow: oracle caught a lie — forfeit held bonus credits.
                     if self.verifier is not None:
-                        self.verifier.record_fail(node.id)
+                        self.verifier.record_fail(node.id, expected_job_value=cost)
                     return
-                self.trust.record_verification(node.id, True)
+                self.trust.record_verification(node.id, True, work_value=cost)
                 # Escrow: oracle verified honest — accrue bonus credit toward release.
                 if self.verifier is not None:
                     self.verifier.record_pass(node.id, node.owner)
@@ -560,7 +563,7 @@ class BatchManager:
             # Must happen OUTSIDE the accept lock: transport calls cannot hold a lock.
             if self.verifier is not None and _redundant_verdict is None:
                 _redundant_verdict = await self._redundant_check(
-                    job, unit, result, node)
+                    job, unit, result, node, expected_job_value=cost)
             if _redundant_verdict is False:
                 # Primary node lied in redundant check — reject and retry elsewhere.
                 unit.status = UnitStatus.PENDING
@@ -582,12 +585,15 @@ class BatchManager:
                 if speculative:
                     self.speculative_wins += 1
                 accepted = True
-                cost = job.cpu_pct_per_unit * elapsed_s
                 # Donor earns; consumer spends the same amount -> the ledger conserves
                 # (net zero when producer == consumer, e.g. a single owner). Only the
                 # first accepted attempt records credit, so a backup task cannot double-pay.
-                self.ledger.record_donation(node.id, node.owner, cost,
-                                            detail=f"batch:{job.id}")
+                if self.verifier is not None:
+                    self.verifier.record_earning(node.id, node.owner, cost,
+                                                 detail=f"batch:{job.id}")
+                else:
+                    self.ledger.record_donation(node.id, node.owner, cost,
+                                                detail=f"batch:{job.id}")
                 self.ledger.record_consumption(node.id, job.owner, cost,
                                                detail=f"batch:{job.id}")
                 self.trust.record_task_result(node.id, True)
@@ -622,7 +628,8 @@ class BatchManager:
             self._finalize(job)
             self.store.put_job(job)
 
-    async def _redundant_check(self, job, unit, primary_result, primary_node) -> Optional[bool]:
+    async def _redundant_check(self, job, unit, primary_result, primary_node,
+                               expected_job_value: float = 0.0) -> Optional[bool]:
         """Run the same unit on a second independent node and compare digests.
 
         Returns:
@@ -709,18 +716,22 @@ class BatchManager:
         if not primary_matches_tb and secondary_matches_tb:
             # Secondary + tiebreak agree; primary is the outlier.
             self._unit_failed_nodes.setdefault(unit.id, set()).add(primary_node.id)
-            self.trust.record_verification(primary_node.id, False)
+            self.trust.record_verification(primary_node.id, False,
+                                           work_value=expected_job_value)
             self.trust.record_task_result(primary_node.id, False)
-            self.verifier.record_fail(primary_node.id)
+            self.verifier.record_fail(primary_node.id,
+                                      expected_job_value=expected_job_value)
             log.warning("redundant check: PRIMARY is the outlier — penalised",
                         unit=unit.id, primary=primary_node.id)
             return False   # signal _run_unit to reject and retry
 
         if primary_matches_tb and not secondary_matches_tb:
             # Primary + tiebreak agree; secondary is the outlier.
-            self.trust.record_verification(secondary.id, False)
+            self.trust.record_verification(secondary.id, False,
+                                           work_value=expected_job_value)
             self.trust.record_task_result(secondary.id, False)
-            self.verifier.record_fail(secondary.id)
+            self.verifier.record_fail(secondary.id,
+                                      expected_job_value=expected_job_value)
             log.warning("redundant check: SECONDARY is the outlier — penalised",
                         unit=unit.id, secondary=secondary.id)
             return True    # primary is fine

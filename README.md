@@ -495,6 +495,23 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   denominated in internal compute-credits. Owners are **uncapped by default** — set
   `MESHPOOL_DEFAULT_SPEND_CAP` to change that. The console reports `enforced: false`
   when no cap is set rather than displaying a number nothing applies.
+- **Public-mesh trust is fraud detection, staking and economics — not cryptographic
+  proof.** MeshPool does **not** use Intel SGX / consumer TEEs as a root of trust
+  (known TEE break classes include Foreshadow/SGAxe/global-TCB recovery and real key
+  extraction incidents), and it does **not** claim zkML/zkVM proofs for LLM inference
+  (current overhead and non-deterministic floating-point/GPU sampling make that
+  impractical). What is implemented is proportional detection: deterministic work can
+  be redundantly spot-checked; LLM-serving should use top-logit commitments plus
+  reference re-execution as detection, not proof; training/serving disputes localize
+  disagreements with an O(log N) Truebit-style bisection helper. Tier-2 reputation is a
+  decaying Beta posterior weighted by verified work value, so old behaviour fades and
+  cheap micro-jobs do not buy expensive-job trust. New nodes face graduated stake
+  requirements near 20× expected job value; detected fraud slashes stake into a real
+  destination ledger account, preserving donated==consumed conservation. Contributor
+  earnings also have Storj-style held-back escrow (50% initially, 25% after three
+  months, 0% after nine months). Sybil resistance remains no-KYC: Ed25519 device
+  enrollment can be bound to a serial hardware-timing challenge. That raises the cost
+  of mass fake identities; it cannot prove a unique human or make Sybils impossible.
 - **Proof-of-storage audits are per-chunk hashes, not a Merkle tree or PoRep.** Nodes are
   challenged on a random chunk offset and must return its SHA-256. A node that deleted the
   bytes fails. A determined cheater *can* defeat this by caching the chunk hash table

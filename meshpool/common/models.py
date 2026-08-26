@@ -427,8 +427,13 @@ class LedgerEntry(BaseModel):
 
 
 class TrustScore(BaseModel):
-    """EMA-based reputation (spec §7). Tier 1 fields are tracked but only used
-    when the cluster runs above Tier 0."""
+    """Reputation signals for a node.
+
+    The legacy EMA fields are retained for compatibility, but Tier 2 decisions use
+    the decaying Beta posterior below.  ``beta_alpha`` and ``beta_beta`` are
+    weighted by verified work value, not just job count, so a node cannot cheaply
+    farm trust on tiny jobs and spend it on expensive ones.
+    """
     node_id: str
     benchmark_pass_rate_ema: float = 1.0
     task_success_rate_ema: float = 1.0
@@ -443,8 +448,15 @@ class TrustScore(BaseModel):
     # unit thereafter — a proven cheat is never again trusted blindly.
     verify_passes: int = 0
     verify_failures: int = 0
+    beta_alpha: float = 1.0
+    beta_beta: float = 1.0
+    beta_last_ms: int = 0
+    proven_value: float = 0.0
 
     def score(self) -> float:
+        beta_total = self.beta_alpha + self.beta_beta
+        if beta_total > 2.0:
+            return self.beta_alpha / beta_total
         return (
             0.35 * self.benchmark_pass_rate_ema
             + 0.25 * self.task_success_rate_ema
