@@ -6,9 +6,10 @@ stop, returning the affected node ids so the engines can reschedule their work.
 
 Locking model
 -------------
-``NodeRegistry._lock`` (threading.RLock) guards all accesses to the in-memory
-``_nodes``, ``_tokens``, and ``_token_to_node`` dicts.  It must be held for any
-read-modify-write on those structures.
+``NodeRegistry._lock`` (threading.RLock) guards cross-index updates to the
+in-memory sharded ``_nodes`` map plus the URL/device/status/token indexes.  Each
+node shard also has its own lock, so id lookups do not require enumerating the
+whole registry.
 
 Why a threading lock rather than asyncio.Lock?  FastAPI routes that use plain
 ``def`` (not ``async def``) run in Starlette's thread pool and can therefore
@@ -26,6 +27,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from dataclasses import dataclass, field
+import hashlib
 import secrets as _secrets
 import threading
 import time
@@ -94,6 +97,78 @@ class EventBus:
         ]
 
 
+@dataclass
+class _RegistryShard:
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    nodes: dict[str, Node] = field(default_factory=dict)
+
+
+class ShardedNodeMap:
+    """Thread-safe node storage split by node id.
+
+    ``values_calls`` is intentionally exposed for acceptance gates: indexed
+    register/get/token lookups must not have to enumerate every node.
+    """
+
+    def __init__(self, nodes: list[Node] | None = None, shard_count: int = 64) -> None:
+        self.shards = [_RegistryShard() for _ in range(shard_count)]
+        self.values_calls = 0
+        for node in nodes or []:
+            self[node.id] = node
+
+    def _idx(self, node_id: str) -> int:
+        digest = hashlib.blake2b(node_id.encode("utf-8"), digest_size=4).digest()
+        return int.from_bytes(digest, "big") % len(self.shards)
+
+    def _shard(self, node_id: str) -> _RegistryShard:
+        return self.shards[self._idx(node_id)]
+
+    def get(self, node_id: str, default: Optional[Node] = None) -> Optional[Node]:
+        shard = self._shard(node_id)
+        with shard.lock:
+            return shard.nodes.get(node_id, default)
+
+    def __getitem__(self, node_id: str) -> Node:
+        shard = self._shard(node_id)
+        with shard.lock:
+            return shard.nodes[node_id]
+
+    def __setitem__(self, node_id: str, node: Node) -> None:
+        shard = self._shard(node_id)
+        with shard.lock:
+            shard.nodes[node_id] = node
+
+    def __len__(self) -> int:
+        total = 0
+        for shard in self.shards:
+            with shard.lock:
+                total += len(shard.nodes)
+        return total
+
+    def __contains__(self, node_id: object) -> bool:
+        if not isinstance(node_id, str):
+            return False
+        shard = self._shard(node_id)
+        with shard.lock:
+            return node_id in shard.nodes
+
+    def values(self) -> list[Node]:
+        self.values_calls += 1
+        out: list[Node] = []
+        for shard in self.shards:
+            with shard.lock:
+                out.extend(shard.nodes.values())
+        return out
+
+    def items(self) -> list[tuple[str, Node]]:
+        self.values_calls += 1
+        out: list[tuple[str, Node]] = []
+        for shard in self.shards:
+            with shard.lock:
+                out.extend(shard.nodes.items())
+        return out
+
+
 class NodeRegistry:
     def __init__(self, store: Store, node_timeout_s: int, events: EventBus) -> None:
         self.store = store
@@ -106,7 +181,13 @@ class NodeRegistry:
         self._eviction_grace_until: float = 0.0
         # _lock guards _nodes, _tokens, _token_to_node (see module docstring).
         self._lock = threading.RLock()
-        self._nodes: dict[str, Node] = {n.id: n for n in store.list_nodes()}
+        loaded_nodes = store.list_nodes()
+        self._nodes = ShardedNodeMap(loaded_nodes)
+        self._url_to_node: dict[str, str] = {}
+        self._device_to_node: dict[str, str] = {}
+        self._status_to_nodes: dict[NodeStatus, set[str]] = {
+            status: set() for status in NodeStatus
+        }
         # Optional owner resolver (global mode): maps a verified device_id to the
         # subject that earns credits/reputation for its donations (its linked
         # account, else the device itself). Left None in LAN mode, where the
@@ -131,6 +212,7 @@ class NodeRegistry:
         # nodes rediscovered on restart are stale until they heartbeat again
         for n in self._nodes.values():
             n.status = NodeStatus.OFFLINE
+            self._index_node_locked(n)
         # ------------------------------------------------------------------ #
         # Vivaldi network coordinates.
         # _vivaldi maps node_id -> Coordinate (in-memory only; reconstructed
@@ -142,6 +224,33 @@ class NodeRegistry:
         # ------------------------------------------------------------------ #
         self._vivaldi: dict[str, Coordinate] = {}
         self._vivaldi_lock = threading.Lock()
+
+    def _index_node_locked(self, node: Node) -> None:
+        self._url_to_node[node.url] = node.id
+        if node.device_id:
+            self._device_to_node[node.device_id] = node.id
+        self._status_to_nodes.setdefault(node.status, set()).add(node.id)
+
+    def _unindex_node_locked(self, node: Node) -> None:
+        if self._url_to_node.get(node.url) == node.id:
+            self._url_to_node.pop(node.url, None)
+        if node.device_id and self._device_to_node.get(node.device_id) == node.id:
+            self._device_to_node.pop(node.device_id, None)
+        self._status_to_nodes.setdefault(node.status, set()).discard(node.id)
+
+    def _replace_node_locked(self, node: Node) -> None:
+        old = self._nodes.get(node.id)
+        if old is not None:
+            self._unindex_node_locked(old)
+        self._nodes[node.id] = node
+        self._index_node_locked(node)
+
+    def _update_status_index_locked(self, node_id: str, old: NodeStatus,
+                                    new: NodeStatus) -> None:
+        if old is new:
+            return
+        self._status_to_nodes.setdefault(old, set()).discard(node_id)
+        self._status_to_nodes.setdefault(new, set()).add(node_id)
 
     # --- registration / heartbeat --------------------------------------- #
     def _verified_device_id(self, req: RegisterRequest) -> Optional[str]:
@@ -176,10 +285,10 @@ class NodeRegistry:
             # node keeps its id across IP/network changes and many tunnel nodes can share
             # the same sentinel URL. Plain LAN nodes are matched by URL as before.
             if device_id is not None:
-                existing = next((n for n in self._nodes.values()
-                                 if n.device_id == device_id), None)
+                existing_id = self._device_to_node.get(device_id)
             else:
-                existing = next((n for n in self._nodes.values() if n.url == req.url), None)
+                existing_id = self._url_to_node.get(req.url)
+            existing = self._nodes.get(existing_id) if existing_id else None
             node_id = existing.id if existing else new_id("node")
             # Resolve the owning subject. In global mode a verified device earns for its
             # linked account (or itself); an explicitly-supplied non-default owner (LAN)
@@ -204,7 +313,7 @@ class NodeRegistry:
                 registered_ms=existing.registered_ms if existing else now_ms(),
                 failure_domain=failure_domain,
             )
-            self._nodes[node_id] = node
+            self._replace_node_locked(node)
             # Mint (or reuse) a session token so the node can prove its identity later.
             token = self._tokens.get(node_id) or ("nt_" + _secrets.token_urlsafe(24))
             self._tokens[node_id] = token
@@ -229,10 +338,12 @@ class NodeRegistry:
             node = self._nodes.get(hb.node_id)
             if not node:
                 return False
+            old_status = node.status
             node.load = hb.load
             node.policy = hb.policy
             node.status = hb.status
             node.last_heartbeat_ms = now_ms()
+            self._update_status_index_locked(node.id, old_status, node.status)
         # store write outside _lock so we never hold two locks simultaneously
         self.store.put_node(node)
         self.events.publish("heartbeat", {"id": node.id, "load": hb.load.model_dump()})
@@ -248,8 +359,10 @@ class NodeRegistry:
             node = self._nodes.get(node_id)
             if not node:
                 return
+            old_status = node.status
             node.status = status
             node.last_heartbeat_ms = now_ms()
+            self._update_status_index_locked(node_id, old_status, status)
         self.store.put_node(node)
         self.events.publish("node_status", {"id": node_id, "status": status.value})
 
@@ -320,7 +433,12 @@ class NodeRegistry:
 
     def online(self) -> list[Node]:
         with self._lock:
-            return [n for n in self._nodes.values() if n.status is NodeStatus.ONLINE]
+            ids = list(self._status_to_nodes.get(NodeStatus.ONLINE, set()))
+            return [
+                n for node_id in ids
+                if (n := self._nodes.get(node_id)) is not None
+                and n.status is NodeStatus.ONLINE
+            ]
 
     def schedulable_nodes(self) -> list[Node]:
         nodes = [n for n in self.online() if schedulable(n)]
@@ -397,7 +515,9 @@ class NodeRegistry:
                 with self._lock:
                     # re-check under lock in case a concurrent heartbeat arrived
                     if node.status is not NodeStatus.OFFLINE and node.last_heartbeat_ms < cutoff:
+                        old_status = node.status
                         node.status = NodeStatus.OFFLINE
+                        self._update_status_index_locked(node.id, old_status, NodeStatus.OFFLINE)
                         gone.append(node.id)
                     else:
                         continue
