@@ -46,6 +46,31 @@ DEFAULT_REPLICATION = 2
 DEFAULT_EC_K = 6
 DEFAULT_EC_M = 3
 
+# ---------------------------------------------------------------------------
+# Storj-inspired tiered erasure-coding profiles (§5.1, §5.3, §5.4).
+#
+# Notation: RS(k, total) where total = k + m (parity shards m = total - k).
+# Overhead = total/k.  "Repair threshold" = minimum live pieces before the
+# repair loop fires -- below this count pieces are regenerated onto new nodes.
+#
+# Source labels (§5.2 honesty requirement):
+#   cold 35/80 repair threshold -- CITED: Storj production (Storj blog, 2018)
+#   hot/warm repair thresholds  -- CALIBRATED: same 43.75% ratio as Storj cold
+#   all other numbers           -- MEASURED / computed from the RS math above
+#
+# HONESTY: RS(29,80) cold requires 80 nodes.  A 3-node cluster cannot use it;
+# the engine falls back to 2× replication automatically (see `put()`).  The
+# unit / sim tests for this tier use in-process virtual clusters with 80
+# simulated node objects.  Real multi-datacenter durability numbers require an
+# actual deployed fleet -- do NOT cite the single-host emulated numbers as if
+# they represent a real deployment.
+# ---------------------------------------------------------------------------
+EC_PROFILES: dict[str, dict] = {
+    "hot":  {"k": 10, "m": 20, "repair_threshold": 13},  # RS(10,30)  13/30 ≈ 43.3%  [calibrated]
+    "warm": {"k": 20, "m": 40, "repair_threshold": 26},  # RS(20,60)  26/60 ≈ 43.3%  [calibrated]
+    "cold": {"k": 29, "m": 51, "repair_threshold": 35},  # RS(29,80)  35/80 = 43.75% [cited: Storj]
+}
+
 # Objects larger than this are split into content-addressed chunks, each replicated
 # independently across the pool, so one object can exceed any single machine's free
 # disk. Read at call time so tests and end-to-end runs can shrink it via the env.
@@ -103,6 +128,11 @@ class StorageManager:
         # Persisted in-band via replication_desired (k*256+m) and chunks presence;
         # this dict caches the decode to avoid recomputing on every access.
         self._ec_params: dict[str, tuple[int, int]] = {}
+        # Per-blob repair threshold (min live pieces before triggering repair).
+        # Keyed by blob_id; populated at put time from the EC profile.
+        # Missing key → default (total = k+m): repair whenever any shard is absent.
+        # Lost on restart; reverts to the conservative (immediate-repair) default.
+        self._repair_thresholds: dict[str, int] = {}
         self._bucket_owners: dict[str, str] = {}
         self._bucket_acls: dict[tuple[str, str], set[str]] = {}
         self._object_versions: dict[tuple[str, str], list[dict]] = {}
@@ -322,8 +352,15 @@ class StorageManager:
     async def _store_ec_leaf_locked(self, blob_id: str, data: bytes,
                                     k: int, m: int, *,
                                     owner: str, name: str,
-                                    internal: bool) -> BlobMeta:
-        """Erasure-code one blob and store k+m shards on distinct nodes."""
+                                    internal: bool,
+                                    repair_threshold: int = 0) -> BlobMeta:
+        """Erasure-code one blob and store k+m shards on distinct nodes.
+
+        ``repair_threshold`` is the minimum live shard count before the repair
+        loop fires.  0 (default) means ``k+m`` -- repair whenever any shard is
+        missing (conservative / legacy behaviour).  Named tiers set this from
+        ``EC_PROFILES``.
+        """
         codec = RSCodec(k, m)
         shards = codec.encode(data)  # list of k+m bytes objects
         total = k + m
@@ -396,6 +433,8 @@ class StorageManager:
 
         # Record EC params so we can decode without re-reading the manifest header
         self._ec_params[blob_id] = (k, m)
+        # Record repair threshold (0 → total, i.e. repair immediately on any loss)
+        self._repair_thresholds[blob_id] = repair_threshold or (k + m)
 
         status = "stored" if placed_count == total else "degraded"
         meta = BlobMeta(
@@ -415,7 +454,8 @@ class StorageManager:
     async def _store_ec_chunked_locked(self, blob_id: str, data: bytes,
                                        k: int, m: int, *,
                                        owner: str, name: str,
-                                       internal: bool = False) -> BlobMeta:
+                                       internal: bool = False,
+                                       repair_threshold: int = 0) -> BlobMeta:
         """Split a large object into chunk-sized pieces, EC-protect each."""
         size = len(data)
         step = _chunk_size()
@@ -425,7 +465,8 @@ class StorageManager:
             chunk = data[off:off + step]
             cid = self.digest(chunk)
             await self._store_ec_leaf_locked(
-                cid, chunk, k, m, owner=owner, name="", internal=True)
+                cid, chunk, k, m, owner=owner, name="", internal=True,
+                repair_threshold=repair_threshold)
             chunk_ids.append(cid)
         manifest = BlobMeta(
             id=blob_id, owner=owner, size=size,
@@ -576,12 +617,25 @@ class StorageManager:
                   erasure: bool = True,
                   ec_k: int = DEFAULT_EC_K,
                   ec_m: int = DEFAULT_EC_M,
+                  tier: str = "",
                   internal: bool = False) -> BlobMeta:
         """Store ``data`` in the pool.
 
         By default uses Reed–Solomon (ec_k, ec_m) erasure coding, which gives
         lower storage overhead and higher durability than plain replication.
         Set ``erasure=False`` to fall back to ``replication``-way replication.
+
+        ``tier`` selects a named erasure profile (``"hot"``, ``"warm"``,
+        ``"cold"``).  When set it overrides ``ec_k`` and ``ec_m`` and also
+        sets the Storj-inspired repair threshold for the object.  An empty
+        string (the default) keeps the explicit ``ec_k``/``ec_m`` values and
+        uses the conservative "repair immediately" threshold.
+
+        RS(10,30) hot requires 30 nodes; RS(20,60) warm requires 60; RS(29,80)
+        cold requires 80.  On a smaller cluster the engine falls back
+        automatically to 2× replication and logs the reason.  Real durability
+        numbers require a deployed multi-datacentre fleet -- the emulated sim
+        tests on a single host are labelled accordingly.
 
         Very small objects (below the per-shard-header crossover) automatically
         fall back to replication even when ``erasure=True``.
@@ -596,6 +650,15 @@ class StorageManager:
         ``internal=True`` marks the object as machinery so it is hidden from
         user-facing listings.
         """
+        # Resolve named tier -> ec parameters + repair threshold
+        if tier in EC_PROFILES:
+            prof = EC_PROFILES[tier]
+            ec_k = prof["k"]
+            ec_m = prof["m"]
+            repair_threshold = prof["repair_threshold"]
+        else:
+            repair_threshold = ec_k + ec_m   # repair immediately on any loss (legacy)
+
         blob_id = self.digest(data)
         async with self._lock:
             size = len(data)
@@ -604,14 +667,19 @@ class StorageManager:
             use_ec = (erasure and size >= _ec_crossover(ec_k, ec_m)
                       and ec_k + ec_m <= 255
                       and available_nodes >= ec_k + ec_m)
+            if not use_ec and erasure and tier:
+                log.info("ec tier fallback: cluster too small for requested profile",
+                         tier=tier, need=ec_k + ec_m, have=available_nodes)
             if use_ec:
                 if size <= _chunk_size():
                     return await self._store_ec_leaf_locked(
                         blob_id, data, ec_k, ec_m,
-                        owner=owner, name=name, internal=internal)
+                        owner=owner, name=name, internal=internal,
+                        repair_threshold=repair_threshold)
                 return await self._store_ec_chunked_locked(
                     blob_id, data, ec_k, ec_m,
-                    owner=owner, name=name, internal=internal)
+                    owner=owner, name=name, internal=internal,
+                    repair_threshold=repair_threshold)
             # Replication path (small objects or explicit request)
             if size <= _chunk_size():
                 return await self._store_leaf_locked(
@@ -795,7 +863,7 @@ class StorageManager:
         for meta in self.store.list_blobs():
             if meta.chunks:
                 if self._is_ec(meta):
-                    # EC leaf: check shard health and repair if needed
+                    # EC leaf: check shard health and trigger repair at threshold
                     k, m = (self._ec_params.get(meta.id)
                             or _unpack_ec_params(meta.replication_desired))
                     placed = sum(
@@ -803,10 +871,14 @@ class StorageManager:
                         if (sm := self.store.get_blob(sid)) and sm.replicas
                         and any(r in live for r in sm.replicas))
                     total = k + m
+                    # Storj-style threshold: repair when placed drops below
+                    # repair_threshold (default = total → repair immediately).
+                    # Threshold is set from the EC profile at put() time.
+                    repair_threshold = self._repair_thresholds.get(meta.id, total)
                     new_status = ("stored" if placed == total
                                   else ("degraded" if placed >= k else "lost"))
-                    if placed < total and placed >= k:
-                        # can repair
+                    if placed < repair_threshold and placed >= k:
+                        # Below repair threshold AND enough shards to reconstruct
                         await self._repair_ec_locked(meta)
                         continue
                     if new_status != meta.status:
@@ -814,7 +886,8 @@ class StorageManager:
                         self.store.put_blob(meta)
                         self.events.publish("blob_health",
                                             {"id": meta.id, "status": new_status,
-                                             "shards": placed, "total": total})
+                                             "shards": placed, "total": total,
+                                             "repair_threshold": repair_threshold})
                     continue
                 # Regular chunked manifest: refresh aggregate health
                 agg = self._chunk_status(meta.chunks)
