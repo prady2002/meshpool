@@ -97,6 +97,48 @@ MUTATIONS = [
             "not just the absence of plaintext."
         ),
     },
+    {
+        "id": "spend-cap-boundary",
+        "path": "meshpool/controlplane/spend.py",
+        "old": b"return self.spent(owner) >= cap",
+        "new": b"return self.spent(owner) > cap",
+        "cmd": [sys.executable, "sim/scenarios/verify_spend_cap_hard_stop.py"],
+        "why": (
+            "A cap that only stops work *above* the limit lets an account sit exactly "
+            "at its cap and keep spending forever. Straddling a boundary is not "
+            "testing it: a gate that spends far past the cap and a gate that spends "
+            "well under it both pass this mutation. Only landing exactly ON the cap "
+            "tells the two comparisons apart."
+        ),
+    },
+    {
+        "id": "authz-scope-bypass",
+        "path": "meshpool/common/auth.py",
+        "old": b"if not principal.has_scope(scope):",
+        "new": b"if False and not principal.has_scope(scope):",
+        "cmd": [sys.executable, "sim/scenarios/verify_authz_matrix.py"],
+        "why": (
+            "Scope enforcement disabled entirely: every credential may call every "
+            "endpoint. Expiry still rejects, so any test that only checks 'a bad "
+            "token is refused' stays green. Catching this needs the other half of "
+            "the matrix -- a *valid* credential that lacks the required scope must "
+            "still be refused."
+        ),
+    },
+    {
+        "id": "ledger-double-fee",
+        "path": "meshpool/common/billing.py",
+        "old": b"total = mesh_seconds + fee",
+        "new": b"total = mesh_seconds + fee * 2",
+        "cmd": [sys.executable, "sim/scenarios/verify_ledger_conservation.py"],
+        "why": (
+            "Consumers are charged twice the platform fee while donors are still paid "
+            "the same gross, so money appears from nowhere and the books stop "
+            "balancing. Receipts still render, totals still rise monotonically, and "
+            "every charge is still positive -- the defect is only visible to a check "
+            "that asserts the identity total_charged == gross_earnings + platform_fee."
+        ),
+    },
 ]
 
 
@@ -120,7 +162,13 @@ def _apply(worktree: Path, mut: dict) -> bytes:
 def main() -> int:
     print("== mutation coverage: do our strongest gates actually detect breakage? ==\n")
 
-    pre = {m["path"]: _sha(ROOT / m["path"]) for m in MUTATIONS}
+    # Optional id filter keeps the edit/run loop cheap while writing a new entry.
+    wanted = set(sys.argv[1:])
+    selected = [m for m in MUTATIONS if not wanted or m["id"] in wanted]
+    unknown = wanted - {m["id"] for m in MUTATIONS}
+    assert not unknown, f"unknown mutation id(s): {sorted(unknown)}"
+
+    pre = {m["path"]: _sha(ROOT / m["path"]) for m in selected}
     tmp = Path(tempfile.mkdtemp(prefix="meshpool-mut-"))
     worktree = tmp / "wt"
     survivors: list[dict] = []
@@ -137,8 +185,8 @@ def main() -> int:
         env["PYTHONPATH"] = str(worktree)
         env.pop("PYTHONHOME", None)
 
-        for i, mut in enumerate(MUTATIONS, 1):
-            print(f"-- [{i}/{len(MUTATIONS)}] {mut['id']}")
+        for i, mut in enumerate(selected, 1):
+            print(f"-- [{i}/{len(selected)}] {mut['id']}")
             print(f"   {mut['path']}: {mut['old'].decode()}")
             print(f"                -> {mut['new'].decode()}")
             original = _apply(worktree, mut)
@@ -181,11 +229,11 @@ def main() -> int:
             print(f"  Guarded by: {' '.join(mut['cmd'][1:])}")
             print()
         raise AssertionError(
-            f"{len(survivors)} of {len(MUTATIONS)} mutations survived. The gates "
+            f"{len(survivors)} of {len(selected)} mutations survived. The gates "
             "above cannot fail, so they are not protecting what they claim to. Fix "
             "the tests -- a surviving mutation never means the code was fine.")
 
-    print(f"\nALL {len(MUTATIONS)} MUTATIONS CAUGHT")
+    print(f"\nALL {len(selected)} MUTATIONS CAUGHT")
     return 0
 
 

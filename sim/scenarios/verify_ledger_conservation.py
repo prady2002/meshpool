@@ -116,7 +116,8 @@ def main() -> int:
         print(f"\n== 1) run {UNITS} verified units to drive an escrow release ==")
         sess = _auth(cp)
         hdr = {"X-MeshPool-Session": sess["session_token"]}
-        job = _wait_job(cp, _submit(cp, hdr, UNITS))
+        job_id = _submit(cp, hdr, UNITS)
+        job = _wait_job(cp, job_id)
         assert job["status"] == "completed", job["status"]
         for u in job["units"]:
             assert u["result"] == u["payload"]["x"] ** 2, u
@@ -179,6 +180,45 @@ def main() -> int:
                 f"summary.{field}={summary[field]} but the per-owner rows "
                 f"sum to {rows}")
         print("  PASS: summary and per-owner rows agree on all three kinds")
+
+        print("\n== 7) every receipt line: total_charged == gross + fee ==")
+        # Sections 3-6 all reconcile recorded numbers against other recorded
+        # numbers, so a books-wide error that is *consistently* wrong still
+        # balances perfectly. Double the platform fee on every charge and the
+        # ledger stays self-consistent while consumers are silently overbilled.
+        # This is the one check that compares the money to arithmetic instead of
+        # to itself.
+        r = httpx.get(f"{cp}/api/v1/jobs/{job_id}/receipt", headers=hdr, timeout=10)
+        assert r.status_code == 200, f"receipt fetch failed: {r.status_code} {r.text[:200]}"
+        receipt = r.json()
+        lines = receipt.get("lines") or []
+        assert lines, f"receipt carries no line items, so nothing was checked: {receipt}"
+        fee_rate = float(receipt["fee_rate"])
+        assert fee_rate > 0.0, (
+            f"platform fee rate is {fee_rate}, so fee errors are unobservable here "
+            "and this check would pass on any arithmetic at all")
+        for ln in lines:
+            gross, fee = float(ln["gross_earnings"]), float(ln["platform_fee"])
+            total = float(ln["total_charged"])
+            assert abs(total - (gross + fee)) < TOL, (
+                f"line {ln.get('line_id')}: consumer charged {total} but the donor "
+                f"earns {gross} and the platform takes {fee} (= {gross + fee}). "
+                f"{total - (gross + fee):+.6f} appears from nowhere.")
+            assert abs(fee - gross * fee_rate) < TOL, (
+                f"line {ln.get('line_id')}: fee {fee} != gross {gross} x rate "
+                f"{fee_rate} = {gross * fee_rate}")
+        tot = receipt["totals"]
+        for field, want in (("gross_earnings", sum(float(x["gross_earnings"]) for x in lines)),
+                            ("platform_fee", sum(float(x["platform_fee"]) for x in lines)),
+                            ("total_charged", sum(float(x["total_charged"]) for x in lines))):
+            assert abs(float(tot[field]) - want) < TOL, (
+                f"receipt totals.{field}={tot[field]} but its own lines sum to {want}")
+        assert abs(float(receipt["platform_fee_line_item"]["amount"])
+                   - float(tot["platform_fee"])) < TOL, (
+            "the platform fee shown as a separate line item disagrees with the "
+            "fee actually charged across the receipt's lines")
+        print(f"  PASS: {len(lines)} line(s) at fee rate {fee_rate}; charges equal "
+              f"gross + fee exactly, and totals match their own lines")
 
         print("\nALL LEDGER CONSERVATION CHECKS PASSED")
     except Exception as exc:  # noqa: BLE001
