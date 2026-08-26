@@ -362,6 +362,40 @@ MUTATIONS = [
             "and that throughput came back."
         ),
     },
+    {
+        "id": "pulled-weights-are-never-verified",
+        "path": "meshpool/agent/daemon.py",
+        "old": b"        if hashlib.sha256(raw).hexdigest() == blob_id:\n            return raw",
+        "new": b"        if raw is not None:\n            return raw",
+        "cmd": [sys.executable, "sim/scenarios/verify_weight_swarm_coldstart.py"],
+        "why": (
+            "Takes the first peer at its word. This is the most dangerous mutation in "
+            "the list, because it breaks nothing anyone would notice: every pull still "
+            "succeeds, every model still loads, every request still returns fluent "
+            "text. Only the text is wrong, and it is wrong in a way that reads as the "
+            "model being bad rather than the platform being broken. No timeout fires, "
+            "no exception is raised, no counter moves. A gate can only catch this by "
+            "planting a peer that actually lies and then hashing what ends up on disk "
+            "-- which is the entire reason the dishonest-peer fault exists."
+        ),
+    },
+    {
+        "id": "weights-relay-through-the-coordinator",
+        "path": "meshpool/inference/engine.py",
+        "old": b"            if may_pull and await self._try_peer_pull(node_id, bid):",
+        "new": b"            if False and await self._try_peer_pull(node_id, bid):",
+        "cmd": [sys.executable, "sim/scenarios/verify_weight_swarm_coldstart.py"],
+        "why": (
+            "Routes every weight group through the control plane instead of peer to "
+            "peer. Still correct, and invisible at nano-gpt scale -- same output, same "
+            "timings, every functional check passes. At the scale the product exists "
+            "for it is fatal: the coordinator becomes a hard bandwidth bottleneck that "
+            "every node join queues behind, which is the exact centralisation the "
+            "design exists to avoid. A property that only shows up as a bottleneck at "
+            "600 GB has to be asserted structurally at 6 MB, by counting relays and "
+            "requiring zero."
+        ),
+    },
 ]
 
 
