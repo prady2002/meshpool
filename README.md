@@ -537,6 +537,14 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   months, 0% after nine months). Sybil resistance remains no-KYC: Ed25519 device
   enrollment can be bound to a serial hardware-timing challenge. That raises the cost
   of mass fake identities; it cannot prove a unique human or make Sybils impossible.
+- **The current fraud-detection release gate is logic-level, not full transport E2E.**
+  `sim/scenarios/verify_fraud_detection.py` deliberately runs in process while driving
+  the real `BatchManager`, `Verifier`, `TrustEngine`, `ContributionLedger`, SQLite
+  `Store`, and deterministic function runner. It proves the detection/slashing logic
+  and non-vacuity controls, but it does **not** yet prove that a real multi-process
+  agent returning a bad answer over the production transport is caught and slashed.
+  Before anonymous public supply opens, this must be complemented by a multi-process
+  gate using real agents and the real transport.
 - **Proof-of-storage audits are per-chunk hashes, not a Merkle tree or PoRep.** Nodes are
   challenged on a random chunk offset and must return its SHA-256. A node that deleted the
   bytes fails. A determined cheater *can* defeat this by caching the chunk hash table

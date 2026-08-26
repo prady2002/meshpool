@@ -5,10 +5,16 @@ batch unit is run through the real redundant-verification code with one lying
 node.  The gate proves detection, slashing as a balanced ledger transfer, and
 two non-vacuity controls: an honest node is not slashed, and disabling the
 detector lets the lie through.
+
+LIMITATION: this validates the fraud-detection and slashing logic in-process.
+It does not yet prove end-to-end detection across real agent processes and the
+real transport.  A multi-process version is required before anonymous public
+supply is opened.
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
 from pathlib import Path
 
@@ -17,8 +23,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from meshpool.batch.engine import BatchManager  # noqa: E402
 from meshpool.batch.functions import run_function  # noqa: E402
 from meshpool.common.db import Store  # noqa: E402
-from meshpool.common.models import BatchJob, UnitStatus, WorkUnit, now_ms  # noqa: E402
+from meshpool.common.models import (  # noqa: E402
+    BatchJob,
+    Capability,
+    DonationPolicy,
+    Node,
+    NodeStatus,
+    UnitStatus,
+    WorkUnit,
+    now_ms,
+)
 from meshpool.common.trust import ContributionLedger, TrustEngine  # noqa: E402
+from meshpool.controlplane.registry import NodeRegistry  # noqa: E402
 from meshpool.controlplane.verification import VerificationPolicy, Verifier  # noqa: E402
 
 
@@ -27,20 +43,46 @@ class _Events:
         pass
 
 
-class _Node:
-    def __init__(self, node_id: str):
-        self.id = node_id
-        self.name = node_id
-        self.owner = f"dev:{node_id}"
-        self.status = "online"
-        self.capability = type("C", (), {"cpu_cores": 4, "ram_mb": 4096})()
-        self.policy = type("P", (), {"cpu_pct": 100, "ram_mb": 4096})()
+def _signature_without_self(method) -> tuple:
+    sig = inspect.signature(method)
+    return tuple(
+        (p.kind, p.default is inspect.Signature.empty)
+        for name, p in sig.parameters.items()
+        if name != "self"
+    )
 
-    def donatable_cpu_slots(self):
-        return 4
 
-    def provides(self, workload_class):
-        return workload_class == "batch"
+def _assert_conformance() -> None:
+    """Fail fast if this in-process gate drifts from real model/registry APIs."""
+    for method in ("provides", "donatable_cpu_slots"):
+        if not hasattr(Node, method):
+            raise AssertionError(f"real Node is missing {method}()")
+    assert _signature_without_self(Node.provides) == (
+        (inspect.Parameter.POSITIONAL_OR_KEYWORD, True),
+    ), "Node.provides(service) signature changed"
+    assert _signature_without_self(Node.donatable_cpu_slots) == (), (
+        "Node.donatable_cpu_slots() signature changed")
+
+    for method in ("schedulable_nodes", "online", "list", "get"):
+        if not hasattr(NodeRegistry, method):
+            raise AssertionError(f"real NodeRegistry is missing {method}()")
+        if not hasattr(_Registry, method):
+            raise AssertionError(f"_Registry fake is missing {method}()")
+        assert _signature_without_self(getattr(_Registry, method)) == (
+            _signature_without_self(getattr(NodeRegistry, method))
+        ), f"_Registry.{method} signature drifted from NodeRegistry.{method}"
+
+
+def _make_node(node_id: str) -> Node:
+    return Node(
+        id=node_id,
+        name=node_id,
+        url=f"http://127.0.0.1/{node_id}",
+        owner=f"dev:{node_id}",
+        status=NodeStatus.ONLINE,
+        capability=Capability(cpu_cores=4, ram_mb=4096),
+        policy=DonationPolicy(cpu_pct=100, ram_mb=4096),
+    )
 
 
 class _Registry:
@@ -52,6 +94,12 @@ class _Registry:
 
     def online(self):
         return list(self.nodes)
+
+    def list(self):
+        return list(self.nodes)
+
+    def get(self, node_id: str):
+        return next((n for n in self.nodes if n.id == node_id), None)
 
 
 class _BatchStore:
@@ -94,7 +142,8 @@ def _make_job():
 
 
 def _run(liars: set[str], primary_id: str, redundant_rate: float) -> dict:
-    nodes = [_Node("liar"), _Node("honest1"), _Node("honest2")]
+    _assert_conformance()
+    nodes = [_make_node("liar"), _make_node("honest1"), _make_node("honest2")]
     store = Store(":memory:")
     ledger = ContributionLedger(store)
     trust = TrustEngine(store, tier=2)
@@ -127,6 +176,10 @@ def _run(liars: set[str], primary_id: str, redundant_rate: float) -> dict:
 def main() -> int:
     ok = True
     try:
+        print("== test 0: gate fakes conform to real Node/NodeRegistry interfaces ==")
+        _assert_conformance()
+        print("  PASS: Node and registry fake signatures match the real interfaces")
+
         print("== test 1: dishonest primary is detected and slashed ==")
         bad = _run({"liar"}, "liar", redundant_rate=1.0)
         assert bad["calls"] >= 2, f"redundant path did not execute: {bad}"
