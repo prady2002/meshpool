@@ -100,7 +100,7 @@ def main() -> int:
         print("== building meshd ==")
         exe = data_root / ("meshd.exe" if os.name == "nt" else "meshd")
         build = subprocess.run([go, "build", "-o", str(exe), "./cmd/meshd"],
-                               cwd=str(GO_DIR), capture_output=True, text=True)
+                               cwd=str(GO_DIR), capture_output=True, text=True, errors="replace")
         print(f"  go build exit={build.returncode}")
         if build.returncode != 0:
             print(build.stdout[-2000:])

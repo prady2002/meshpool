@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -160,3 +161,131 @@ class TestFlopsEstimate:
 
     def test_returns_float(self):
         assert isinstance(_flops_estimate(), float)
+
+
+# ── tool output the local codepage cannot decode ───────────────────────────
+
+class TestToolOutputEncoding:
+    """A GPU must not disappear because its name has an awkward byte in it.
+
+    Every hardware detector here shells out to a vendor tool and reads its text.
+    On Windows those tools write pipes in the *OEM* codepage (cp437/cp850/...)
+    while Python decodes with the *ANSI* one (cp1252/...). The two differ on
+    essentially every Windows install, so one non-ASCII byte anywhere in a GPU
+    name is enough to break the decode.
+
+    What makes that dangerous rather than merely annoying is the failure shape.
+    The decode happens on subprocess's reader thread, so it does not propagate:
+    the thread dies, ``CompletedProcess.stdout`` comes back as **None**, the
+    ``.strip()`` in the caller raises AttributeError, and the broad ``except
+    Exception`` -- there to let a missing tool degrade quietly -- swallows it.
+    ``_detect_gpu`` then falls through every branch and reports no GPU at all.
+
+    The owner sees nothing. Their machine is quietly classified CPU-only, never
+    receives inference work, and earns nothing, on a box with a 4090 in it.
+    """
+
+    # A name carrying 0x90, which is unmapped in cp1252. Real cases: any
+    # localized Windows, or a vendor string with a trademark/dash glyph.
+    RAW = (b'[{"Name":"NVIDIA GeForce RTX 4090 \x90 OEM",'
+           b'"AdapterRAM":25757220864}]')
+
+    @staticmethod
+    def _run_like_subprocess(raw: bytes, **kwargs):
+        """Reproduce CPython's decode behaviour, including the None on failure.
+
+        Verified against the real thing: with a bare ``text=True`` and no
+        ``errors`` policy, an undecodable byte leaves ``stdout`` as None rather
+        than raising.
+        """
+        import locale
+        enc = kwargs.get("encoding") or locale.getpreferredencoding(False)
+        errs = kwargs.get("errors")
+        try:
+            return raw.decode(enc, errs) if errs else raw.decode(enc)
+        except UnicodeDecodeError:
+            return None
+
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+    def test_the_hazard_is_real_on_this_machine(self):
+        """Paired non-vacuity check: prove the trap exists before proving it is
+        avoided. Skips where the locale is UTF-8 and there is nothing to trip on."""
+        import locale
+        if locale.getpreferredencoding(False).lower().replace("-", "") == "utf8":
+            pytest.skip("UTF-8 locale: no decode hazard to demonstrate")
+        r = subprocess.run(
+            [sys.executable, "-c",
+             f"import sys; sys.stdout.buffer.write({self.RAW!r})"],
+            capture_output=True, text=True, timeout=30)
+        assert r.stdout is None, (
+            "expected the locale decoder to fail and null out stdout; if this "
+            "ever stops being true the test below proves nothing")
+
+    def test_errors_replace_keeps_the_output_readable(self):
+        r = subprocess.run(
+            [sys.executable, "-c",
+             f"import sys; sys.stdout.buffer.write({self.RAW!r})"],
+            capture_output=True, text=True, errors="replace", timeout=30)
+        assert isinstance(r.stdout, str)
+        # The bytes we actually parse are ASCII, so they survive intact.
+        assert '"AdapterRAM":25757220864' in r.stdout
+        assert "RTX 4090" in r.stdout
+
+    def test_a_gpu_whose_name_cannot_be_decoded_is_still_detected(self, monkeypatch):
+        """The end-to-end claim: undecodable name in, GPU still out."""
+        import platform as _platform
+
+        import meshpool.agent.probe as probe
+
+        monkeypatch.setattr(probe.platform, "system", lambda: "Windows")
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] != "powershell":
+                raise FileNotFoundError(cmd[0])  # no nvidia-smi / rocm-smi here
+            text = self._run_like_subprocess(self.RAW, **kwargs)
+            return subprocess.CompletedProcess(cmd, 0, text, "")
+
+        monkeypatch.setattr(probe.subprocess, "run", fake_run)
+        has_gpu, vram, names = _detect_gpu()
+
+        assert has_gpu is True, "a 24 GB GPU vanished because of one byte in its name"
+        assert vram == 25757220864 // (1024 * 1024)
+        assert names and "RTX 4090" in names[0]
+        assert _platform  # keep the import meaningful for linters
+
+    def test_a_none_stdout_never_raises(self, monkeypatch):
+        """Belt and braces: even if some future tool still returns None, the
+        probe must degrade to 'no GPU' rather than take the agent down."""
+        import meshpool.agent.probe as probe
+
+        monkeypatch.setattr(probe.subprocess, "run",
+                            lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, None, ""))
+        has_gpu, vram, names = _detect_gpu()
+        assert (has_gpu, vram, names) == (False, 0, [])
+
+    def test_every_capture_in_probe_is_decode_safe(self):
+        """Structural guard for call site number twelve.
+
+        The fix is one keyword argument, which makes it exactly the kind of thing
+        that gets left off the next detector someone adds. Pin it in source.
+        """
+        import re
+        from pathlib import Path
+
+        src = Path(probe_module_file()).read_text(encoding="utf-8")
+        calls = re.findall(r"subprocess\.run\((?:[^()]|\([^()]*\))*\)", src,
+                           flags=re.S)
+        capturing = [c for c in calls
+                     if "text=True" in c or "encoding=" in c]
+        assert capturing, "no text-capturing subprocess calls found — bad matcher"
+        offenders = [" ".join(c.split())[:110] for c in capturing
+                     if "errors=" not in c]
+        assert not offenders, (
+            "these probe subprocess calls decode tool output with the ambient "
+            "locale and will null out stdout on one odd byte; add "
+            'errors="replace":\n  ' + "\n  ".join(offenders))
+
+
+def probe_module_file() -> str:
+    import meshpool.agent.probe as probe
+    return probe.__file__

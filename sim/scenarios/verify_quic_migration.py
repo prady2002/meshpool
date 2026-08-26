@@ -195,7 +195,7 @@ def go_quic_smoke() -> int:
     exe = data_root / ("meshd.exe" if os.name == "nt" else "meshd")
     exe.parent.mkdir(parents=True, exist_ok=True)
     build = subprocess.run([go, "build", "-o", str(exe), "./cmd/meshd"],
-                           cwd=str(GO_DIR), capture_output=True, text=True)
+                           cwd=str(GO_DIR), capture_output=True, text=True, errors="replace")
     if build.returncode != 0:
         print("FAILED: meshd did not build")
         print(build.stdout[-2000:])

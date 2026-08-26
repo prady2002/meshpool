@@ -128,7 +128,7 @@ def run_nonvacuity_check() -> None:
             [sys.executable, str(Path(__file__).resolve())],
             cwd=str(REPO_ROOT),
             capture_output=True,
-            text=True,
+            text=True, errors="replace",
             timeout=420,
             env=env,
         )

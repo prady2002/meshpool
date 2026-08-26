@@ -345,7 +345,7 @@ def test_module_console_is_widened_when_stdout_is_not_a_tty():
     proc = subprocess.run(
         [sys.executable, "-c",
          "import meshpool.cli.main as m; print(m.console.width)"],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, errors="replace", env=env,
         cwd=str(Path(cli_module.__file__).resolve().parents[2]),
     )
     assert proc.returncode == 0, proc.stderr

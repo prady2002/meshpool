@@ -38,14 +38,19 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 # ── Production build marker ────────────────────────────────────────────────
 # Packaging step: flip to True (or rewrite to `True`) to hard-disable all faults.
 _FAULTINJECT_STRIPPED: bool = False
 
 log = logging.getLogger("meshpool.faultinject")
+
+# Set only through set_stall_ms(), which enforces the opt-in guard. None means
+# "fall back to the environment variable".
+_runtime_stall_ms: "Optional[float]" = None
 
 
 def _opt_in() -> bool:
@@ -109,7 +114,62 @@ def active_profile() -> FaultProfile:
         return FaultProfile()
 
     lie = os.environ.get("MESHPOOL_LIE", "").strip().lower() in ("1", "true", "yes", "on")
-    return FaultProfile(corrupt_results=lie)
+    return FaultProfile(corrupt_results=lie, stall_seconds=_stall_seconds())
+
+
+def _stall_seconds() -> float:
+    """Milliseconds of artificial delay per shard call.
+
+    A straggler is not a failure -- the node answers, correctly, just late -- so it
+    cannot be emulated by killing anything. On consumer hardware this is the *normal*
+    case (thermal throttling, someone launches a game, Wi-Fi degrades), and in a
+    pipeline one slow stage caps the throughput of every stage. Emulating it needs a
+    knob that makes a node slow while leaving it perfectly healthy.
+
+    A runtime override takes precedence over ``MESHPOOL_STALL_MS`` so a scenario can
+    make a node slow *while it is already serving*. Starting it slow would prove much
+    less: the interesting claim is that a healthy deployment notices a node that
+    degrades under it and routes around it, and that is only observable if there was
+    a healthy baseline first.
+    """
+    if _runtime_stall_ms is not None:
+        return max(0.0, _runtime_stall_ms) / 1000.0
+    raw = os.environ.get("MESHPOOL_STALL_MS", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        ms = float(raw)
+    except ValueError:
+        log.warning("ignoring unparseable MESHPOOL_STALL_MS: %r", raw)
+        return 0.0
+    return max(0.0, ms) / 1000.0
+
+
+def set_stall_ms(ms: Optional[float]) -> bool:
+    """Set (or clear, with None) the runtime stall. False when not opted in.
+
+    Refusing rather than silently ignoring matters: a scenario that believes it made
+    a node slow, and did not, will report a passing straggler test that never had a
+    straggler in it.
+    """
+    global _runtime_stall_ms
+    if not _opt_in():
+        log.warning("refusing to set a runtime stall: fault injection is not enabled")
+        return False
+    _runtime_stall_ms = None if ms is None else max(0.0, float(ms))
+    log.warning("FAULT INJECTION ACTIVE - stall set to %r ms "
+                "(test-only straggler emulation; never active in production)",
+                _runtime_stall_ms)
+    return True
+
+
+def stall(profile: FaultProfile | None = None) -> float:
+    """Block for the configured stall, returning the seconds actually spent."""
+    p = profile if profile is not None else active_profile()
+    if p.stall_seconds <= 0:
+        return 0.0
+    time.sleep(p.stall_seconds)
+    return p.stall_seconds
 
 
 # ── Fault application helpers ─────────────────────────────────────────────

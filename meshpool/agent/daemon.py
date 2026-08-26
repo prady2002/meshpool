@@ -32,7 +32,8 @@ from ..common.models import (
 from ..common.identity import enrollment_challenge
 from .donation import DonationController
 from .probe import measure_link, network_class_from_link, probe_capability
-from ..common.faultinject import active_profile, corrupt_result
+from ..common.faultinject import (active_profile, corrupt_result, set_stall_ms,
+                                  stall)
 from .runtime import ProcessRuntime, free_port, start_app_process, LogBuffer
 from ..inference import model as M
 from ..inference.pipeline import CachedShard
@@ -895,6 +896,38 @@ async def shard_load(req: ShardLoadRequest) -> dict:
             "params": n_params}
 
 
+def _with_stall(fn, *args):
+    """Run ``fn`` on the executor thread after any configured straggler delay.
+
+    Applied inside the executor rather than around the await so it blocks this
+    node's compute the way real slowness does, instead of merely deferring the
+    reply while the node stays free to serve everyone else.
+    """
+    stall()
+    return fn(*args)
+
+
+class StallRequest(BaseModel):
+    ms: Optional[float] = None
+
+
+@app.post("/fault/stall")
+async def fault_stall(req: StallRequest) -> dict:
+    """Make this node slow without making it unhealthy. Test-only.
+
+    Guarded by the same opt-in as every other injected fault (see faultinject.py), so
+    a production agent answers 403 no matter what is posted to it. It exists because
+    a straggler cannot be emulated from the outside: killing a node tests the failure
+    path, throttling the link tests the transport, and neither produces the case that
+    actually caps a pipeline -- a node that is up, correct, and late.
+    """
+    if not set_stall_ms(req.ms):
+        raise HTTPException(
+            status_code=403,
+            detail="fault injection is not enabled on this node")
+    return {"ok": True, "stall_ms": req.ms}
+
+
 @app.post("/shard/forward")
 async def shard_forward(req: ShardForwardRequest) -> dict:
     shard = state.shards.get(req.model_id)
@@ -914,7 +947,8 @@ async def shard_forward(req: ShardForwardRequest) -> dict:
     inp = req.data if req.is_tokens else np.asarray(req.data, dtype="float32")
     try:
         out = await asyncio.get_running_loop().run_in_executor(
-            None, shard.forward, inp, req.is_tokens, int(req.pos_offset), session)
+            None, _with_stall, shard.forward, inp, req.is_tokens,
+            int(req.pos_offset), session)
     except ValueError as exc:
         # A cache miss is a protocol error the caller can recover from by replaying
         # the prompt, so report it as such rather than as a 500.
@@ -964,6 +998,7 @@ async def shard_forward_batch(req: ShardBatchForwardRequest) -> dict:
     state.shard_rows += len(req.items)
 
     def _run() -> list:
+        stall()
         outs, cursor = [], 0
         for item in req.items:
             rows = int(item.rows)

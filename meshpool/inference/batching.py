@@ -142,6 +142,7 @@ class BatcherStats:
     completed: int = 0
     abandoned: int = 0
     rejected: int = 0
+    straggler_rotations: int = 0
     rows_processed: int = 0
     max_batch_seen: int = 0
     batch_size_sum: int = 0
@@ -157,6 +158,7 @@ class BatcherStats:
             "completed": self.completed,
             "abandoned": self.abandoned,
             "rejected": self.rejected,
+            "straggler_rotations": self.straggler_rotations,
             "rows_processed": self.rows_processed,
             "max_batch_seen": self.max_batch_seen,
             "mean_batch": round(self.mean_batch, 3),
@@ -333,6 +335,7 @@ class ContinuousBatcher:
                 # tenant's future. Fail the whole active set loudly and carry on:
                 # a traversal is shared, so a failure in it is genuinely shared too.
                 self._fail_active(exc)
+            self._check_stragglers()
             # Yield between steps, unconditionally.
             #
             # A traversal only suspends if something inside it actually awaits, and
@@ -344,6 +347,25 @@ class ContinuousBatcher:
             # cost is one scheduler tick per step; the benefit is that "continuous"
             # is true rather than aspirational.
             await asyncio.sleep(0)
+
+    def _check_stragglers(self) -> None:
+        """Ask the pipeline to retire a stage that has become the bottleneck.
+
+        Driven from the scheduler rather than from inside a hop because the decision
+        is comparative -- it needs every stage's cost from the *same* traversal, and
+        only the loop knows when a traversal has ended. Local pipelines have no such
+        method and no spares, so this is a no-op for them.
+        """
+        check = getattr(self.pipe, "check_stragglers", None)
+        if check is None:
+            return
+        try:
+            if check() is not None:
+                self.stats.straggler_rotations += 1
+        except Exception as exc:  # noqa: BLE001
+            # Never let an optimisation take down the scheduler: serving slowly is
+            # always better than not serving.
+            log.warning("straggler check failed", error=str(exc))
 
     def _admit(self) -> None:
         """Refill free slots from the queue.

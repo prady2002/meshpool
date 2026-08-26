@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def _run_scenario(module: str) -> None:
     proc = subprocess.run(
         [sys.executable, "-m", module],
-        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=600,
+        cwd=str(REPO_ROOT), capture_output=True, text=True, errors="replace", timeout=600,
     )
     if proc.returncode != 0:
         raise AssertionError(

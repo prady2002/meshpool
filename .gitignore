@@ -52,3 +52,6 @@ pytest_*.txt
 *_out.txt
 *_out[0-9].txt
 _gatelogs/
+
+# scratch file used to pass multi-line commit messages to git commit -F
+.commitmsg

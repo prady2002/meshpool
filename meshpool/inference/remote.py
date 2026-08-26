@@ -24,17 +24,44 @@ applies it before computing. **Rollback therefore costs zero extra round trips.*
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
 import numpy as np
 
 from . import model as M
+from ..common.logging import get_logger
 from ..common.transport import TransportError
 from .pipeline import LinkProfile, Pipeline, StageCall
+
+log = get_logger("remote")
 
 # A node that does not know the batched hop answers with one of these. Anything
 # else is a real failure and must not be silently downgraded to the slow path.
 _BATCH_UNSUPPORTED_STATUS = frozenset({404, 405, 501})
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+# How much slower than the median of its peers a stage must be before it counts as a
+# straggler. 3x is deliberately well clear of ordinary heterogeneity: the mesh is
+# *expected* to mix a laptop with a workstation, and rotating on a 1.5x spread would
+# thrash a healthy deployment. What we are hunting is the node that fell off a cliff.
+STRAGGLER_RATIO = _env_float("MESHPOOL_STRAGGLER_RATIO", 3.0)
+# Consecutive traversals that must agree before acting. Rotation costs a KV rebuild,
+# so a single GC pause must never buy one.
+STRAGGLER_STREAK = int(_env_float("MESHPOOL_STRAGGLER_STREAK", 4))
+# Hops a stage must have served before its EMA is trusted at all.
+STRAGGLER_MIN_SAMPLES = int(_env_float("MESHPOOL_STRAGGLER_MIN_SAMPLES", 3))
+# Floor between two rotations of the same stage, so a deployment cannot walk through
+# its entire spare list during one bad minute on the network.
+STRAGGLER_COOLDOWN_S = _env_float("MESHPOOL_STRAGGLER_COOLDOWN_S", 10.0)
 
 
 def spare_model_id(model_id: str, start: int, end: int) -> str:
@@ -129,6 +156,24 @@ class RemoteShard:
         self.failovers = 0
         self.dead: list[str] = []
         self.hydrations = 0
+        # -- straggler state -------------------------------------------------- #
+        # A straggler is not a failure: the node answers, correctly, just late. On
+        # consumer hardware that is the *normal* degradation (thermal throttling,
+        # someone launches a game, Wi-Fi drops to a slower rate), and in a pipeline a
+        # single slow stage caps the throughput of every other stage. So slowness has
+        # to be able to trigger the same rotation that death does -- which is what
+        # makes one mechanism cover both churn and stragglers.
+        #
+        # Cost is tracked as an EMA over *observed* hop durations. A median would be
+        # more robust to spikes, but rotation is already gated on a run of
+        # consecutive violations, so the spike-rejection lives there and this can stay
+        # O(1) with no history buffer per stage.
+        self.cost_ms: float = 0.0
+        self.last_ms: float = 0.0
+        self.samples = 0
+        self.slow_streak = 0
+        self.straggler_rotations = 0
+        self._last_rotate_at = 0.0
         # Sessions this stage has served, and those the *current* node has no cache
         # for. Tracked separately because a rotation invalidates every session at
         # once but hydration is paid lazily, per session, only if it is used again.
@@ -167,6 +212,34 @@ class RemoteShard:
         self._truncate_to.clear()
         self._needs_hydration = set(self._sessions)
         self._batch_supported = None
+        # Cost belongs to the node, not the stage: carrying the old node's EMA over
+        # would keep the replacement looking slow for its first several hops and could
+        # immediately rotate it away too.
+        self.cost_ms = 0.0
+        self.last_ms = 0.0
+        self.samples = 0
+        self.slow_streak = 0
+        self._last_rotate_at = time.monotonic()
+        return True
+
+    def observe_cost(self, ms: float) -> None:
+        """Record how long the current node took to serve one hop."""
+        self.last_ms = ms
+        self.cost_ms = ms if self.samples == 0 else 0.7 * self.cost_ms + 0.3 * ms
+        self.samples += 1
+
+    def rotate_for_slowness(self) -> bool:
+        """Retire the current node because it is slow, not because it is broken.
+
+        Returns False when there is no spare left, so a mesh with nowhere better to
+        go keeps serving from the slow node rather than failing the request. Slow is
+        strictly better than absent.
+        """
+        if self._active + 1 >= len(self.candidates):
+            return False
+        if not self._rotate():
+            return False
+        self.straggler_rotations += 1
         return True
 
     async def _ensure_hydrated(self, sessions: Sequence[Optional[str]],
@@ -256,7 +329,10 @@ class RemoteShard:
         while True:
             await self._ensure_hydrated([session], [pos_offset])
             try:
-                return await self._forward_once(data, is_tokens, pos_offset, session)
+                t0 = time.perf_counter()
+                out = await self._forward_once(data, is_tokens, pos_offset, session)
+                self.observe_cost((time.perf_counter() - t0) * 1000.0)
+                return out
             except Exception as exc:  # noqa: BLE001
                 if not self._is_node_failure(exc) or not self._rotate():
                     if self._is_node_failure(exc):
@@ -309,7 +385,15 @@ class RemoteShard:
             await self._ensure_hydrated([c.session for c in calls],
                                         [c.pos_offset for c in calls])
             try:
-                return await self._forward_batch_once(calls)
+                # Timed around the single hop only, and *after* hydration, so a
+                # rebuild -- which is a one-off cost of a rotation, not a property of
+                # the node -- is never charged to the node it landed on. Charging it
+                # would make every replacement look like a straggler on its first hop
+                # and could rotate a healthy node away immediately.
+                t0 = time.perf_counter()
+                out = await self._forward_batch_once(calls)
+                self.observe_cost((time.perf_counter() - t0) * 1000.0)
+                return out
             except Exception as exc:  # noqa: BLE001
                 if not self._is_node_failure(exc) or not self._rotate():
                     if self._is_node_failure(exc):
@@ -407,6 +491,85 @@ class RemotePipeline(Pipeline):
         # activation cache and the token journal), so the two have to be joined here.
         for idx, stage in enumerate(stages):
             stage.rehydrate = self._make_rehydrator(idx)
+
+    def check_stragglers(self) -> Optional[RemoteShard]:
+        """Retire the one stage that is holding the whole pipeline back, if any.
+
+        Three rules, each of which exists because the obvious version is wrong:
+
+        **Peer-relative, never absolute.** A stage is not slow because it takes 200 ms;
+        it is slow because it takes far longer than its *siblings on the same
+        traversal*. An absolute threshold would condemn every stage on a slow machine
+        and every stage of a big model, and would need retuning per deployment.
+
+        **Only the maximum hop.** In a pipeline, ``t_token`` is bounded by the slowest
+        stage, so rotating the second-slowest buys nothing and costs a hydration.
+        Exactly one candidate is considered per check.
+
+        **Sustained, and rate-limited.** Rotation is not free: the replacement starts
+        with an empty KV cache and pays a rebuild. A GC pause, a scheduler hiccup or a
+        one-off retry must not trigger one, so a stage must violate the ratio on
+        ``STRAGGLER_STREAK`` consecutive traversals and no stage may rotate more than
+        once per ``STRAGGLER_COOLDOWN_S``.
+
+        Returns the stage that was rotated, or None.
+        """
+        ready = [s for s in self.stages if s.samples >= STRAGGLER_MIN_SAMPLES]
+        if len(ready) < 2:
+            # With one measured stage there is no peer to be relative to. Guessing
+            # here is how an absolute threshold sneaks back in.
+            return None
+
+        worst = max(ready, key=lambda s: s.cost_ms)
+        others = sorted(s.cost_ms for s in ready if s is not worst)
+        mid = len(others) // 2
+        peer = (others[mid] if len(others) % 2
+                else (others[mid - 1] + others[mid]) / 2.0)
+        for s in ready:
+            if s is not worst:
+                s.slow_streak = 0
+
+        # Both the smoothed cost and the most recent hop must be over the line.
+        #
+        # The EMA alone is not enough in either direction. It rises slowly, which is
+        # what makes it reject spikes -- but it also *falls* slowly, so a node that has
+        # already recovered keeps looking slow for several more traversals and would
+        # be evicted for its history. Requiring the latest sample as well means
+        # recovery is recognised on the very next hop, while a single spike still
+        # cannot move the EMA far enough to matter.
+        if (peer <= 0 or worst.cost_ms < peer * STRAGGLER_RATIO
+                or worst.last_ms < peer * STRAGGLER_RATIO):
+            worst.slow_streak = 0
+            return None
+
+        worst.slow_streak += 1
+        if worst.slow_streak < STRAGGLER_STREAK:
+            return None
+        if worst.spares_remaining < 1:
+            # Nothing better to move to. Keep serving from the slow node -- slow is
+            # strictly better than absent -- but stop counting so the log does not
+            # fill with a decision that can never be acted on.
+            worst.slow_streak = 0
+            return None
+        if time.monotonic() - worst._last_rotate_at < STRAGGLER_COOLDOWN_S:
+            return None
+
+        # Snapshot the evidence before rotating: rotate_for_slowness() resets the cost
+        # state, so reading it afterwards logs the replacement's empty counters and
+        # tells an operator the stage was retired for taking 0.0 ms.
+        was = worst.node_id
+        was_cost, was_last = worst.cost_ms, worst.last_ms
+        if not worst.rotate_for_slowness():
+            return None
+        log.warning("stage rotated away from a straggler",
+                    layers=f"{worst.start}-{worst.end}", retired=was,
+                    now=worst.node_id, cost_ms=round(was_cost, 1),
+                    last_ms=round(was_last, 1), peer_ms=round(peer, 1))
+        return worst
+
+    @property
+    def straggler_rotations(self) -> int:
+        return sum(s.straggler_rotations for s in self.stages)
 
     def _make_rehydrator(self, idx: int) -> Callable[[str, int], Awaitable[None]]:
         async def _rehydrate(session: str, upto_pos: int) -> None:

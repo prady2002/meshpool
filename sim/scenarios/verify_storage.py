@@ -162,7 +162,7 @@ def main() -> int:
         def _cli(*args):
             return subprocess.run(
                 [sys.executable, "-m", "meshpool.cli.main", "storage", *args],
-                cwd=str(repo_root), env=cli_env, capture_output=True, text=True, timeout=60)
+                cwd=str(repo_root), env=cli_env, capture_output=True, text=True, errors="replace", timeout=60)
 
         up = _cli("put", str(src), "--name", "cli.bin")
         assert up.returncode == 0, f"`storage put` failed: {up.stderr or up.stdout}"

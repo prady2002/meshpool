@@ -413,7 +413,7 @@ def run_nonvacuity_check() -> None:
         env["MESHPOOL_STREAM_TTFT_MUTATION"] = "1"
         result = subprocess.run(
             [sys.executable, str(Path(__file__).resolve())],
-            cwd=str(REPO_ROOT), capture_output=True, text=True,
+            cwd=str(REPO_ROOT), capture_output=True, text=True, errors="replace",
             timeout=600, env=env,
         )
     finally:

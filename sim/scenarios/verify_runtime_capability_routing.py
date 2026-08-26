@@ -130,7 +130,7 @@ def main() -> int:  # noqa: C901
     print("== building meshd ==")
     exe = data_root / ("meshd.exe" if os.name == "nt" else "meshd")
     build = subprocess.run([go, "build", "-o", str(exe), "./cmd/meshd"],
-                           cwd=str(GO_DIR), capture_output=True, text=True)
+                           cwd=str(GO_DIR), capture_output=True, text=True, errors="replace")
     if build.returncode != 0:
         print("FAILED: meshd did not build")
         print(build.stderr[-2000:])

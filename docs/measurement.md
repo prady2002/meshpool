@@ -45,7 +45,7 @@ The fault injector exists solely to emulate a **dishonest node** in the Tier-2 t
 |-------|-------------|
 | `corrupt_results` | Deterministically mutates the work-unit result (bool flipped, int/float +1, string appended "X", list head-dropped, dict values mutated) |
 | `drop_work` | (API surface; not yet wired up) Silently ignore a work unit |
-| `stall_seconds` | (API surface; not yet wired up) Delay response |
+| `stall_seconds` | Delays every inference shard hop by a fixed amount, turning a healthy node into a straggler. Settable at startup via `MESHPOOL_STALL_MS`, or at runtime via `POST /fault/stall` on the agent (403 unless fault injection is opted in). Drives `verify_straggler_tolerance.py` |
 | `lie_capability` | (API surface; not yet wired up) Advertise false hardware specs |
 
 ### How to enable in tests / the sim harness

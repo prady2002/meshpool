@@ -136,6 +136,7 @@ class Harness:
                  data_dir: Optional[str] = None, scale: str = "home",
                  tunnel: bool = False, sandbox: bool = False,
                  liar_indices: Optional[set] = None,
+                 stall_ms: Optional[dict] = None,
                  topology: Optional["Topology"] = None,
                  fresh: bool = True) -> None:
         self.n_agents = n_agents
@@ -151,6 +152,10 @@ class Harness:
         # indices as dishonest so the coordinator's spot-check must catch them.
         self.sandbox = sandbox
         self.liar_indices = set(liar_indices or ())
+        # agent index -> milliseconds of delay per shard hop. Restart-safe: an agent
+        # restarted through start_agent picks the delay up again, and set_stall()
+        # exists so a gate can make a node slow *after* it is already serving.
+        self.stall_ms: dict = dict(stall_ms or {})
         # Optional network topology for emulated WAN conditions.  When supplied,
         # callers can retrieve a NetEmTransport from netem_transport().
         self.topology: Optional["Topology"] = topology
@@ -243,6 +248,12 @@ class Harness:
             # Test-only: this agent returns wrong results; the Tier-2 spot-check must
             # catch it, reject its work, and keep it from being paid.
             env["MESHPOOL_LIE"] = "1"
+        if idx in self.stall_ms:
+            # Test-only: this agent stays perfectly correct and healthy but answers
+            # slowly, which is the shape of thermal throttling or a busy machine.
+            # Killing a node cannot emulate it, and a straggler is the failure that
+            # actually caps a pipeline's throughput.
+            env["MESHPOOL_STALL_MS"] = str(self.stall_ms[idx])
         proc = subprocess.Popen(
             [sys.executable, "-m", "meshpool.agent.daemon"], env=env, cwd=str(REPO_ROOT))
         if idx < len(self.agent_procs):
@@ -257,6 +268,21 @@ class Harness:
         for i in range(self.n_agents):
             self.start_agent(i)
         self.wait_nodes_online(self.n_agents)
+
+    def set_stall(self, idx: int, ms: Optional[float]) -> None:
+        """Make agent ``idx`` answer slowly, or clear the delay with ``None``.
+
+        Raises if the agent refuses, because a scenario that believes it created a
+        straggler and did not would report a passing straggler test with no straggler
+        in it -- the most flattering possible failure.
+        """
+        url = f"http://{self.host}:{self.agent_ports[idx]}/fault/stall"
+        r = httpx.post(url, json={"ms": ms}, timeout=10)
+        r.raise_for_status()
+        if ms is None:
+            self.stall_ms.pop(idx, None)
+        else:
+            self.stall_ms[idx] = ms
 
     def stop_agent(self, idx: int, fast: bool = False) -> None:
         """Stop agent ``idx``. ``fast=True`` returns in microseconds (see _kill_now)."""

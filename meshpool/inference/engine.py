@@ -158,7 +158,10 @@ class InferenceManager:
         return {
             "failovers": past_f + pipe.failovers,
             "hydrations": past_h + pipe.hydrations,
+            "straggler_rotations": getattr(pipe, "straggler_rotations", 0),
             "serving_nodes": [self._node_name(s.node_id) for s in pipe.stages],
+            "stage_cost_ms": [round(getattr(s, "cost_ms", 0.0), 1)
+                              for s in pipe.stages],
             "retired_nodes": dead,
         }
 

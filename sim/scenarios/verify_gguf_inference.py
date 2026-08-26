@@ -72,7 +72,7 @@ def _run_stage(worker_py: str, path: str, span, is_first, is_last, x) -> dict:
         input=json.dumps({"path": path, "start": span[0], "end": span[1],
                           "is_first": is_first, "is_last": is_last,
                           "x": np.asarray(x).tolist()}),
-        capture_output=True, text=True, timeout=180)
+        capture_output=True, text=True, errors="replace", timeout=180)
     if p.returncode != 0:
         raise RuntimeError(f"stage [{span[0]}:{span[1]}] failed: {p.stderr[-600:]}")
     return json.loads(p.stdout)

@@ -117,7 +117,7 @@ def _detect_cpu_model() -> Optional[str]:
                 ["powershell", "-NoProfile", "-Command",
                  "(Get-CimInstance Win32_Processor | Select-Object -First 1 "
                  "-ExpandProperty Name)"],
-                capture_output=True, text=True, timeout=4,
+                capture_output=True, text=True, errors="replace", timeout=4,
             )
             if out.returncode == 0 and out.stdout.strip():
                 return out.stdout.strip()
@@ -129,13 +129,13 @@ def _detect_cpu_model() -> Optional[str]:
                     return parsed
             except OSError:
                 pass
-            out = subprocess.run(["lscpu"], capture_output=True, text=True, timeout=4)
+            out = subprocess.run(["lscpu"], capture_output=True, text=True, errors="replace", timeout=4)
             if out.returncode == 0:
                 return _parse_lscpu_model(out.stdout)
         if sysname == "Darwin":
             out = subprocess.run(
                 ["sysctl", "-n", "machdep.cpu.brand_string"],
-                capture_output=True, text=True, timeout=4,
+                capture_output=True, text=True, errors="replace", timeout=4,
             )
             if out.returncode == 0 and out.stdout.strip():
                 return out.stdout.strip()
@@ -325,7 +325,7 @@ def _detect_thermal_state() -> str:
                 ["powershell", "-NoProfile", "-Command",
                  "Get-CimInstance -Namespace root/wmi MSAcpi_ThermalZoneTemperature | "
                  "Select-Object -ExpandProperty CurrentTemperature"],
-                capture_output=True, text=True, timeout=4,
+                capture_output=True, text=True, errors="replace", timeout=4,
             )
             if out.returncode == 0:
                 vals = []
@@ -364,7 +364,7 @@ def _detect_battery() -> tuple[Optional[bool], Optional[float]]:
                 ["powershell", "-NoProfile", "-Command",
                  "Get-CimInstance Win32_Battery | "
                  "Select-Object BatteryStatus,EstimatedChargeRemaining | ConvertTo-Json"],
-                capture_output=True, text=True, timeout=4,
+                capture_output=True, text=True, errors="replace", timeout=4,
             )
             if out.returncode == 0 and out.stdout.strip():
                 data = json.loads(out.stdout)
@@ -390,7 +390,7 @@ def _detect_battery() -> tuple[Optional[bool], Optional[float]]:
             pass
     elif sysname == "Darwin":
         try:
-            out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=4)
+            out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, errors="replace", timeout=4)
             if out.returncode == 0:
                 text = out.stdout
                 pct_match = re.search(r"(\d+)%", text)
@@ -424,7 +424,7 @@ def _detect_gpu() -> tuple[bool, int, list[str]]:
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=4,
+            capture_output=True, text=True, errors="replace", timeout=4,
         )
         if out.returncode == 0 and out.stdout.strip():
             has_gpu, vram = _parse_nvidia_smi_vram(out.stdout)
@@ -436,7 +436,7 @@ def _detect_gpu() -> tuple[bool, int, list[str]]:
     try:
         out = subprocess.run(
             ["rocm-smi", "--showmeminfo", "vram", "--csv"],
-            capture_output=True, text=True, timeout=4,
+            capture_output=True, text=True, errors="replace", timeout=4,
         )
         if out.returncode == 0:
             has_gpu, vram = _parse_rocm_smi_vram(out.stdout)
@@ -450,7 +450,7 @@ def _detect_gpu() -> tuple[bool, int, list[str]]:
         try:
             out = subprocess.run(
                 ["system_profiler", "SPDisplaysDataType", "-json"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, errors="replace", timeout=5,
             )
             if out.returncode == 0:
                 has_gpu, vram, names = _parse_macos_displays_json(out.stdout)
@@ -466,7 +466,7 @@ def _detect_gpu() -> tuple[bool, int, list[str]]:
                 ["powershell", "-NoProfile", "-Command",
                  "Get-CimInstance Win32_VideoController | "
                  "Select-Object Name,AdapterRAM | ConvertTo-Json"],
-                capture_output=True, text=True, timeout=6,
+                capture_output=True, text=True, errors="replace", timeout=6,
             )
             if out.returncode == 0 and out.stdout.strip():
                 has_gpu, vram, names = _parse_windows_video_json(out.stdout)
@@ -483,7 +483,7 @@ def _nvidia_gpu_names() -> list[str]:
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=4,
+            capture_output=True, text=True, errors="replace", timeout=4,
         )
         if out.returncode == 0:
             return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]

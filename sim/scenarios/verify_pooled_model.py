@@ -161,7 +161,7 @@ def main() -> int:
                 [sys.executable, "-m", "meshpool.cli.main", "models", "upload",
                  ckpt_path, "--model", "nano-gpt"],
                 cwd=str(Path(__file__).resolve().parents[2]),
-                env=cli_env, capture_output=True, text=True, timeout=180)
+                env=cli_env, capture_output=True, text=True, errors="replace", timeout=180)
         finally:
             try:
                 os.unlink(ckpt_path)

@@ -69,7 +69,7 @@ def main() -> int:
         proc = subprocess.run(
             [sys.executable, "-m", "meshpool.launcher", "self-test",
              "--data-dir", str(stage / "state")],
-            cwd=str(extract), env=env, capture_output=True, text=True, timeout=180)
+            cwd=str(extract), env=env, capture_output=True, text=True, errors="replace", timeout=180)
         out = (proc.stdout or "") + (proc.stderr or "")
         # surface a few key lines for the log without dumping everything
         for line in (proc.stdout or "").splitlines():

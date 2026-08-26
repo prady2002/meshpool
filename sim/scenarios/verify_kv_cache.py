@@ -149,7 +149,7 @@ def main() -> int:  # noqa: C901
                 [sys.executable, str(worker_py), str(ROOT), path, str(start), str(end),
                  "1" if first else "0", "1" if last else "0"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True))
+                text=True, errors="replace"))
         print(f"  checkpoint layers={info.config.n_layer}, worker spans=[0:2), [2:4)")
         print("  PASS: workers are separate processes holding only their stage ranges")
 

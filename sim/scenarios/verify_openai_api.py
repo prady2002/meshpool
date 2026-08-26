@@ -319,7 +319,7 @@ def run_nonvacuity_check() -> None:
         env["MESHPOOL_OAI_NONVACUITY"] = "1"
         result = subprocess.run(
             [sys.executable, str(Path(__file__).resolve())],
-            capture_output=True, text=True, cwd=str(REPO_ROOT), env=env,
+            capture_output=True, text=True, errors="replace", cwd=str(REPO_ROOT), env=env,
             timeout=360,
         )
     finally:

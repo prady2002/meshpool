@@ -61,7 +61,7 @@ def _build_probe(workdir: Path) -> Path | None:
     out = workdir / ("wasmfn-probe.exe" if sys.platform == "win32" else "wasmfn-probe")
     proc = subprocess.run(
         ["go", "build", "-o", str(out), "./cmd/wasmfn-probe"],
-        cwd=str(ROOT / "agent-go"), capture_output=True, text=True, timeout=600,
+        cwd=str(ROOT / "agent-go"), capture_output=True, text=True, errors="replace", timeout=600,
     )
     if proc.returncode != 0:
         print(f"  FAIL: go build failed:\n{proc.stdout}\n{proc.stderr}")
@@ -74,7 +74,7 @@ def _run_go(probe: Path, module_path: Path, payload, timeout_s: float = 10.0) ->
         [str(probe), "--module", str(module_path),
          "--payload", json.dumps(payload),
          "--timeout", f"{timeout_s}s"],
-        capture_output=True, text=True, timeout=timeout_s + 60,
+        capture_output=True, text=True, errors="replace", timeout=timeout_s + 60,
     )
     line = (proc.stdout or "").strip().splitlines()
     if not line:

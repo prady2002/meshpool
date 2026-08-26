@@ -24,7 +24,7 @@ DEAD = "http://127.0.0.1:9999"
 def run_cli(args: list[str], env: dict) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "meshpool.cli.main", *args],
-        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=120,
+        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, errors="replace", timeout=120,
     )
 
 
