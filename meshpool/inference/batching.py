@@ -48,9 +48,12 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from ..common.logging import get_logger
 from .pipeline import (GREEDY_EPS, Pipeline, PipelineStats, StageCall,
                        dist_from_logits, sample_from_dist)
 from .spd import DraftModel, SpecStats, _residual
+
+log = get_logger("batching")
 
 
 @dataclass
@@ -71,6 +74,12 @@ class BatchRequest:
     # B tenants each verifying K+1 candidates ride ONE traversal between them.
     draft_factory: Optional[Callable[[], DraftModel]] = None
     draft_k: int = 4
+    # Called with each newly produced token id, as soon as it exists, so a caller can
+    # stream. Real streaming has to originate *here*: the tokens become available one
+    # traversal at a time, and anything that waits for the whole answer before
+    # chunking it is not streaming -- it is a progress bar drawn after the fact, with
+    # a time-to-first-token equal to the total generation time.
+    on_tokens: Optional[Callable[[list[int]], None]] = None
 
     def __post_init__(self) -> None:
         if not self.prompt:
@@ -131,6 +140,8 @@ class BatcherStats:
     steps: int = 0
     admitted: int = 0
     completed: int = 0
+    abandoned: int = 0
+    rejected: int = 0
     rows_processed: int = 0
     max_batch_seen: int = 0
     batch_size_sum: int = 0
@@ -144,6 +155,8 @@ class BatcherStats:
             "steps": self.steps,
             "admitted": self.admitted,
             "completed": self.completed,
+            "abandoned": self.abandoned,
+            "rejected": self.rejected,
             "rows_processed": self.rows_processed,
             "max_batch_seen": self.max_batch_seen,
             "mean_batch": round(self.mean_batch, 3),
@@ -244,16 +257,32 @@ class ContinuousBatcher:
                 await task
             except asyncio.CancelledError:  # pragma: no cover - shutdown race
                 pass
+            except Exception:  # noqa: BLE001
+                # _loop already logged this and handed it to every waiting caller.
+                # Re-raising from aclose() would replace a caller's real error with
+                # the same error thrown from a cleanup path.
+                pass
 
     @property
     def in_flight(self) -> int:
         return len(self._active) + len(self._queue)
+
+    @property
+    def alive(self) -> bool:
+        """True while the scheduler loop can still resolve a request."""
+        return self._task is not None and not self._task.done()
 
     # -- submission --------------------------------------------------------- #
     def submit(self, req: BatchRequest) -> "asyncio.Future[BatchResult]":
         """Queue a request. The returned future resolves with its :class:`BatchResult`."""
         if self._stopping:
             raise RuntimeError("batcher is shutting down")
+        task = self._task
+        if task is not None and task.done():
+            # Nothing will ever drain this queue again. Refusing is strictly better
+            # than accepting a request that would wait forever.
+            exc = task.exception() if not task.cancelled() else None
+            raise RuntimeError(f"batcher loop is not running: {exc!r}")
         loop = asyncio.get_event_loop()
         fut: "asyncio.Future[BatchResult]" = loop.create_future()
         self._seq_counter += 1
@@ -270,6 +299,20 @@ class ContinuousBatcher:
 
     # -- scheduler ---------------------------------------------------------- #
     async def _loop(self) -> None:
+        try:
+            await self._run_loop()
+        except BaseException as exc:  # noqa: BLE001
+            # The loop is the only thing that ever resolves a caller's future, so if
+            # it dies every in-flight and queued request waits forever -- no error, no
+            # timeout, just permanent silence on a shared deployment. Anything that
+            # escapes the per-step handler must therefore take the whole batcher down
+            # loudly and hand the exception to everyone who was waiting.
+            log.exception("batcher loop terminated", error=str(exc))
+            self._fail_active(exc)
+            self._fail_queued(exc)
+            raise
+
+    async def _run_loop(self) -> None:
         while True:
             self._admit()
             if not self._active:
@@ -313,8 +356,17 @@ class ContinuousBatcher:
                 continue
             self.pipe.drop_session(seq.session)
             if seq.req.draft_factory is not None:
-                seq.draft = seq.req.draft_factory()
-                seq.draft.reset()
+                # A caller-supplied factory is arbitrary code. Letting it raise here
+                # would escape into the scheduler and strand every other tenant, so
+                # the blast radius is contained to the request that supplied it.
+                try:
+                    seq.draft = seq.req.draft_factory()
+                    seq.draft.reset()
+                except Exception as exc:  # noqa: BLE001
+                    if not seq.future.done():
+                        seq.future.set_exception(exc)
+                    self.stats.rejected += 1
+                    continue
             seq.started_at = time.perf_counter()
             self._active.append(seq)
             self.stats.admitted += 1
@@ -324,8 +376,12 @@ class ContinuousBatcher:
         calls: list[StageCall] = []
         owners: list[_Seq] = []
         finished: list[_Seq] = []
+        abandoned: list[_Seq] = []
 
         for seq in self._active:
+            if seq.future.cancelled():
+                abandoned.append(seq)
+                continue
             call = self._plan(seq)
             if call is None:
                 finished.append(seq)
@@ -333,6 +389,8 @@ class ContinuousBatcher:
             calls.append(call)
             owners.append(seq)
 
+        for seq in abandoned:
+            self._abandon(seq)
         for seq in finished:
             self._retire(seq)
 
@@ -401,6 +459,7 @@ class ContinuousBatcher:
         p = dist_from_logits(seq.logits[-1], seq.req.temperature, seq.req.top_k)
         nxt = sample_from_dist(p, seq.rng)
         seq.out.append(nxt)
+        self._emit(seq, [nxt])
         if seq.ttft_at == 0.0:
             seq.ttft_at = time.perf_counter()
         if len(seq.out) >= seq.req.max_new_tokens:
@@ -525,6 +584,7 @@ class ContinuousBatcher:
 
         new_tokens = (seq.drafts[:accepted] + [emitted])[:req.max_new_tokens - len(seq.out)]
         seq.out.extend(new_tokens)
+        self._emit(seq, new_tokens)
         seq.spec.emitted += len(new_tokens)
         if seq.ttft_at == 0.0 and new_tokens:
             seq.ttft_at = time.perf_counter()
@@ -538,6 +598,37 @@ class ContinuousBatcher:
         seq.cached = valid
         seq.ctx = seq.ctx[:base] + new_tokens
         seq.pending = seq.ctx[seq.cached:]
+
+    def _emit(self, seq: _Seq, tokens: list[int]) -> None:
+        """Hand freshly produced tokens to a streaming caller, if there is one.
+
+        Deliberately swallowing: this batcher is shared by every tenant of the
+        deployment, so one consumer whose callback raises -- a client that hung up
+        mid-stream is the ordinary case -- must not be able to take down the loop
+        that is serving everyone else. The tokens are still recorded in ``seq.out``,
+        so the final result is unaffected either way.
+        """
+        cb = seq.req.on_tokens
+        if cb is None or not tokens:
+            return
+        try:
+            cb(list(tokens))
+        except Exception:  # noqa: BLE001
+            seq.req.on_tokens = None
+
+    def _abandon(self, seq: _Seq) -> None:
+        """Drop a sequence whose caller gave up waiting for it.
+
+        Streaming makes this the common case rather than an edge case: a browser tab
+        closing mid-answer cancels the awaiting task, and without this the sequence
+        would keep riding every traversal until it hit ``max_new_tokens``, occupying
+        a batch slot and spending wide-area round trips on output nobody will read.
+        ``_admit`` already skips cancelled requests still in the queue; this is the
+        same check for ones already running.
+        """
+        self._active.remove(seq)
+        self.pipe.drop_session(seq.session)
+        self.stats.abandoned += 1
 
     def _retire(self, seq: _Seq) -> None:
         now = time.perf_counter()
@@ -562,6 +653,12 @@ class ContinuousBatcher:
         for seq in list(self._active):
             self._active.remove(seq)
             self.pipe.drop_session(seq.session)
+            if not seq.future.done():
+                seq.future.set_exception(exc)
+
+    def _fail_queued(self, exc: BaseException) -> None:
+        for seq in list(self._queue):
+            self._queue.remove(seq)
             if not seq.future.done():
                 seq.future.set_exception(exc)
 

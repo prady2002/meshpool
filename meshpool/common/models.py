@@ -404,6 +404,20 @@ class ModelDeployment(BaseModel):
     weight_groups: Optional[int] = None
     status: str = "pending"
     tokens_per_sec: Optional[float] = None
+    # Warm standby nodes per stage: primary node id -> node ids holding the SAME
+    # layer range, loaded and resident but idle. In a pipeline one dead stage stalls
+    # everything behind it, and re-partitioning the whole deployment takes seconds
+    # that an in-flight generation does not have. A spare turns that into a rotation
+    # plus an O(T) single-stage replay. Empty when the pool has no capacity to spare,
+    # which is the honest common case on a small mesh.
+    spares: dict[str, list[str]] = Field(default_factory=dict)
+    # Cumulative failover history, folded in when a batcher is retired so it is not
+    # lost the moment the control plane re-partitions. A user asking "did my
+    # deployment survive anything today?" is asking about the deployment's whole
+    # life, not about whichever pipeline object happens to be resident right now.
+    failovers_total: int = 0
+    hydrations_total: int = 0
+    retired_nodes: list[str] = Field(default_factory=list)
     created_ms: int = Field(default_factory=now_ms)
 
 

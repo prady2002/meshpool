@@ -15,7 +15,6 @@ Usage:  prompt_tokens + completion_tokens + total_tokens reported in every respo
 from __future__ import annotations
 
 import json
-import asyncio
 import time
 from typing import Callable, Optional
 
@@ -244,18 +243,6 @@ def _sse_chunk(comp_id: str, model: str, delta: dict,
     return f"data: {json.dumps(chunk)}\n\n"
 
 
-async def _stream_text_chunks(text: str):
-    """Yield small text deltas so OpenAI SDK consumers observe incremental output."""
-    if not text:
-        return
-    start = 0
-    for idx, ch in enumerate(text, start=1):
-        if ch.isspace() or idx - start >= 8 or idx == len(text):
-            yield text[start:idx]
-            start = idx
-            await asyncio.sleep(0)
-
-
 # ---------------------------------------------------------------------------
 # Route registration
 # ---------------------------------------------------------------------------
@@ -339,17 +326,70 @@ def register_openai_routes(app, cp_factory: Callable) -> None:  # noqa: C901
         # MeshPool's built-in tokenizer is character-based (1 char = 1 token).
         # Reported honestly; this is not GPT-4 tokenisation.
         prompt_tokens = len(prompt)
+        comp_id = f"chatcmpl-{now_ms()}"
+        gen_kw = dict(
+            temperature=req.temperature,
+            seed=req.seed,
+            speculative=req.speculative,
+            draft_k=req.draft_k,
+            draft_layers=req.draft_layers,
+            chunked_prefill=req.chunked_prefill,
+        )
+
+        if req.stream:
+            agen = cp.inference.chat_stream(model_id, prompt, req.max_tokens, **gen_kw)
+            # Pull the first item before committing to a 200. Generation failures
+            # surface on the very first step (the deployment is resolved before any
+            # token is produced), and an OpenAI client can act on a 404/503 body but
+            # not on an exception buried inside an already-started event stream.
+            try:
+                first = await agen.__anext__()
+            except StopAsyncIteration:
+                first = None
+            except KeyError:
+                await agen.aclose()
+                return openai_error("model deployment not found",
+                                    error_type="model_not_found",
+                                    code="model_not_found", status=404)
+            except RuntimeError as exc:
+                await agen.aclose()
+                return openai_error(str(exc), error_type="server_error", status=503)
+
+            model_name = deployed[0].model
+
+            async def _stream():
+                yield _sse_chunk(comp_id, model_name, {"role": "assistant"})
+                finish_reason = "stop"
+                item = first
+                try:
+                    while item is not None:
+                        if "delta" in item:
+                            yield _sse_chunk(comp_id, model_name,
+                                             {"content": item["delta"]})
+                        elif item.get("done"):
+                            out = item["result"]
+                            finish_reason = _openai_finish_reason(
+                                out, out["tokens"], req.max_tokens)
+                        try:
+                            item = await agen.__anext__()
+                        except StopAsyncIteration:
+                            item = None
+                except Exception as exc:  # noqa: BLE001
+                    # The status line is long gone. Report the truncation in-band so
+                    # the client sees a cut-off answer as a cut-off answer.
+                    yield _sse_chunk(comp_id, model_name,
+                                     {"content": ""}, finish_reason="length")
+                    yield ("data: " + json.dumps(
+                        {"error": {"message": str(exc), "type": "server_error"}})
+                        + "\n\n")
+                    yield "data: [DONE]\n\n"
+                    return
+                yield _sse_chunk(comp_id, model_name, {}, finish_reason=finish_reason)
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(_stream(), media_type="text/event-stream")
 
         try:
-            out = await cp.inference.chat(
-                model_id, prompt, req.max_tokens,
-                temperature=req.temperature,
-                seed=req.seed,
-                speculative=req.speculative,
-                draft_k=req.draft_k,
-                draft_layers=req.draft_layers,
-                chunked_prefill=req.chunked_prefill,
-            )
+            out = await cp.inference.chat(model_id, prompt, req.max_tokens, **gen_kw)
         except KeyError:
             return openai_error("model deployment not found",
                                 error_type="model_not_found",
@@ -359,19 +399,7 @@ def register_openai_routes(app, cp_factory: Callable) -> None:  # noqa: C901
 
         completion_tokens: int = out["tokens"]
         total_tokens = prompt_tokens + completion_tokens
-        comp_id = f"chatcmpl-{now_ms()}"
         finish_reason = _openai_finish_reason(out, completion_tokens, req.max_tokens)
-
-        if req.stream:
-            async def _stream():
-                # Role delta
-                yield _sse_chunk(comp_id, out["model"], {"role": "assistant"})
-                async for text_chunk in _stream_text_chunks(out["text"]):
-                    yield _sse_chunk(comp_id, out["model"], {"content": text_chunk})
-                # Terminal chunk
-                yield _sse_chunk(comp_id, out["model"], {}, finish_reason=finish_reason)
-                yield "data: [DONE]\n\n"
-            return StreamingResponse(_stream(), media_type="text/event-stream")
 
         return JSONResponse({
             "id": comp_id,
@@ -420,6 +448,76 @@ def register_openai_routes(app, cp_factory: Callable) -> None:  # noqa: C901
             )
         model_id = deployed[0].id
         prompt_tokens = len(req.prompt)
+        comp_id = f"cmpl-{now_ms()}"
+
+        if req.stream:
+            agen = cp.inference.chat_stream(
+                model_id, req.prompt, req.max_tokens,
+                temperature=req.temperature, seed=req.seed)
+            try:
+                first = await agen.__anext__()
+            except StopAsyncIteration:
+                first = None
+            except KeyError:
+                await agen.aclose()
+                return openai_error("model deployment not found",
+                                    error_type="model_not_found",
+                                    code="model_not_found", status=404)
+            except RuntimeError as exc:
+                await agen.aclose()
+                return openai_error(str(exc), error_type="server_error", status=503)
+
+            model_name = deployed[0].model
+
+            def _text_chunk(text: str, finish: Optional[str] = None,
+                            usage: Optional[dict] = None) -> str:
+                body = {
+                    "id": comp_id,
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [{
+                        "text": text,
+                        "index": 0,
+                        "logprobs": None,
+                        "finish_reason": finish,
+                    }],
+                }
+                if usage is not None:
+                    body["usage"] = usage
+                return f"data: {json.dumps(body)}\n\n"
+
+            async def _stream():
+                finish_reason = "stop"
+                completion_tokens = 0
+                item = first
+                try:
+                    while item is not None:
+                        if "delta" in item:
+                            yield _text_chunk(item["delta"])
+                        elif item.get("done"):
+                            out = item["result"]
+                            completion_tokens = out["tokens"]
+                            finish_reason = _openai_finish_reason(
+                                out, completion_tokens, req.max_tokens)
+                        try:
+                            item = await agen.__anext__()
+                        except StopAsyncIteration:
+                            item = None
+                except Exception as exc:  # noqa: BLE001
+                    yield _text_chunk("", finish="length")
+                    yield ("data: " + json.dumps(
+                        {"error": {"message": str(exc), "type": "server_error"}})
+                        + "\n\n")
+                    yield "data: [DONE]\n\n"
+                    return
+                yield _text_chunk("", finish=finish_reason, usage={
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                })
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(_stream(), media_type="text/event-stream")
 
         try:
             out = await cp.inference.chat(
@@ -436,45 +534,7 @@ def register_openai_routes(app, cp_factory: Callable) -> None:  # noqa: C901
 
         completion_tokens = out["tokens"]
         total_tokens = prompt_tokens + completion_tokens
-        comp_id = f"cmpl-{now_ms()}"
         finish_reason = _openai_finish_reason(out, completion_tokens, req.max_tokens)
-
-        if req.stream:
-            async def _stream():
-                async for text_chunk in _stream_text_chunks(out["text"]):
-                    chunk = {
-                        "id": comp_id,
-                        "object": "text_completion",
-                        "created": int(time.time()),
-                        "model": out["model"],
-                        "choices": [{
-                            "text": text_chunk,
-                            "index": 0,
-                            "logprobs": None,
-                            "finish_reason": None,
-                        }],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                terminal = {
-                    "id": comp_id,
-                    "object": "text_completion",
-                    "created": int(time.time()),
-                    "model": out["model"],
-                    "choices": [{
-                        "text": "",
-                        "index": 0,
-                        "logprobs": None,
-                        "finish_reason": finish_reason,
-                    }],
-                    "usage": {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens,
-                    },
-                }
-                yield f"data: {json.dumps(terminal)}\n\n"
-                yield "data: [DONE]\n\n"
-            return StreamingResponse(_stream(), media_type="text/event-stream")
 
         return JSONResponse({
             "id": comp_id,

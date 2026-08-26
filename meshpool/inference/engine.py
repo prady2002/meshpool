@@ -26,7 +26,7 @@ import base64
 import json
 import os
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -37,7 +37,7 @@ from . import model as M
 from .adapters import BACKENDS, DEFAULT_BACKEND, get_backend
 from .batching import BatchRequest, ContinuousBatcher
 from .pipeline import generate_baseline
-from .remote import RemotePipeline, build_remote_stages
+from .remote import RemotePipeline, build_remote_stages, spare_model_id
 from .spd import SelfDraft, speculative_generate
 
 log = get_logger("inference")
@@ -108,12 +108,58 @@ class InferenceManager:
             "n_layers": dep.n_layers,
             "replicas": len(dep.partition),
             "tokens_per_sec": dep.tokens_per_sec,
+            # Honest redundancy reporting: how many stages have a warm standby.
+            # A user is entitled to know whether their deployment survives a node
+            # death mid-generation or merely survives it between generations.
+            "protected_stages": len(getattr(dep, "spares", {}) or {}),
+            "spares": {
+                self._node_name(k): [self._node_name(s) for s in v]
+                for k, v in (getattr(dep, "spares", {}) or {}).items()
+            },
             "stages": [
                 {"node_id": a.node_id, "node_name": self._node_name(a.node_id),
                  "first": a.start_layer, "last": a.end_layer,
                  "is_first": a.is_first, "is_last": a.is_last}
                 for a in sorted(dep.partition, key=lambda a: a.start_layer)
             ],
+            **self._live_routing(model_id),
+        }
+
+    def _live_routing(self, model_id: str) -> dict:
+        """Where traffic is actually going right now, and what it cost to get there.
+
+        ``stages`` above is the *plan*. After a failover the plan and the reality
+        diverge: the deployment still names the node it was placed on, while the
+        pipeline is talking to a spare. Reporting only the plan would make a
+        recovered deployment look untouched, which is exactly the information a user
+        watching a node die most wants to see -- and the data the Mesh Map needs to
+        animate the reroute.
+
+        Counts are ``persisted + live`` so that a re-partition, which retires the
+        pipeline these counters live on, does not reset the history to zero.
+        """
+        dep = self.store.get_model(model_id)
+        past_f = getattr(dep, "failovers_total", 0) if dep else 0
+        past_h = getattr(dep, "hydrations_total", 0) if dep else 0
+        past_dead = list(getattr(dep, "retired_nodes", []) or []) if dep else []
+        live = self._batchers.get(model_id)
+        if live is None:
+            if not (past_f or past_h or past_dead):
+                return {}
+            return {"failovers": past_f, "hydrations": past_h,
+                    "serving_nodes": [], "retired_nodes": past_dead}
+        pipe = live[2]
+        dead = list(past_dead)
+        for s in pipe.stages:
+            for d in s.dead:
+                name = self._node_name(d)
+                if name not in dead:
+                    dead.append(name)
+        return {
+            "failovers": past_f + pipe.failovers,
+            "hydrations": past_h + pipe.hydrations,
+            "serving_nodes": [self._node_name(s.node_id) for s in pipe.stages],
+            "retired_nodes": dead,
         }
 
     def _node_name(self, node_id: str) -> str:
@@ -184,6 +230,7 @@ class InferenceManager:
                 if meta is None:
                     _, meta = M.load_params(cfg)
                 self._tok[dep.id] = backend.tokenizer(cfg, meta)
+                dep.spares = await self._warm_spares(dep, cfg, nodes, manifest)
             dep.status = "ready"
             self.store.put_model(dep)
         log.info("model deployed", id=dep.id, model=model_name, backend=backend.name,
@@ -193,6 +240,99 @@ class InferenceManager:
                             {"id": dep.id, "model": model_name, "backend": backend.name,
                              "stages": len(dep.partition)})
         return dep
+
+    async def _warm_spares(self, dep: ModelDeployment, cfg: M.ModelConfig,
+                           nodes, manifest: Optional[dict]) -> dict[str, list[str]]:
+        """Load each stage onto a standby node, where the pool can afford it.
+
+        This is the reliability half of pipeline parallelism (plan §3.4). A pipeline
+        is a chain, so its availability is the *product* of its stages' — five nodes
+        at 99% each give 95%, and consumer machines are nowhere near 99%. Re-partition
+        recovers the deployment but not the generation that was in flight, and it
+        takes seconds. A warm spare turns a stage death into a rotation plus an O(T)
+        single-stage replay, and the user never sees it.
+
+        Deliberately *best-effort and non-fatal*: a small mesh has no capacity to
+        spare, and a deployment that works without redundancy must not be refused
+        because it could not get any. What the pool cannot afford, it simply does not
+        get -- and ``dep.spares`` says so honestly rather than implying protection
+        that is not there.
+
+        Placement prefers a node that hosts no stage of this deployment, because such
+        a node fails independently of every stage. When there is no idle node -- the
+        common case on a small mesh, where the planner has already spread the model
+        across everything it has -- a spare may be **co-hosted** on a machine already
+        serving a *different* stage, provided it has memory headroom left. That is
+        weaker redundancy: losing that machine takes a primary and a standby at once.
+        It is still strictly better than none, because the failure it protects
+        against (one node dying) is far more common than the correlated case, and
+        without it a fully-packed mesh could never have a spare at all.
+        """
+        from ..controlplane.scheduler import usable_layer_memory_mb
+
+        def capacity(node) -> int:
+            mem = usable_layer_memory_mb(node)
+            mem = min(mem, node.policy.ram_mb) if node.policy.ram_mb else mem
+            return int((mem * 0.8) // max(1, cfg.per_layer_mb))
+
+        hosted: dict[str, int] = {}
+        for a in dep.partition:
+            hosted[a.node_id] = hosted.get(a.node_id, 0) + (a.end_layer - a.start_layer)
+
+        hosts = [n for n in nodes if n.provides("shards")]
+        if not hosts:
+            return {}
+        headroom = {n.id: capacity(n) - hosted.get(n.id, 0) for n in hosts}
+        # Idle machines first, then the roomiest co-host. Ordering by headroom
+        # descending also keeps a wide stage from being blocked by a narrow node
+        # that a narrow stage could have used.
+        hosts.sort(key=lambda n: (n.id in hosted, -headroom.get(n.id, 0)))
+
+        # Protect the widest stages first. A stage holding 5 layers is both more
+        # expensive to lose and harder to place, so spending the scarce standby
+        # capacity on it buys more availability than protecting a 1-layer stage.
+        order = sorted(dep.partition, key=lambda a: a.end_layer - a.start_layer,
+                       reverse=True)
+        spares: dict[str, list[str]] = {}
+        taken: set[str] = set()
+        for a in order:
+            width = a.end_layer - a.start_layer
+            # Never on the node already serving this stage: that is not a standby,
+            # it is the same failure domain as the thing it is meant to replace.
+            # One standby role per machine keeps the spares spread out.
+            pick = next((n for n in hosts
+                         if n.id != a.node_id
+                         and n.id not in taken
+                         and headroom.get(n.id, 0) >= width),
+                        None)
+            if pick is None:
+                continue
+            try:
+                weight_blobs: Optional[list[str]] = None
+                if manifest is not None:
+                    names = M.stage_groups(a.start_layer, a.end_layer,
+                                           a.is_first, a.is_last)
+                    weight_blobs = [manifest["groups"][n] for n in names]
+                    await self._place_blobs(pick.id, weight_blobs)
+                await self.transport.call(
+                    pick.id, "shard/load",
+                    {"model_id": spare_model_id(dep.id, a.start_layer, a.end_layer),
+                     "model_name": dep.model,
+                     "start_layer": a.start_layer, "end_layer": a.end_layer,
+                     "is_first": a.is_first, "is_last": a.is_last,
+                     "weight_blobs": weight_blobs},
+                    timeout=60.0)
+            except Exception as exc:  # noqa: BLE001
+                log.info("spare not warmed", model=dep.id, node=pick.id,
+                         stage=f"{a.start_layer}:{a.end_layer}", error=str(exc))
+                continue
+            spares[a.node_id] = [pick.id]
+            taken.add(pick.id)
+            headroom[pick.id] = headroom.get(pick.id, 0) - width
+        if spares:
+            log.info("warm spares placed", model=dep.id,
+                     protected=len(spares), of=len(dep.partition))
+        return spares
 
     def _pooled_layer_capacity(self, nodes, cfg) -> int:
         from ..controlplane.scheduler import usable_layer_memory_mb
@@ -348,11 +488,47 @@ class InferenceManager:
                  "weight_blobs": weight_blobs},
                 timeout=60.0)
 
-    async def _unload_shards(self, dep: ModelDeployment) -> None:
-        for a in dep.partition:
+    def _spare_targets(self, dep: ModelDeployment) -> list[tuple[str, str]]:
+        """``(node_id, shard_key)`` for every standby copy this deployment placed."""
+        by_primary = {a.node_id: a for a in dep.partition}
+        out: list[tuple[str, str]] = []
+        for primary, standbys in (getattr(dep, "spares", {}) or {}).items():
+            a = by_primary.get(primary)
+            if a is None:
+                continue
+            sid = spare_model_id(dep.id, a.start_layer, a.end_layer)
+            out += [(node_id, sid) for node_id in standbys]
+        return out
+
+    async def _unload_spares(self, dep: ModelDeployment) -> None:
+        """Drop only the standby copies, leaving the primaries serving.
+
+        Used before a re-partition: the new plan has different layer boundaries, so
+        the old standby shards are dead weight under keys nobody will address again.
+        Reloading the primaries overwrites them by id, but a standby's id is
+        stage-qualified and would otherwise survive forever on a donated machine.
+        """
+        for node_id, mid in dict.fromkeys(self._spare_targets(dep)):
             try:
-                await self.transport.call(a.node_id, "shard/unload",
-                                          {"model_id": dep.id}, timeout=5.0)
+                await self.transport.call(node_id, "shard/unload",
+                                          {"model_id": mid}, timeout=5.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _unload_shards(self, dep: ModelDeployment) -> None:
+        """Release every shard this deployment placed: primaries *and* standbys.
+
+        Standbys are keyed by a stage-qualified id, and a standby can share a machine
+        with a primary, so unloading by ``dep.id`` alone would leave the spare copies
+        resident -- a memory leak on a donated machine, and exactly the kind of thing
+        a contributor would notice as "MeshPool never gives my RAM back".
+        """
+        work: list[tuple[str, str]] = [(a.node_id, dep.id) for a in dep.partition]
+        work += self._spare_targets(dep)
+        for node_id, mid in dict.fromkeys(work):
+            try:
+                await self.transport.call(node_id, "shard/unload",
+                                          {"model_id": mid}, timeout=5.0)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -377,7 +553,8 @@ class InferenceManager:
     async def chat(self, model_id: str, prompt: str, max_new_tokens: int = 48,
                    temperature: float = 0.8, seed: int = 0,
                    speculative: bool = True, draft_k: int = 4,
-                   draft_layers: int = 2, chunked_prefill: int = 0) -> dict:
+                   draft_layers: int = 2, chunked_prefill: int = 0,
+                   on_tokens: Optional[Callable[[list[int]], None]] = None) -> dict:
         """Generate over the sharded pipeline.
 
         Decoding is KV-cached, so a decode step ships ``d_model`` floats per hop
@@ -419,7 +596,7 @@ class InferenceManager:
         result_b = await batcher.generate(BatchRequest(
             prompt=prompt_ids, max_new_tokens=max_new_tokens, temperature=temperature,
             seed=seed, session=session, chunked_prefill=chunked_prefill,
-            draft_factory=draft_factory, draft_k=draft_k))
+            draft_factory=draft_factory, draft_k=draft_k, on_tokens=on_tokens))
         elapsed = max(1e-6, time.perf_counter() - t0)
 
         generated = result_b.tokens
@@ -464,10 +641,101 @@ class InferenceManager:
             result["speculative"] = spec
         return result
 
+    async def chat_stream(self, model_id: str, prompt: str, max_new_tokens: int = 48,
+                          **kw):
+        """Yield text as it is produced, then the full result.
+
+        Yields ``{"delta": str}`` for each piece of new text and finally
+        ``{"done": True, "result": {...}}`` carrying exactly what :meth:`chat` would
+        have returned.
+
+        Why this exists: the OpenAI-compatible route used to generate the whole
+        answer and *then* chop the finished string into SSE frames. The wire format
+        was correct and the behaviour was not -- time-to-first-token equalled total
+        generation time, so on a wide-area mesh a 500-token reply meant a minute of
+        silence followed by a burst. It also made the flagship reliability property
+        untestable end to end: nothing can fail over "mid-stream" if the stream only
+        starts once generation has finished.
+
+        Deltas are computed by decoding the whole prefix and taking the suffix, not
+        by decoding each token alone. For a byte-pair tokenizer a single token can be
+        a partial UTF-8 sequence, and decoding it in isolation yields replacement
+        characters; taking the difference of two prefix decodes is correct for every
+        tokenizer.
+
+        Native-generate backends (a whole-model replica behind Ollama) produce no
+        incremental tokens through this path, so their text arrives in one final
+        delta. That is reported honestly rather than simulated with a fake drip.
+        """
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        task = loop.create_task(self.chat(
+            model_id, prompt, max_new_tokens,
+            on_tokens=queue.put_nowait, **kw))
+        # Fires after every token already queued, so the sentinel is always last.
+        task.add_done_callback(lambda _t: queue.put_nowait(None))
+
+        ids: list[int] = []
+        sent = ""
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                ids.extend(item)
+                tok = self._tok.get(model_id)
+                if tok is None:
+                    continue
+                text = tok.decode(ids)
+                # Two ways a prefix decode can be unsafe to forward yet:
+                #   - it ends in U+FFFD, i.e. the last token is half of a multi-byte
+                #     character and the rest has not been generated;
+                #   - it does not extend what was already sent, i.e. the tokenizer
+                #     retracted an earlier guess.
+                # In both cases the text is still counted, just held back until it
+                # stabilises. Emitting text that a later decode contradicts cannot be
+                # undone -- an SSE frame the client has rendered is gone.
+                if text.endswith("\ufffd") or not text.startswith(sent):
+                    continue
+                if len(text) > len(sent):
+                    yield {"delta": text[len(sent):]}
+                    sent = text
+
+            result = await task
+            final = result.get("text", "")
+            # The authoritative text wins. It matches the incremental decode exactly
+            # on the sharded path; where it does not -- a backend that produced no
+            # tokens, or a decode still held back -- the recorded answer is the one
+            # the client must end up with.
+            if final.startswith(sent):
+                if len(final) > len(sent):
+                    yield {"delta": final[len(sent):]}
+            elif final != sent:
+                log.warning("stream delta diverged from final text",
+                            model=model_id, streamed=len(sent), final=len(final))
+            yield {"done": True, "result": result}
+        finally:
+            # Covers consumer cancellation and ``aclose()`` alike: a client that hung
+            # up must not leave generation running against a mesh that is charging
+            # someone for it. The batcher notices the cancelled future on its next
+            # step and frees the slot.
+            if not task.done():
+                task.cancel()
+
     @staticmethod
     def _partition_fingerprint(dep: ModelDeployment) -> str:
-        return "|".join(f"{a.node_id}:{a.start_layer}-{a.end_layer}"
-                        for a in sorted(dep.partition, key=lambda a: a.start_layer))
+        """Identity of the placement a batcher is bound to.
+
+        Includes the spare map, not just the primaries: a deployment that has just
+        gained (or lost) standby nodes has different failure semantics, and a batcher
+        still holding the old RemoteShard objects would keep the stale candidate
+        lists — silently serving without the protection the deployment now advertises.
+        """
+        primaries = "|".join(f"{a.node_id}:{a.start_layer}-{a.end_layer}"
+                             for a in sorted(dep.partition, key=lambda a: a.start_layer))
+        spares = getattr(dep, "spares", None) or {}
+        standby = ";".join(f"{k}>{','.join(spares[k])}" for k in sorted(spares))
+        return f"{primaries}#{standby}"
 
     async def _batcher_for(self, dep: ModelDeployment,
                            cfg: M.ModelConfig) -> tuple[ContinuousBatcher, RemotePipeline]:
@@ -482,11 +750,15 @@ class InferenceManager:
         fp = self._partition_fingerprint(dep)
         existing = self._batchers.get(dep.id)
         if existing is not None:
-            if existing[0] == fp:
+            if existing[0] == fp and existing[1].alive:
                 return existing[1], existing[2]
+            # Either the partition moved or the scheduler loop died. A dead batcher
+            # can never resolve another request, so keeping it cached would turn one
+            # crash into a permanently broken deployment.
             await self._retire_batcher(dep.id)
-        pipe = RemotePipeline(cfg, build_remote_stages(self.transport, dep.id,
-                                                       dep.partition))
+        pipe = RemotePipeline(cfg, build_remote_stages(
+            self.transport, dep.id, dep.partition,
+            spares=getattr(dep, "spares", None)))
         batcher = ContinuousBatcher(pipe, max_batch=self.max_batch)
         await batcher.start()
         self._batchers[dep.id] = (fp, batcher, pipe)
@@ -497,10 +769,34 @@ class InferenceManager:
         if entry is None:
             return
         _, batcher, pipe = entry
+        self._fold_failover_history(model_id, pipe)
         try:
             await batcher.aclose()
         finally:
             await pipe.flush()
+
+    def _fold_failover_history(self, model_id: str, pipe: RemotePipeline) -> None:
+        """Persist a retiring pipeline's failover record onto the deployment.
+
+        Retirement is triggered by exactly the events worth remembering -- a node
+        died, the model re-partitioned -- so discarding the counters at that moment
+        would erase the evidence precisely when it becomes interesting.
+        """
+        dep = self.store.get_model(model_id)
+        if dep is None:
+            return
+        if not (pipe.failovers or pipe.hydrations):
+            return
+        dep.failovers_total = getattr(dep, "failovers_total", 0) + pipe.failovers
+        dep.hydrations_total = getattr(dep, "hydrations_total", 0) + pipe.hydrations
+        seen = list(getattr(dep, "retired_nodes", []) or [])
+        for stage in pipe.stages:
+            for node in stage.dead:
+                name = self._node_name(node)
+                if name not in seen:
+                    seen.append(name)
+        dep.retired_nodes = seen
+        self.store.put_model(dep)
 
     async def _native_chat(self, dep: ModelDeployment, backend, prompt: str,
                            max_new_tokens: int, temperature: float) -> dict:
@@ -620,12 +916,25 @@ class InferenceManager:
                 self.events.publish("model_degraded",
                                     {"id": dep.id, "reason": "insufficient capacity"})
                 return
+            # Release the old standby copies BEFORE the partition is replaced: their
+            # shard keys are qualified by the *old* layer boundaries, so they can only
+            # be named while the old partition is still in hand. Reloading will not
+            # overwrite them (different key), and they would otherwise sit in a
+            # donor's RAM until the deployment is deleted.
+            await self._unload_spares(dep)
             dep.partition = partition
+            # The old spare map names the old primaries and may name the node that
+            # just died. Clearing it before the reload means a failure during reload
+            # leaves the deployment honestly unprotected rather than pointing the
+            # pipeline at standby nodes that no longer hold these layer ranges.
+            dep.spares = {}
             dep.status = "loading"
             self.store.put_model(dep)
             try:
                 if not backend.native_generate:
-                    await self._load_shards(dep, cfg)
+                    manifest, _ = await self._resolve_manifest(dep)
+                    await self._load_shards(dep, cfg, manifest)
+                    dep.spares = await self._warm_spares(dep, cfg, survivors, manifest)
                 dep.status = "ready"
                 self.store.put_model(dep)
                 log.info("model re-partitioned", id=dep.id,

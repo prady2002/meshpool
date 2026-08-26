@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -104,6 +105,30 @@ def _kill_tree(proc: Optional[subprocess.Popen]) -> None:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def _kill_now(proc: Optional[subprocess.Popen]) -> None:
+    """Stop a process *immediately*, then clean up its children in the background.
+
+    Measured on this machine: ``taskkill /T /F`` takes ~367 ms to return while
+    ``Popen.kill`` (TerminateProcess) takes ~0.3 ms -- a 1200x difference. That gap
+    is not academic. A gate that kills a node "mid-stream" and then waits a third
+    of a second for the killer to return can easily have the whole workload finish
+    inside the kill, producing a PASS that proves the failover path was never
+    touched. Any gate timing a failure against live traffic must use this.
+
+    The tree sweep still happens, just off the critical path, so pool children are
+    not leaked.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    proc.kill()
+    if sys.platform == "win32":
+        threading.Thread(
+            target=lambda: subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True),
+            daemon=True).start()
 
 
 class Harness:
@@ -233,8 +258,9 @@ class Harness:
             self.start_agent(i)
         self.wait_nodes_online(self.n_agents)
 
-    def stop_agent(self, idx: int) -> None:
-        _kill_tree(self.agent_procs[idx])
+    def stop_agent(self, idx: int, fast: bool = False) -> None:
+        """Stop agent ``idx``. ``fast=True`` returns in microseconds (see _kill_now)."""
+        (_kill_now if fast else _kill_tree)(self.agent_procs[idx])
         self.agent_procs[idx] = None
 
     def restart_agent(self, idx: int) -> None:

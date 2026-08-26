@@ -31,7 +31,7 @@ import asyncio
 import inspect
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 
@@ -233,6 +233,17 @@ class Pipeline:
         self.link = link or LinkProfile()
         self.stats = PipelineStats()
         self.activation_cache = KV.ActivationCache()
+        # Per-session token history, indexed by absolute position.
+        #
+        # ActivationCache deliberately does not store boundary 0 (raw tokens), which
+        # left stage 0 as the one stage no client could rebuild: every other stage is
+        # recoverable by replaying the boundary activations the client already holds,
+        # but stage 0's input is tokens and nobody kept them. That asymmetry meant a
+        # mesh could survive the loss of any stage EXCEPT the first, and the first is
+        # no less likely to churn than the rest. Tokens are ints and a whole 8k
+        # context is ~64 KB, so journalling them costs nothing measurable and makes
+        # recovery uniform across the pipeline.
+        self.token_journal: dict[str, list[int]] = {}
 
     @property
     def depth(self) -> int:
@@ -245,6 +256,7 @@ class Pipeline:
         for s in self.stages:
             s.drop(session)
         self.activation_cache.drop(session)
+        self.token_journal.pop(session, None)
 
     def truncate_session(self, session: str, length: int) -> None:
         """Roll every stage's cache back to ``length`` positions.
@@ -255,6 +267,31 @@ class Pipeline:
         for s in self.stages:
             s.truncate(session, length)
         self.activation_cache.truncate(session, length)
+        journal = self.token_journal.get(session)
+        if journal is not None and length < len(journal):
+            # Rejected draft tokens must vanish from the journal too, or a later
+            # stage-0 rebuild would replay tokens the model never actually accepted
+            # and silently reconstruct a different conversation.
+            del journal[length:]
+
+    def _journal_tokens(self, session: str, pos_offset: int,
+                        tokens: Sequence[int]) -> None:
+        """Append ``tokens`` to ``session``'s history at ``pos_offset``.
+
+        Mirrors ActivationCache.record's append discipline exactly: writing at 0
+        restarts the session, writing at the current length appends, and anything
+        else is a positional inconsistency that must be loud rather than silently
+        producing a journal that does not correspond to the model's real history.
+        """
+        journal = self.token_journal.get(session)
+        if pos_offset == 0:
+            self.token_journal[session] = [int(t) for t in tokens]
+            return
+        if journal is None or pos_offset != len(journal):
+            raise ValueError(
+                f"token journal for {session!r} cannot append at {pos_offset}; "
+                f"current length is {0 if journal is None else len(journal)}")
+        journal.extend(int(t) for t in tokens)
 
     def cache_bytes(self) -> int:
         return sum(s.cache_bytes() for s in self.stages)
@@ -291,6 +328,59 @@ class Pipeline:
             if inspect.isawaitable(out):
                 await out
 
+    async def hydrate_stage_from_tokens(
+        self,
+        session: str,
+        upto_pos: int,
+        chunk: int = 0,
+    ) -> None:
+        """Rebuild **stage 0**'s KV cache by replaying the journalled tokens.
+
+        The counterpart of :meth:`hydrate_stage_from_activations` for the one stage
+        it cannot serve. Same shape, same cost class -- O(T) through a single stage
+        rather than a restart of the whole generation -- so losing the first node of
+        a pipeline is no more expensive to recover from than losing any other.
+        """
+        if not self.stages:
+            raise ValueError("pipeline has no stages")
+        journal = self.token_journal.get(session)
+        if journal is None:
+            raise ValueError(
+                f"no token journal for session {session!r}: stage 0 cannot be "
+                f"rebuilt without the tokens that produced its cache")
+        if upto_pos > len(journal):
+            raise ValueError(
+                f"cannot rebuild stage 0 to position {upto_pos}; the journal holds "
+                f"only {len(journal)} tokens")
+        stage = self.stages[0]
+        stage.drop(session)
+        chunk = upto_pos if chunk <= 0 else chunk
+        for pos in range(0, upto_pos, chunk):
+            span = journal[pos:min(upto_pos, pos + chunk)]
+            out = stage.forward(list(span), is_tokens=True, pos_offset=pos,
+                                session=session)
+            if inspect.isawaitable(out):
+                await out
+
+    async def rehydrate_stage(
+        self,
+        session: str,
+        stage_index: int,
+        upto_pos: int,
+        chunk: int = 0,
+    ) -> None:
+        """Rebuild any stage's cache, choosing the right replay source for it.
+
+        Callers recovering from churn should use this rather than picking between
+        the two primitives themselves: which source is correct is a property of the
+        stage's position, not of the caller's situation.
+        """
+        if stage_index == 0:
+            await self.hydrate_stage_from_tokens(session, upto_pos, chunk)
+        else:
+            await self.hydrate_stage_from_activations(
+                session, stage_index, upto_pos, chunk)
+
     async def forward(self, tokens: list[int], pos_offset: int = 0,
                       session: Optional[str] = None) -> np.ndarray:
         """One traversal. Returns logits ``[len(tokens), vocab]`` for the new positions.
@@ -302,6 +392,8 @@ class Pipeline:
         st = PipelineStats(traversals=1, positions_processed=len(tokens))
         data: object = list(tokens)
         is_tokens = True
+        if session is not None:
+            self._journal_tokens(session, pos_offset, tokens)
 
         for idx, stage in enumerate(self.stages):
             if idx > 0:
@@ -356,6 +448,9 @@ class Pipeline:
 
         st = PipelineStats(traversals=1, positions_processed=sum(c.rows for c in calls))
         current = list(calls)
+        for c in calls:
+            if c.session is not None and c.is_tokens:
+                self._journal_tokens(c.session, c.pos_offset, c.data)  # type: ignore[arg-type]
 
         for idx, stage in enumerate(self.stages):
             if idx > 0:

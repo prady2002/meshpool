@@ -226,6 +226,56 @@ MUTATIONS = [
             "to open a file can notice when the omission stops being true."
         ),
     },
+    {
+        "id": "hydration-drops-without-rebuilding",
+        "path": "meshpool/inference/pipeline.py",
+        "old": b"            out = stage.forward(act, is_tokens=False, pos_offset=pos, session=session)",
+        "new": b"            out = None",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_kvcache.py",
+                "-m", "slow or not slow"],
+        "why": (
+            "Recovery that is worse than doing nothing: the stage's cache is cleared "
+            "one line above, so skipping the replay leaves it EMPTY while the caller "
+            "is told it was rebuilt. This is the shape the real defect took -- the "
+            "coroutine was created and dropped -- and local shards are synchronous, "
+            "so an in-process test cannot see it. Catching it needs a stage that is "
+            "genuinely a coroutine and an assertion that a forward actually ran."
+        ),
+    },
+    {
+        "id": "spare-rotates-without-hydrating",
+        "path": "meshpool/inference/remote.py",
+        "old": b"        self._needs_hydration = set(self._sessions)",
+        "new": b"        self._needs_hydration = set()",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_hot_spares.py",
+                "-m", "slow or not slow"],
+        "why": (
+            "Failover still happens -- the dead node is retired and a spare takes over "
+            "-- but no session is marked dirty, so the spare is handed a decode step at "
+            "a non-zero position with an empty KV cache. Every failover counter still "
+            "increments and the telemetry still says the stage recovered. Only an "
+            "end-to-end oracle comparing post-kill output against a clean run notices "
+            "that the pipeline is now serving from a stage that remembers nothing."
+        ),
+    },
+    {
+        "id": "per-call-httpx-client-on-hot-path",
+        "path": "meshpool/cli/main.py",
+        "old": b'    r = _http().get(f"{base_url()}{path}", headers=_auth_headers(), timeout=30)',
+        "new": b'    r = httpx.get(f"{base_url()}{path}", headers=_auth_headers(), timeout=30)',
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_cli.py",
+                "-m", "slow or not slow"],
+        "why": (
+            "The module-level wrapper builds a whole httpx.Client per call, and "
+            "constructing one loads the system TLS trust store: measured at ~1.0 s "
+            "here, versus 5 ms with verification off. Nothing breaks -- every command "
+            "returns the same bytes -- the CLI just becomes a second slower per "
+            "request and every benchmark that starts its stopwatch outside the call "
+            "silently reports the certificate parse as network latency. A behavioural "
+            "test would only cover the call sites it happens to exercise, so the guard "
+            "is static and covers the whole file."
+        ),
+    },
 ]
 
 
