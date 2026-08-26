@@ -49,6 +49,15 @@ EXPECTED_PUBLIC = {
     "POST /api/v1/nodes/register",
     "POST /api/v1/nodes/heartbeat",
     "POST /api/v1/secrets/redeem",
+    # Abuse reports must be acceptable from people who are not MeshPool users:
+    # the party best placed to notice a mesh node attacking something is the
+    # operator of the thing being attacked, and they have no account here. An
+    # abuse pipeline that only listens to its own customers cannot do the job
+    # §6.3 needs it to do. Safe to expose because the handler takes no
+    # privileged action -- it rate-limits per IP (10/min) *before* reading the
+    # body, truncates the free-text fields, and appends to a deque bounded at
+    # 1000 entries for operator review.
+    "POST /api/v1/abuse/report",
     "GET /",
     # The React console shell and its assets. Same rationale as "GET /": the
     # bundle is a static client that contains no data — every byte it displays

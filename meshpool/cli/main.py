@@ -8,6 +8,7 @@ environment variable (flag takes precedence over the env var).
 from __future__ import annotations
 
 import os
+import sys
 import json
 import hashlib
 from pathlib import Path
@@ -23,7 +24,32 @@ from rich.table import Table
 from meshpool.storage.crypto import ClientKeyring, decrypt_object, encrypt_object, is_encrypted_package
 
 app = typer.Typer(add_completion=False, help="MeshPool — pool your machines into one computer.")
-console = Console()
+
+
+def _console() -> Console:
+    """A console that does not mangle tables when stdout is not a terminal.
+
+    Rich assumes 80 columns whenever it cannot query a TTY, which is every time
+    output is piped, redirected, or captured -- ``meshpool nodes > nodes.txt``,
+    CI logs, ``| grep``. The node table needs more than 80, so Rich silently
+    shrinks columns and truncates cells: ``sim-node-1`` renders as ``sim-nod…``,
+    and in a real mesh ``gaming-rig-basement`` and ``gaming-rig-office`` both
+    become ``gaming-…``. A node list you cannot read node names in is useless,
+    and it is worst in exactly the non-interactive cases people script against.
+
+    Widening the budget for non-TTY output lets the table size to its content.
+    It does not pad to that width -- Rich only expands a table that far if the
+    content needs it -- so piped output stays clean.
+    """
+    if sys.stdout.isatty():
+        return Console()
+    env_cols = os.environ.get("COLUMNS")
+    if env_cols and env_cols.isdigit():
+        return Console(width=int(env_cols))
+    return Console(width=200)
+
+
+console = _console()
 
 # Module-level override set by the --control-plane global flag; None means "not set".
 _override_url: Optional[str] = None

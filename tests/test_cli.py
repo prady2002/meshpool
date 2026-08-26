@@ -7,9 +7,15 @@ storage commands is covered end-to-end by ``sim.scenarios.verify_storage`` (test
 """
 from __future__ import annotations
 
+import io
+import os
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner
 
 import meshpool.cli.main as cli_module
@@ -250,3 +256,119 @@ def test_control_plane_flag_trailing_slash_stripped(monkeypatch):
         assert "//" not in called_url.split("//", 1)[1], (
             f"double slash in path: {called_url}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Console width when stdout is not a terminal.
+#
+# Rich falls back to 80 columns whenever it cannot query a TTY -- which is every
+# piped, redirected or captured run. The `nodes` table needs more than 80, so at
+# 80 Rich shrinks columns and truncates cells: real node names turn into
+# "gaming-…". That is worst in exactly the non-interactive cases people script
+# against. These three tests are deliberately layered:
+#
+#   1. the module-level `console` really is widened (attacks the producer, so
+#      reverting to a bare `Console()` fails this test);
+#   2. 80 columns really does truncate (proves the fix is not a no-op);
+#   3. the widened console does not pad output out to its full width (proves the
+#      fix does not trade one piped-output bug for another).
+# ---------------------------------------------------------------------------
+
+_LONG_NODES = ("gaming-rig-basement", "gaming-rig-office", "threadripper-nas-01")
+
+
+def _mock_cluster_named(names):
+    """A GET /api/v1/cluster payload whose node names are realistically long."""
+    m = MagicMock()
+    m.raise_for_status.return_value = None
+    m.json.return_value = {
+        "summary": {"online": len(names), "total_nodes": len(names),
+                    "total_cores": 8 * len(names), "total_ram_mb": 16000 * len(names)},
+        "nodes": [
+            {
+                "name": n,
+                "status": "online",
+                "owner": "alice@example.com",
+                "headroom_cpu_pct": 87.5,
+                "trust_score": 0.93,
+                "capability": {"cpu_cores": 8, "ram_mb": 16000},
+            }
+            for n in names
+        ],
+    }
+    return m
+
+
+def _render_nodes(console_obj, monkeypatch) -> str:
+    """Run the real `nodes` command against `console_obj` and return what it drew."""
+    buf = io.StringIO()
+    console_obj.file = buf
+    monkeypatch.setattr(cli_module, "console", console_obj)
+    with patch("httpx.get", return_value=_mock_cluster_named(_LONG_NODES)):
+        r = runner.invoke(app, ["nodes"])
+    assert r.exit_code == 0, r.output
+    return buf.getvalue()
+
+
+def test_module_console_is_widened_when_stdout_is_not_a_tty():
+    """The console the CLI actually prints with must not be clamped to 80 columns.
+
+    Checked in a subprocess with stdout piped, so stdout is genuinely not a TTY
+    regardless of how pytest itself was invoked (`-s` or not).
+    """
+    env = dict(os.environ)
+    env.pop("COLUMNS", None)
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import meshpool.cli.main as m; print(m.console.width)"],
+        capture_output=True, text=True, env=env,
+        cwd=str(Path(cli_module.__file__).resolve().parents[2]),
+    )
+    assert proc.returncode == 0, proc.stderr
+    width = int(proc.stdout.strip())
+    assert width >= 120, (
+        f"module-level console is {width} columns wide when piped; the nodes "
+        f"table needs more than 80 or it truncates node names"
+    )
+
+
+def test_eighty_columns_would_truncate_node_names(monkeypatch):
+    """The oracle: at Rich's non-TTY default of 80 the table really does truncate.
+
+    Without this, test_widened_console_shows_full_node_names could pass for a
+    reason that has nothing to do with width.
+    """
+    monkeypatch.delenv("COLUMNS", raising=False)
+    out = _render_nodes(Console(width=80), monkeypatch)
+    assert "…" in out, f"expected truncation at 80 columns, got:\n{out}"
+    truncated = [n for n in _LONG_NODES if n not in out]
+    assert truncated, f"expected at least one truncated node name at 80 cols:\n{out}"
+
+
+def test_widened_console_shows_full_node_names(monkeypatch):
+    """With the real non-TTY console, every node name renders in full."""
+    monkeypatch.delenv("COLUMNS", raising=False)
+    monkeypatch.setattr(sys, "stdout", io.StringIO())  # isatty() -> False
+    out = _render_nodes(cli_module._console(), monkeypatch)
+    for n in _LONG_NODES:
+        assert n in out, f"node name {n!r} was truncated:\n{out}"
+
+
+def test_widened_console_does_not_pad_output_to_its_full_width(monkeypatch):
+    """Widening the budget must not pad piped output out to 200 columns.
+
+    Rich sizes a table to its content and only expands to the console width if
+    the content needs it, so a three-node table should stay far short of 200.
+    """
+    monkeypatch.delenv("COLUMNS", raising=False)
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    out = _render_nodes(cli_module._console(), monkeypatch)
+    widest = max(len(line.rstrip()) for line in out.splitlines())
+    assert widest < 150, f"output padded to {widest} columns:\n{out}"
+
+
+def test_columns_env_var_still_wins_when_set(monkeypatch):
+    """Honour an explicit COLUMNS, so users and CI can still pin the width."""
+    monkeypatch.setenv("COLUMNS", "300")
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    assert cli_module._console().width == 300
