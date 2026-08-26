@@ -26,6 +26,26 @@ from sim.harness import Harness  # noqa: E402
 BASE = Path(__file__).resolve().parent
 
 
+
+
+_CLIENT = None
+
+
+def _http():
+    """One reused client for the whole report.
+
+    ``httpx.get``/``httpx.post`` build a fresh ``httpx.Client`` per call, and building
+    one loads the system TLS trust store: ~0.67 s per call on this machine, versus
+    0.002 s through a reused client. This gate asserts that work stealing ON finishes faster
+    than OFF. A fixed per-call cost lands on both sides and compresses the very
+    difference being measured, shrinking the margin until the comparison is decided by
+    noise. Build the client once, before any stopwatch starts.
+    """
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = httpx.Client(follow_redirects=True)
+    return _CLIENT
+
 @contextmanager
 def _env(values: dict[str, str | None]):
     old = {k: os.environ.get(k) for k in values}
@@ -45,31 +65,31 @@ def _env(values: dict[str, str | None]):
 
 
 def _submit_dag(cp: str, name: str, stages: list[dict]) -> str:
-    r = httpx.post(f"{cp}/api/v1/dags", json={"name": name, "stages": stages}, timeout=10)
+    r = _http().post(f"{cp}/api/v1/dags", json={"name": name, "stages": stages}, timeout=10)
     r.raise_for_status()
     return r.json()["dag_id"]
 
 
 def _dag(cp: str, dag_id: str) -> dict:
-    r = httpx.get(f"{cp}/api/v1/dags/{dag_id}", timeout=10)
+    r = _http().get(f"{cp}/api/v1/dags/{dag_id}", timeout=10)
     r.raise_for_status()
     return r.json()
 
 
 def _job(cp: str, job_id: str) -> dict:
-    r = httpx.get(f"{cp}/api/v1/jobs/{job_id}", timeout=10)
+    r = _http().get(f"{cp}/api/v1/jobs/{job_id}", timeout=10)
     r.raise_for_status()
     return r.json()
 
 
 def _cluster(cp: str) -> dict:
-    r = httpx.get(f"{cp}/api/v1/cluster", timeout=10)
+    r = _http().get(f"{cp}/api/v1/cluster", timeout=10)
     r.raise_for_status()
     return r.json()
 
 
 def _ledger_total(cp: str) -> float:
-    r = httpx.get(f"{cp}/api/v1/ledger", timeout=10)
+    r = _http().get(f"{cp}/api/v1/ledger", timeout=10)
     r.raise_for_status()
     return float(r.json()["summary"]["donated"])
 
@@ -186,7 +206,7 @@ def _run_preemption_case(port: int) -> dict:
             assert chosen_node and before > 0, "non-vacuity: no active DAG units to reclaim"
 
             requeued_before = int(_cluster(cp)["summary"].get("requeued_units", 0))
-            r = httpx.post(f"{cp}/api/v1/nodes/{chosen_node}/reclaim", json={}, timeout=10)
+            r = _http().post(f"{cp}/api/v1/nodes/{chosen_node}/reclaim", json={}, timeout=10)
             r.raise_for_status()
             time.sleep(0.3)
             requeued_after = int(_cluster(cp)["summary"].get("requeued_units", 0))

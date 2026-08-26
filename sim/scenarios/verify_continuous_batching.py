@@ -74,10 +74,35 @@ def single_machine_greedy(prompt: str, n: int) -> str:
     return tok.decode(out)
 
 
+def _http() -> httpx.Client:
+    """One client for the whole gate run, built once.
+
+    ``httpx.post`` constructs a fresh ``httpx.Client`` per call and constructing one
+    loads the system TLS trust store -- measured at ~0.67 s per call on this machine
+    against this very cluster, versus 0.002 s through a reused client. That is not a
+    detail here: this gate *measures throughput and completion order*, so a fixed
+    two-thirds of a second stapled to every request is measurement error large enough
+    to swamp the effect being measured. Test 4's aggregate tokens/sec was understated
+    by it, and test 5's fairness margin was nearly consumed by it -- the short requests
+    spent more time loading certificates than generating.
+
+    Build it once, outside the timed regions, exactly as a real client would.
+    """
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = httpx.Client(timeout=300,
+                               limits=httpx.Limits(max_connections=64,
+                                                   max_keepalive_connections=64))
+    return _CLIENT
+
+
+_CLIENT: httpx.Client | None = None
+
+
 def chat(cp: str, prompt: str, **kw) -> dict:
     body = {"prompt": prompt, "max_new_tokens": N_TOKENS, "temperature": 0.0}
     body.update(kw)
-    r = httpx.post(f"{cp}/api/v1/inference/chat", json=body, timeout=300)
+    r = _http().post(f"{cp}/api/v1/inference/chat", json=body, timeout=300)
     r.raise_for_status()
     return r.json()
 
@@ -207,39 +232,65 @@ def main() -> int:  # noqa: C901
 
         # ------------------------------------------------------------------ #
         print("\n== test 5: a long request does not starve short ones ==")
-        # nano-gpt's window is 64 positions and the prompts are ~34 tokens, so "long"
-        # stays inside the window: this test is about scheduling fairness, and must
-        # not be able to fail for the unrelated reason of hitting the context limit.
-        results: dict[str, float] = {}
+        # The property that separates continuous batching from static batching is
+        # *mid-flight admission*: a request that arrives while a batch is already
+        # running joins it, rather than waiting for it to drain. So assert that
+        # directly, from the server's own per-step accounting, instead of inferring it
+        # from a stopwatch.
+        #
+        # ``mean_batch`` for a sequence is ``co_riders / steps`` -- the mean number of
+        # rows that shared each traversal it took part in. The LONG request starts
+        # alone, so under static batching its mean_batch is exactly 1.0 no matter how
+        # busy the server gets: nothing can join it. Above 1.0 it is proof that the
+        # later arrivals were admitted into a batch already in progress. That cannot be
+        # faked by the short requests batching among themselves, and it does not depend
+        # on machine load, so it neither flakes nor passes for the wrong reason.
+        #
+        # The wall-clock ordering check is kept as the user-visible consequence, but it
+        # is the exact check above that makes this gate mean something.
+        done_at: dict[str, float] = {}
 
         def timed(label: str, prompt: str, n: int) -> dict:
-            t = time.perf_counter()
             d = chat(cp, prompt, max_new_tokens=n, speculative=False)
-            results[label] = time.perf_counter() - t
+            done_at[label] = time.perf_counter()
             return d
 
         with cf.ThreadPoolExecutor(max_workers=4) as ex:
-            long_f = ex.submit(timed, "long", PROMPTS[0], 28)
-            time.sleep(0.3)
-            short_fs = [ex.submit(timed, f"short{i}", PROMPTS[i + 1], 3)
+            long_f = ex.submit(timed, "long", "a ", 55)
+            time.sleep(0.5)                      # let the long one start generating
+            short_fs = [ex.submit(timed, f"short{i}", PROMPTS[i + 1], 2)
                         for i in range(3)]
             shorts = [f.result() for f in short_fs]
             long_d = long_f.result()
-        worst_short = max(results[f"short{i}"] for i in range(3))
-        print(f"  long request (28 tokens): {results['long']:.2f}s")
-        print(f"  slowest short request (3 tokens): {worst_short:.2f}s")
-        assert long_d["tokens"] == 28, (
-            f"long request produced {long_d['tokens']} of 28 tokens "
-            f"(finish_reason={long_d.get('finish_reason')})")
+
+        assert long_d["tokens"] == 55, (
+            f"long request produced {long_d['tokens']} of 55 tokens "
+            f"(finish_reason={long_d.get('finish_reason')}); it must stay inside the "
+            f"context window or this test is measuring truncation, not fairness")
         for i, d in enumerate(shorts):
-            assert d["tokens"] == 3, (
-                f"short{i} produced {d['tokens']} of 3 tokens "
-                f"(finish_reason={d.get('finish_reason')})")
-        assert worst_short < results["long"], (
-            f"a 3-token request took {worst_short:.2f}s while a 28-token request took "
-            f"{results['long']:.2f}s -- short requests were made to wait for the long "
-            f"one, which is static batching, not continuous batching")
-        print("  PASS: short requests finished while the long one was still generating")
+            assert d["tokens"] == 2, f"short{i} produced {d['tokens']} of 2 tokens"
+
+        long_mb = long_d["batch"]["mean_batch"]
+        print(f"  long request: 55 tokens, mean_batch={long_mb:.3f}")
+        print(f"  short requests: 2 tokens each, submitted 0.5s after it started")
+        assert long_mb > 1.0, (
+            f"the long request rode every one of its {long_d['batch']['max_batch']}-slot "
+            f"traversals alone (mean_batch={long_mb:.3f}). Requests that arrived while "
+            f"it was generating were made to wait for it to finish instead of joining "
+            f"the batch in flight -- that is static batching, not continuous batching")
+        for i, d in enumerate(shorts):
+            assert d["batch"]["queued_s"] < 0.25, (
+                f"short{i} waited {d['batch']['queued_s']:.3f}s in the queue behind a "
+                f"long request; a free batch slot must be filled on the next step")
+
+        last_short = max(done_at[f"short{i}"] for i in range(3))
+        margin = done_at["long"] - last_short
+        print(f"  all 3 short requests finished {margin:.2f}s before the long one")
+        assert margin > 0, (
+            f"every short request was still waiting when the 55-token request "
+            f"finished ({-margin:.2f}s late) -- short work is queued behind long work, "
+            f"which is static batching, not continuous batching")
+        print("  PASS: later arrivals joined a batch already in flight")
 
         # ------------------------------------------------------------------ #
         print("\n== test 6: a truncated answer is never reported as a complete one ==")

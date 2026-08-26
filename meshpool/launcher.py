@@ -69,12 +69,32 @@ def _kill_tree(proc: Optional[subprocess.Popen]) -> None:
             pass
 
 
+
+_client: "Optional[httpx.Client]" = None
+
+
+def _http() -> "httpx.Client":
+    """One reused HTTP client for launcher polling.
+
+    ``httpx.get``/``httpx.post`` construct a fresh client per call, and constructing
+    one loads the system TLS trust store: ~1.0 s on Windows, measured. The wait loops
+    below poll every 0.3-0.4 s, so that cost did not merely slow start-up -- it ate the
+    timeout budget. ``_wait_http(url, timeout=30)`` intends ~100 probes in 30 s and got
+    roughly 23, each one spending most of its time in certificate parsing rather than
+    waiting for the service. Reusing one client restores the intended poll rate and
+    keeps the connection warm between probes.
+    """
+    global _client
+    if _client is None:
+        _client = httpx.Client(follow_redirects=True)
+    return _client
+
 def _wait_http(url: str, timeout: float = 30.0) -> bool:
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
         try:
-            r = httpx.get(url, timeout=2.5)
+            r = _http().get(url, timeout=2.5)
             if r.status_code < 500:
                 return True
         except Exception as exc:  # noqa: BLE001
@@ -89,7 +109,7 @@ def _wait_nodes_online(cp_url: str, n: int = 1, timeout: float = 30.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            nodes = httpx.get(f"{cp_url}/api/v1/nodes", timeout=3.0).json().get("nodes", [])
+            nodes = _http().get(f"{cp_url}/api/v1/nodes", timeout=3.0).json().get("nodes", [])
             if len([x for x in nodes if x.get("status") == "online"]) >= n:
                 return True
         except Exception:  # noqa: BLE001
@@ -278,7 +298,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             return 1
 
         print("[self-test] submitting a batch job (square 0..7) ...")
-        r = httpx.post(f"{cp_url}/api/v1/jobs", json={
+        r = _http().post(f"{cp_url}/api/v1/jobs", json={
             "name": "selftest", "func": "square",
             "payloads": [{"x": i} for i in range(8)],
             "cpu_pct": 20, "ram_mb": 64}, timeout=15)
@@ -290,7 +310,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         deadline = time.time() + 60
         job = None
         while time.time() < deadline:
-            job = httpx.get(f"{cp_url}/api/v1/jobs/{job_id}", timeout=10).json()
+            job = _http().get(f"{cp_url}/api/v1/jobs/{job_id}", timeout=10).json()
             if job["status"].startswith("completed"):
                 break
             time.sleep(0.4)

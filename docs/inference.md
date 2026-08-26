@@ -188,10 +188,20 @@ Three safeguards, because a batch is a place where tenants can leak into each ot
   those are split pro rata by rows and labelled as such in the code.
 
 Measured on the real 3-process cluster (`verify_continuous_batching.py`), 6 concurrent
-requests: **288 wide-area hops → 54** (81% fewer) and **2.5–3.6x aggregate tok/s**, with
-every reply token-identical to the same prompt run alone. The hop counts are read from
-`GET /shard/stats` on the agents themselves — counted where the packets land, so they
-cannot be inflated by the requester's own bookkeeping.
+requests: **288 wide-area hops → 51** (82% fewer) and **1.65–2.09x aggregate tok/s**,
+with every reply token-identical to the same prompt run alone. The hop counts are read
+from `GET /shard/stats` on the agents themselves — counted where the packets land, so
+they cannot be inflated by the requester's own bookkeeping.
+
+> The throughput figure was previously recorded as 2.5–3.6x. That number was wrong, and
+> the way it was wrong is worth keeping on the record. The gate created a fresh
+> `httpx.Client` per request, and constructing one loads the system TLS trust store —
+> ~0.67 s on the test machine, versus 0.002 s through a reused client. Serving requests
+> *sequentially* paid that once per request; serving them *concurrently* paid it in
+> parallel. So the measurement was crediting batching for hiding a client-side
+> certificate load. With one shared client the mesh does exactly the same work and the
+> honest speedup is 1.65–2.09x. The hop collapse was never affected — it is counted at
+> the receiving nodes, not timed.
 
 ### 3.4 Why a reply stopped
 

@@ -661,11 +661,11 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   compute cost of `B` tenants is still the compute cost of `B` tenants; only the hop is
   shared. On a mesh that is the term worth attacking. Measured on a real 3-process
   cluster (`verify_continuous_batching`, 6 concurrent requests): **288 wide-area hops →
-  54** and **2.5×–3.6× aggregate tok/s**, every reply token-identical to the same prompt
-  run alone. The hop counts come from `GET /shard/stats` on the agents — counted where
-  the packets land, not where they were sent from, so the requester's own accounting
-  cannot flatter it. Expect the ratio to fall as soon as compute, not latency, is the
-  binding constraint.
+  51** and **1.65×–2.09× aggregate tok/s**, every reply token-identical to the same
+  prompt run alone. The hop counts come from `GET /shard/stats` on the agents — counted
+  where the packets land, not where they were sent from, so the requester's own
+  accounting cannot flatter it. Expect the ratio to fall as soon as compute, not
+  latency, is the binding constraint.
 - **A truncated answer is now reported as truncated.** `nano-gpt` uses learned absolute
   position embeddings, so the context window cannot slide without invalidating every
   cached key/value; generation stops at the window instead. That was always true — what

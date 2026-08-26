@@ -25,18 +25,39 @@ from sim.harness import Harness  # noqa: E402
 from meshpool.inference import model as M  # noqa: E402
 
 
+
+_CLIENT = None
+
+
+def _http():
+    """One reused client for the whole report.
+
+    ``httpx.get``/``httpx.post`` build a fresh ``httpx.Client`` per call, and building
+    one loads the system TLS trust store: ~0.67 s per call on this machine, versus
+    0.002 s through a reused client. This file *publishes* numbers, and two of them are
+    measured by polling in a loop -- ``healed_s`` and ``repart_s``. Every poll paid the
+    construction cost, so both figures were inflated by roughly 0.7 s per poll
+    iteration: the report was timing certificate parsing and attributing it to the
+    mesh's recovery speed. Build the client once, before any stopwatch starts.
+    """
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = httpx.Client(follow_redirects=True)
+    return _CLIENT
+
+
 def _nodes(cp: str) -> list[dict]:
-    return httpx.get(f"{cp}/api/v1/nodes", timeout=10).json()["nodes"]
+    return _http().get(f"{cp}/api/v1/nodes", timeout=10).json()["nodes"]
 
 
 def _wait_job(cp: str, jid: str, timeout: float = 90) -> dict:
     end = time.time() + timeout
     while time.time() < end:
-        j = httpx.get(f"{cp}/api/v1/jobs/{jid}", timeout=10).json()
+        j = _http().get(f"{cp}/api/v1/jobs/{jid}", timeout=10).json()
         if j["status"].startswith("completed"):
             return j
         time.sleep(0.3)
-    return httpx.get(f"{cp}/api/v1/jobs/{jid}", timeout=10).json()
+    return _http().get(f"{cp}/api/v1/jobs/{jid}", timeout=10).json()
 
 
 def _online(cp: str) -> int:
@@ -57,7 +78,7 @@ def _fire(cp: str, dep_id: str, n: int) -> Counter:
     c: Counter = Counter()
     for _ in range(n):
         try:
-            r = httpx.get(f"{cp}/app/{dep_id}/", timeout=5)
+            r = _http().get(f"{cp}/app/{dep_id}/", timeout=5)
             key = "ok" if r.status_code == 200 else f"HTTP {r.status_code}"
         except Exception as exc:  # noqa: BLE001
             key = f"ERR {type(exc).__name__}"
@@ -78,7 +99,7 @@ def measure(cp: str, metrics: dict) -> None:
     print("== batch: distribute 30 sha_pow units ==")
     payloads = [{"seed": f"s{i}", "rounds": 60000} for i in range(30)]
     t0 = time.perf_counter()
-    jid = httpx.post(f"{cp}/api/v1/jobs", json={"name": "sha_pow", "func": "sha_pow",
+    jid = _http().post(f"{cp}/api/v1/jobs", json={"name": "sha_pow", "func": "sha_pow",
                      "payloads": payloads, "cpu_pct": 15}, timeout=10).json()["job_id"]
     job = _wait_job(cp, jid)
     dt = time.perf_counter() - t0
@@ -92,12 +113,12 @@ def measure(cp: str, metrics: dict) -> None:
 
     # ---- hosting -------------------------------------------------------- #
     print("== hosting: deploy 2 replicas, measure LB + failover ==")
-    dep_id = httpx.post(f"{cp}/api/v1/deployments",
+    dep_id = _http().post(f"{cp}/api/v1/deployments",
                         json={"name": "perf-app", "app": "hello", "replicas": 2},
                         timeout=20).json()["id"]
     time.sleep(2)
     before = _fire(cp, dep_id, 40)
-    dep = httpx.get(f"{cp}/api/v1/deployments/{dep_id}", timeout=10).json()
+    dep = _http().get(f"{cp}/api/v1/deployments/{dep_id}", timeout=10).json()
     victim_name = dep["replicas"][0]["node_name"]
     victim_idx = int(victim_name.split("-")[-1]) - 1   # sim-node-N -> harness index N-1
     print(f"   killing {victim_name} mid-traffic ...")
@@ -108,7 +129,7 @@ def measure(cp: str, metrics: dict) -> None:
     healed_s = None
     end = time.time() + 30
     while time.time() < end:
-        d = httpx.get(f"{cp}/api/v1/deployments/{dep_id}", timeout=10).json()
+        d = _http().get(f"{cp}/api/v1/deployments/{dep_id}", timeout=10).json()
         if sum(1 for r in d["replicas"] if r["healthy"]) >= 2:
             healed_s = round(time.perf_counter() - t0, 2)
             break
@@ -129,12 +150,12 @@ def measure(cp: str, metrics: dict) -> None:
 
     # ---- inference ------------------------------------------------------ #
     print("== inference: shard nano-gpt, measure tok/s + failover ==")
-    view = httpx.post(f"{cp}/api/v1/models", json={"model": "nano-gpt"}, timeout=60).json()
+    view = _http().post(f"{cp}/api/v1/models", json={"model": "nano-gpt"}, timeout=60).json()
     if "stages" not in view:
         raise RuntimeError(f"model deploy did not return a partition: {view}")
     stages = view["stages"]
     prompt = "MeshPool turns idle machines into "
-    chat = httpx.post(f"{cp}/api/v1/inference/chat",
+    chat = _http().post(f"{cp}/api/v1/inference/chat",
                       json={"prompt": prompt, "max_new_tokens": 24, "temperature": 0.8},
                       timeout=60).json()
     # correctness oracle (temperature 0, distributed vs single-machine)
@@ -143,33 +164,79 @@ def measure(cp: str, metrics: dict) -> None:
     ids = tok.encode(prompt) or [tok.encode(" ")[0]]
     single = tok.decode(M.generate_with(lambda c: M.forward_full(P, cfg, c), cfg, ids,
                                         max_new_tokens=24, temperature=0.0))
-    dist_greedy = httpx.post(f"{cp}/api/v1/inference/chat",
+    dist_greedy = _http().post(f"{cp}/api/v1/inference/chat",
                              json={"prompt": prompt, "max_new_tokens": 24, "temperature": 0.0},
                              timeout=60).json()["text"]
-    # failover: kill last-stage node, time the re-partition, re-measure
-    last_node = sorted(stages, key=lambda s: s["first"])[-1]["node_name"]
+    # Failover: kill a stage-holding node, time the recovery, re-measure.
+    #
+    # WHICH node is killed is not arbitrary, and getting it wrong makes this metric
+    # unmeasurable rather than bad. The sim profiles are deliberately heterogeneous and
+    # a node's layer capacity is `donated_ram * 0.8 // per_layer_mb`, so for nano-gpt's
+    # 8 layers the three nodes cap at 6 / 3 / 1 layers. Killing the *last stage's* node
+    # picked whichever node the placement happened to put last -- and when that was the
+    # 3-layer node the survivors could hold only 7 of 8 layers, so the control plane
+    # correctly refused to re-partition and logged "insufficient survivor capacity".
+    # The report then crashed trying to read ["text"] off the error body.
+    #
+    # That was a flaw in the scenario, not in the mesh: it demanded recovery from a loss
+    # that is genuinely unrecoverable and called the honest refusal a failure. Kill the
+    # node holding the *fewest* layers instead -- assignment is proportional to
+    # capacity, so that is the least capacity-critical stage, and it is the same
+    # reasoning verify_inference.py uses when it deliberately kills sim-node-3.
+    victim = min(stages, key=lambda s: (s["last"] - s["first"], s["first"]))
+    last_node = victim["node_name"]
     vidx = int(last_node.split("-")[-1]) - 1   # sim-node-N -> harness index N-1
-    print(f"   killing {last_node} (last stage) ...")
+    print(f"   killing {last_node} "
+          f"(holds layers {victim['first']}:{victim['last']}, the smallest stage) ...")
     t0 = time.perf_counter()
     h_ref.stop_agent(vidx)
     repart_s, after_txt = None, None
-    end = time.time() + 30
+    # Time the recovery by what a user actually experiences -- the mesh answering
+    # correctly again -- not by a status field flipping to "ready".
+    #
+    # This loop used to poll the status flag, break, and then immediately issue one
+    # chat and index ["text"]. That was only ever safe by accident: each poll built a
+    # fresh httpx.Client and so spent ~0.7 s loading the system TLS trust store, which
+    # padded the wait long enough for the re-partitioned stage to actually become
+    # serveable. Removing that cost made the loop exit promptly and the very next chat
+    # returned an error body, blowing up on KeyError. The flag is a proxy, and the
+    # proxy leads the reality it stands for.
+    #
+    # So poll on the real thing. A failed attempt is retried rather than fatal, and the
+    # cost of any settling time lands honestly inside repart_s instead of being hidden.
+    end = time.time() + 60
+    last_status: str = "unknown"
     while time.time() < end:
-        v = httpx.get(f"{cp}/api/v1/models", timeout=10).json()
+        v = _http().get(f"{cp}/api/v1/models", timeout=10).json()
         names = {s["node_name"] for s in v.get("stages", [])}
-        if v.get("status") == "ready" and last_node not in names:
-            repart_s = round(time.perf_counter() - t0, 2)
-            break
-        time.sleep(0.5)
-    after_txt = httpx.post(f"{cp}/api/v1/inference/chat",
-                           json={"prompt": prompt, "max_new_tokens": 24, "temperature": 0.0},
-                           timeout=60).json()["text"]
+        last_status = str(v.get("status"))
+        if last_status == "ready" and last_node not in names:
+            try:
+                body = _http().post(f"{cp}/api/v1/inference/chat",
+                                    json={"prompt": prompt, "max_new_tokens": 24,
+                                          "temperature": 0.0},
+                                    timeout=60).json()
+            except Exception:  # noqa: BLE001  (transport hiccup mid-repartition)
+                body = {}
+            if isinstance(body, dict) and body.get("text"):
+                after_txt = body["text"]
+                repart_s = round(time.perf_counter() - t0, 2)
+                break
+        time.sleep(0.25)
+    if after_txt is None:
+        raise RuntimeError(
+            f"the mesh never served a reply again after losing {last_node} "
+            f"(waited 60s; last deployment status={last_status!r}). {last_node} held "
+            f"the smallest stage, so the survivors had capacity and recovery was "
+            f"genuinely expected here. A re-partition that reports ready without being "
+            f"able to serve is worse than one that fails.")
     metrics["inference"] = {
         "layers": view["n_layers"], "stages": len(stages),
         "layout": [f"{s['node_name']}[{s['first']}:{s['last']}]" for s in stages],
         "tokens_per_sec": chat["tokens_per_sec"], "tokens": chat["tokens"],
         "oracle_identical": bool(dist_greedy == single),
         "repartition_s": repart_s,
+        "victim": f"{last_node} (layers {victim['first']}:{victim['last']})",
         "identical_after_failover": bool(after_txt == single),
         "sample": chat["text"]}
     print(f"   {chat['tokens_per_sec']} tok/s; oracle={dist_greedy == single}; "
@@ -223,7 +290,8 @@ def render_md(metrics: dict) -> str:
         f"- **{inf['tokens_per_sec']} tokens/s** generating {inf['tokens']} tokens.",
         f"- **Correctness oracle** (distributed == single-machine, greedy): "
         f"**{'IDENTICAL ✅' if inf['oracle_identical'] else 'MISMATCH ❌'}**.",
-        f"- Killed the last-stage node → **re-partitioned in {inf['repartition_s']} s**; "
+        f"- Killed the node holding {inf['victim']} → **served correctly again after "
+        f"{inf['repartition_s']} s**; "
         f"output still **{'identical ✅' if inf['identical_after_failover'] else 'changed ❌'}**.",
         f"- Sample: `{inf['sample']!r}`",
         "",

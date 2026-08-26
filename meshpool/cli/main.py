@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 import json
+import atexit
 import hashlib
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -104,39 +105,78 @@ def base_url() -> str:
     return "http://127.0.0.1:8080"
 
 
+_client: Optional[httpx.Client] = None
+
+
+def _http() -> httpx.Client:
+    """The one HTTP client this process uses, built on first call and then reused.
+
+    ``httpx.get``/``httpx.post`` and friends are convenience wrappers that construct a
+    whole ``httpx.Client`` per call -- and constructing one loads the system TLS trust
+    store, which is measured at **~1.0 s on Windows** (``verify=False`` is 5 ms, so the
+    cost is entirely certificate loading). Every CLI command used to pay that at least
+    once, and commands that make several calls paid it several times: ``meshpool run``
+    does an ``_ensure_model`` round trip before it streams, so the user waited ~2 s
+    before the first token could possibly appear, for no reason connected to the mesh.
+
+    Measured against a real 3-node cluster: one chat request took **0.62 s** through a
+    fresh client per call and **0.023 s** through a reused one, while the server
+    reported 0.016 s either way. The overhead was 27x the actual work.
+
+    Reusing one client also keeps the TCP connection alive between calls, and -- since
+    the client is only built when a command actually talks to the network -- ``--help``
+    and other offline commands stay instant.
+
+    Verification is left at its secure default. The fix is to build the trust store
+    once, never to skip it.
+    """
+    global _client
+    if _client is None:
+        _client = httpx.Client(timeout=30, follow_redirects=True)
+        atexit.register(_close_http)
+    return _client
+
+
+def _close_http() -> None:
+    global _client
+    if _client is not None:
+        _client.close()
+        _client = None
+
+
 def _get(path: str) -> dict:
-    r = httpx.get(f"{base_url()}{path}", headers=_auth_headers(), timeout=30)
+    r = _http().get(f"{base_url()}{path}", headers=_auth_headers(), timeout=30)
     r.raise_for_status()
     return r.json()
 
 
 def _post(path: str, body: Optional[dict] = None) -> dict:
-    r = httpx.post(f"{base_url()}{path}", json=body or {}, headers=_auth_headers(), timeout=120)
+    r = _http().post(f"{base_url()}{path}", json=body or {}, headers=_auth_headers(), timeout=120)
     r.raise_for_status()
     return r.json()
 
 
 def _put(path: str, body: Optional[dict] = None) -> dict:
-    r = httpx.put(f"{base_url()}{path}", json=body or {}, headers=_auth_headers(), timeout=300)
+    r = _http().put(f"{base_url()}{path}", json=body or {}, headers=_auth_headers(), timeout=300)
     r.raise_for_status()
     return r.json()
 
 
 def _delete(path: str) -> dict:
-    r = httpx.request("DELETE", f"{base_url()}{path}", headers=_auth_headers(), timeout=30)
+    r = _http().request("DELETE", f"{base_url()}{path}", headers=_auth_headers(), timeout=30)
     r.raise_for_status()
     return r.json()
 
 
 def _post_bytes(path: str, data: bytes, content_type: str = "application/octet-stream") -> dict:
-    r = httpx.post(f"{base_url()}{path}", content=data,
-                   headers={**_auth_headers(), "Content-Type": content_type}, timeout=300)
+    r = _http().post(f"{base_url()}{path}", content=data,
+                     headers={**_auth_headers(), "Content-Type": content_type}, timeout=300)
     r.raise_for_status()
     return r.json()
 
 
 def _get_bytes(path: str) -> bytes:
-    r = httpx.get(f"{base_url()}{path}", headers=_auth_headers(), timeout=300)
+    r = _http().get(f"{base_url()}{path}", headers=_auth_headers(), timeout=300)
     r.raise_for_status()
     return r.content
 
@@ -227,7 +267,7 @@ def login(
             "with `meshpool login` against a loopback control plane"
         ))
     try:
-        r = httpx.post(f"{base_url()}/api/v1/auth/local", json={}, timeout=30)
+        r = _http().post(f"{base_url()}/api/v1/auth/local", json={}, timeout=30)
         r.raise_for_status()
         data = r.json()
     except Exception as exc:  # noqa: BLE001
@@ -1156,7 +1196,7 @@ def _stream_openai_chat(model: str, prompt: str, tokens: int, temperature: float
     }
     seen = 0
     content = ""
-    with httpx.stream(
+    with _http().stream(
         "POST",
         f"{base_url()}/v1/chat/completions",
         json=payload,

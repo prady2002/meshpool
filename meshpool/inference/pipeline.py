@@ -272,6 +272,13 @@ class Pipeline:
         server-side KV cache, the client replays the cached activations emitted by
         stage ``j-1`` through only stage ``j``. That is O(T) for one stage instead of
         restarting the full multi-stage pipeline from tokens.
+
+        The replay must be awaited. A remote stage's ``forward`` is a coroutine, and
+        dropping it on the floor here would be worse than doing nothing: the cache has
+        already been cleared one line above, so the stage would be left EMPTY while
+        the caller believes it was rebuilt, and the next decode step would compute
+        against a missing cache at a non-zero offset. In-process stages are
+        synchronous and hid this completely.
         """
         if not 0 < stage_index < len(self.stages):
             raise ValueError("activation hydration needs a non-first stage index")
@@ -280,7 +287,9 @@ class Pipeline:
         chunk = upto_pos if chunk <= 0 else chunk
         for pos in range(0, upto_pos, chunk):
             act = self.activation_cache.get(session, stage_index, pos, min(upto_pos, pos + chunk))
-            stage.forward(act, is_tokens=False, pos_offset=pos, session=session)
+            out = stage.forward(act, is_tokens=False, pos_offset=pos, session=session)
+            if inspect.isawaitable(out):
+                await out
 
     async def forward(self, tokens: list[int], pos_offset: int = 0,
                       session: Optional[str] = None) -> np.ndarray:

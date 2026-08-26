@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from fastapi.testclient import TestClient  # noqa: E402
 from starlette.routing import Route  # noqa: E402
 
-from meshpool.common.auth import Scope  # noqa: E402
+from meshpool.common.auth import ALL_USER_SCOPES, Scope, TokenIssuer  # noqa: E402
 from meshpool.common.config import Settings  # noqa: E402
 from meshpool.common.identity import DeviceIdentity, enrollment_challenge  # noqa: E402
 from meshpool.common.models import now_ms  # noqa: E402
@@ -382,6 +382,136 @@ def main() -> int:  # noqa: C901
                     print(f"  PASS: all {len(CASES)} classification cases exact")
             finally:
                 _appmod._route_patterns = _prev
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        print(f"  FAIL: {type(exc).__name__}: {exc}")
+        import traceback
+        traceback.print_exc()
+
+    # ---- test 9: EXHAUSTIVE wrong-scope rejection (authoriZation, not -tication) #
+    # Tests 4 and 7 prove an *anonymous* caller is refused. That is authentication.
+    # Test 6 proves a *fully* scoped caller is admitted. Between them there was a
+    # hole the size of the entire authorization half of the system: no test ever
+    # presented a real, signed, unexpired credential that simply did not hold the
+    # scope a route demands. Deleting the scope check outright therefore left this
+    # whole file green -- confirmed empirically: the `authz-scope-bypass` mutation
+    # in verify_mutation_coverage.py SURVIVED until this test existed.
+    #
+    # The distinction between the two refusal codes is the point:
+    #   401 = "I don't know who you are"       (no/expired credential)
+    #   403 = "I know exactly who you are, and you may not do this"
+    # Asserting 403 (not merely "not 2xx") is what makes this test unable to pass
+    # by accident: a broken token would verify-fail and yield 401, which fails here.
+    print("\n== test 9: EVERY scoped route refuses a valid credential lacking the scope ==")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            settings = Settings.load(scale="public", data_dir=td,
+                                     host="127.0.0.1", port=9206, auth_mode="enforced")
+            app = build_app(settings)
+            import meshpool.controlplane.app as _appmod
+
+            scoped = {k: v for k, v in ROUTE_SCOPES.items() if v is not None}
+            with TestClient(app) as client:
+                # CP is installed by the lifespan handler, not by build_app, so it
+                # is only readable once the TestClient context has started the app.
+                cp_obj = _appmod.CP
+                if cp_obj is None:
+                    raise RuntimeError("app startup did not install a ControlPlane")
+                # Sign with the CP's own device key: _token_verifier() verifies against
+                # exactly this public key, so these are genuine, fully valid credentials
+                # -- not forgeries. The ONLY thing wrong with them is the scope set.
+                issuer = TokenIssuer(cp_obj.identity._priv, cp_obj.identity.device_id)
+                # cluster:admin is deliberately hierarchical (has_scope returns True for
+                # every scope when it is held), so it can never serve as a filler.
+                fillers = sorted(
+                    (s for s in ALL_USER_SCOPES if s is not Scope.CLUSTER_ADMIN),
+                    key=lambda s: s.value,
+                )
+                if len(fillers) < 2:
+                    raise RuntimeError(f"need >=2 non-admin scopes, found {len(fillers)}")
+
+                swept = 0
+                leaked = []
+                for key in sorted(scoped):
+                    if key in STREAMING:
+                        continue
+                    required = scoped[key]
+                    filler = next(s for s in fillers if s is not required)
+                    tok = issuer.issue(subject="wrong-scope-probe", kind="user",
+                                       scopes=frozenset({filler}), ttl_ms=300_000)
+                    method, _, path = key.partition(" ")
+                    concrete = re.sub(r"\{[^{}]+\}", "probe", path)
+                    r = client.request(method, concrete,
+                                       headers={"X-MeshPool-Token": tok})
+                    swept += 1
+                    if r.status_code != 403:
+                        leaked.append(f"{key} (needs {required.value}, held "
+                                      f"{filler.value}) -> {r.status_code}")
+                if leaked:
+                    ok = False
+                    print(f"  FAIL: {len(leaked)}/{swept} scoped route(s) did not "
+                          f"return 403 to a valid credential lacking the scope:")
+                    for l in leaked[:25]:
+                        print(f"    {l}")
+                    if len(leaked) > 25:
+                        print(f"    ... and {len(leaked) - 25} more")
+                elif swept < 30:
+                    ok = False
+                    print(f"  FAIL: swept only {swept} routes — check is too weak")
+                else:
+                    print(f"  PASS: all {swept} scoped routes returned 403 to a valid "
+                          f"credential holding the wrong scope")
+
+                # Acceptance half. Without this, "always 403" would pass the sweep
+                # above, so the test must be able to fail in BOTH directions: the
+                # SAME token machinery, granted the EXACT required scope, must be
+                # admitted. Any non-401/403 answer counts -- these carry bogus path
+                # params on purpose, so 404/400/422 are correct, expected outcomes.
+                admitted = []
+                for key in ("GET /api/v1/nodes", "GET /api/v1/jobs",
+                            "GET /api/v1/secrets", "GET /api/v1/ledger",
+                            "GET /api/v1/models"):
+                    required = scoped.get(key)
+                    if required is None:
+                        ok = False
+                        print(f"  FAIL: {key} is not a scoped route — "
+                              f"acceptance half is vacuous")
+                        continue
+                    tok = issuer.issue(subject="right-scope-probe", kind="user",
+                                       scopes=frozenset({required}), ttl_ms=300_000)
+                    method, _, path = key.partition(" ")
+                    r = client.request(method, path,
+                                       headers={"X-MeshPool-Token": tok})
+                    if r.status_code in (401, 403):
+                        admitted.append(f"{key} (holding {required.value}) "
+                                        f"-> {r.status_code}")
+                if admitted:
+                    ok = False
+                    print(f"  FAIL: {len(admitted)} route(s) refused a credential "
+                          f"holding EXACTLY the required scope — the sweep above "
+                          f"may be passing for the wrong reason:")
+                    for a in admitted:
+                        print(f"    {a}")
+                else:
+                    print("  PASS: the same tokens, granted the exact required "
+                          "scope, are admitted (refusal is caused by scope, "
+                          "not by broken credentials)")
+
+                # Expiry must still be 401, never 403: a caller whose credential
+                # ran out is unauthenticated, and telling them "forbidden" would
+                # send them to fix the wrong problem. This also pins the ordering
+                # inside check_scope -- expiry is tested BEFORE scope.
+                dead = issuer.issue(subject="expired-probe", kind="user",
+                                    scopes=frozenset({Scope.NODES_READ}),
+                                    ttl_ms=-60_000)
+                r = client.request("GET", "/api/v1/nodes",
+                                   headers={"X-MeshPool-Token": dead})
+                if r.status_code != 401:
+                    ok = False
+                    print(f"  FAIL: expired credential got {r.status_code}, "
+                          f"expected 401 (expiry is an authentication failure)")
+                else:
+                    print("  PASS: an expired credential is 401, not 403")
     except Exception as exc:  # noqa: BLE001
         ok = False
         print(f"  FAIL: {type(exc).__name__}: {exc}")

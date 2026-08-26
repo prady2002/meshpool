@@ -229,6 +229,120 @@ def test_client_activation_cache_hydrates_failed_middle_stage(cfg_params):
     assert np.abs(ref_logits - rec_logits).max() < TOL
 
 
+class _AsyncStage:
+    """A stage whose ``forward`` is a coroutine, exactly like ``RemoteShard``.
+
+    The recovery path is only ever exercised against *remote* stages in production,
+    and a remote ``forward`` returns a coroutine. Testing hydration with local
+    synchronous shards therefore cannot fail the way production does: a forgotten
+    ``await`` discards the coroutine silently, and the only visible symptom is a
+    RuntimeWarning nobody reads. This stand-in puts the async-ness back.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.forward_calls = 0
+
+    def drop(self, session):
+        self.inner.drop(session)
+
+    def truncate(self, session, length):
+        self.inner.truncate(session, length)
+
+    def cache(self, session):
+        return self.inner.cache(session)
+
+    def cache_bytes(self):
+        return self.inner.cache_bytes()
+
+    async def forward(self, data, is_tokens, pos_offset, session):
+        self.forward_calls += 1
+        return self.inner.forward(data, is_tokens, pos_offset, session)
+
+
+def _async_pipe(cfg, P):
+    st = build_stages(cfg, 3, P, cache_page_size=3)
+    return Pipeline(cfg, [st[0], _AsyncStage(st[1]), st[2]])
+
+
+def test_hydration_actually_replays_into_a_remote_style_stage(cfg_params):
+    """Hydration must rebuild a coroutine-based stage, not merely clear it.
+
+    This is the regression for a defect that made recovery *destructive*: the cache
+    was dropped and the replay coroutine was never awaited, so the stage was left
+    empty while the caller believed it had been rebuilt.
+    """
+    cfg, P = cfg_params
+    prompt = TOKENS[:8]
+    rec = _async_pipe(cfg, P)
+    session = "async-recover"
+    asyncio.run(prefill(rec, prompt, session=session))
+
+    stage = rec.stages[1]
+    stage.drop(session)
+    assert stage.cache(session).length == 0
+    before = stage.forward_calls
+
+    asyncio.run(rec.hydrate_stage_from_activations(session, 1, len(prompt), chunk=3))
+
+    assert stage.forward_calls > before, (
+        "hydration issued no forward call at all -- the replay coroutine was created "
+        "and discarded, leaving the stage empty after its cache was dropped")
+    assert stage.cache(session).length == len(prompt), (
+        f"stage cache holds {stage.cache(session).length} of {len(prompt)} positions "
+        f"after hydration; recovery left it in a worse state than it found it")
+
+
+def test_a_rebuilt_remote_style_stage_computes_identical_logits(cfg_params):
+    """The independent oracle: an untouched pipeline fed the same next token.
+
+    Two claims, deliberately separated, because they are not the same claim:
+
+    * Replayed **in the same shape** as the original pass, the rebuilt stage is
+      bit-identical. Nothing about recovery is approximate.
+    * Replayed in a **different chunking**, it agrees only to float tolerance --
+      because a `[3, D]` matmul and an `[8, D]` matmul reduce in different orders.
+      That is float arithmetic, not a defect, and pretending otherwise would make
+      this test fail for an honest reason and teach us to loosen it.
+    """
+    cfg, P = cfg_params
+    prompt = TOKENS[:8]
+
+    ref = _async_pipe(cfg, P)
+    asyncio.run(prefill(ref, prompt, session="ref"))
+    ref_logits = asyncio.run(ref.forward([7], pos_offset=len(prompt), session="ref"))
+
+    same_shape = _async_pipe(cfg, P)
+    asyncio.run(prefill(same_shape, prompt, session="rec"))
+    same_shape.stages[1].drop("rec")
+    asyncio.run(same_shape.hydrate_stage_from_activations("rec", 1, len(prompt)))
+    got = asyncio.run(same_shape.forward([7], pos_offset=len(prompt), session="rec"))
+    assert np.array_equal(ref_logits, got), (
+        "a stage replayed in one piece, exactly as it was originally filled, must be "
+        "bit-identical to one that never failed")
+
+    chunked = _async_pipe(cfg, P)
+    asyncio.run(prefill(chunked, prompt, session="rec"))
+    chunked.stages[1].drop("rec")
+    asyncio.run(chunked.hydrate_stage_from_activations("rec", 1, len(prompt), chunk=3))
+    got_c = asyncio.run(chunked.forward([7], pos_offset=len(prompt), session="rec"))
+    assert np.abs(ref_logits - got_c).max() < TOL
+    assert int(np.argmax(ref_logits[-1])) == int(np.argmax(got_c[-1])), (
+        "chunked replay changed which token would be sampled")
+
+
+def test_hydration_refuses_the_first_stage(cfg_params):
+    """Boundary 0 is raw tokens and is deliberately not cached, so stage 0 cannot be
+    rebuilt this way. Refusing loudly beats silently rebuilding nothing."""
+    cfg, P = cfg_params
+    rec = _async_pipe(cfg, P)
+    asyncio.run(prefill(rec, TOKENS[:8], session="s"))
+    with pytest.raises(ValueError):
+        asyncio.run(rec.hydrate_stage_from_activations("s", 0, 8))
+    with pytest.raises(ValueError):
+        asyncio.run(rec.hydrate_stage_from_activations("s", len(rec.stages), 8))
+
+
 @pytest.fixture(scope="module")
 def gguf_cached_fixture(tmp_path_factory):
     pytest.importorskip("gguf", reason="GGUF support needs the reference gguf package")

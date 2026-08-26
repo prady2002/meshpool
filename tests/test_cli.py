@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -22,6 +24,28 @@ import meshpool.cli.main as cli_module
 from meshpool.cli.main import app
 
 runner = CliRunner()
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@contextmanager
+def _patch_http(**responses):
+    """Patch the shared HTTP client the CLI actually uses.
+
+    The CLI reuses one ``httpx.Client`` for the life of the process, because building
+    one loads the system TLS trust store (~1s on Windows) and doing that per call made
+    every command pay roughly a second of dead time. A consequence is that patching the
+    module-level ``httpx.get``/``httpx.post`` convenience wrappers intercepts nothing --
+    the CLI never calls them. These tests therefore patch the client itself, which is
+    also closer to the real call path.
+
+    Yields the mock client so callers can assert on ``.get``/``.post`` call args.
+    """
+    client = MagicMock()
+    for name, value in responses.items():
+        getattr(client, name).return_value = value
+    with patch.object(cli_module, "_http", return_value=client):
+        yield client
+
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +122,12 @@ def test_login_persists_local_session_without_copy_paste():
     response = MagicMock()
     response.raise_for_status.return_value = None
     response.json.return_value = {"owner": "local-user", "session_token": "sess-123"}
-    with patch("httpx.post", return_value=response) as post, \
+    with _patch_http(post=response) as http, \
          patch.object(cli_module, "_load_config", return_value={}), \
          patch.object(cli_module, "_save_config") as save:
         r = runner.invoke(app, ["--control-plane", "http://cp:8080", "login"])
     assert r.exit_code == 0, r.output
-    assert post.call_args[0][0] == "http://cp:8080/api/v1/auth/local"
+    assert http.post.call_args[0][0] == "http://cp:8080/api/v1/auth/local"
     save.assert_called_once()
     assert save.call_args[0][0]["session_token"] == "sess-123"
 
@@ -197,20 +221,20 @@ def test_control_plane_flag_visible_in_top_level_help():
 def test_control_plane_flag_only(monkeypatch):
     """When --control-plane is the only URL source, it must be used for requests."""
     monkeypatch.delenv("MESHPOOL_CONTROL_PLANE_URL", raising=False)
-    with patch("httpx.get", return_value=_mock_cluster()) as mock_get:
+    with _patch_http(get=_mock_cluster()) as mock_get:
         runner.invoke(app, ["--control-plane", "http://flaghost:7777", "nodes"])
-    assert mock_get.called, "httpx.get was not called"
-    called_url: str = mock_get.call_args[0][0]
+    assert mock_get.get.called, "no HTTP GET was issued"
+    called_url: str = mock_get.get.call_args[0][0]
     assert "flaghost:7777" in called_url, called_url
 
 
 def test_control_plane_env_only(monkeypatch):
     """When no flag is given but the env var is set, the env var URL must be used."""
     monkeypatch.setenv("MESHPOOL_CONTROL_PLANE_URL", "http://envhost:8888")
-    with patch("httpx.get", return_value=_mock_cluster()) as mock_get:
+    with _patch_http(get=_mock_cluster()) as mock_get:
         runner.invoke(app, ["nodes"])
-    assert mock_get.called, "httpx.get was not called"
-    called_url: str = mock_get.call_args[0][0]
+    assert mock_get.get.called, "no HTTP GET was issued"
+    called_url: str = mock_get.get.call_args[0][0]
     assert "envhost:8888" in called_url, called_url
 
 
@@ -219,19 +243,19 @@ def test_control_plane_saved_login_used_when_no_flag_or_env(monkeypatch):
     monkeypatch.delenv("MESHPOOL_CONTROL_PLANE_URL", raising=False)
     with patch.object(cli_module, "_load_config",
                       return_value={"control_plane": "http://saved:9999"}), \
-         patch("httpx.get", return_value=_mock_cluster()) as mock_get:
+         _patch_http(get=_mock_cluster()) as mock_get:
         runner.invoke(app, ["nodes"])
-    called_url: str = mock_get.call_args[0][0]
+    called_url: str = mock_get.get.call_args[0][0]
     assert "saved:9999" in called_url, called_url
 
 
 def test_control_plane_flag_overrides_env(monkeypatch):
     """--control-plane must take precedence over MESHPOOL_CONTROL_PLANE_URL."""
     monkeypatch.setenv("MESHPOOL_CONTROL_PLANE_URL", "http://envhost:8888")
-    with patch("httpx.get", return_value=_mock_cluster()) as mock_get:
+    with _patch_http(get=_mock_cluster()) as mock_get:
         runner.invoke(app, ["--control-plane", "http://flaghost:7777", "nodes"])
-    assert mock_get.called, "httpx.get was not called"
-    called_url: str = mock_get.call_args[0][0]
+    assert mock_get.get.called, "no HTTP GET was issued"
+    called_url: str = mock_get.get.call_args[0][0]
     assert "flaghost:7777" in called_url, f"flag URL not used; got {called_url}"
     assert "envhost:8888" not in called_url, f"env var leaked into URL: {called_url}"
 
@@ -249,10 +273,10 @@ def test_control_plane_invalid_url_exits_with_clear_message():
 def test_control_plane_flag_trailing_slash_stripped(monkeypatch):
     """Trailing slashes must be stripped so API paths don't get double slashes."""
     monkeypatch.delenv("MESHPOOL_CONTROL_PLANE_URL", raising=False)
-    with patch("httpx.get", return_value=_mock_cluster()) as mock_get:
+    with _patch_http(get=_mock_cluster()) as mock_get:
         runner.invoke(app, ["--control-plane", "http://myhost:9090/", "nodes"])
-    if mock_get.called:
-        called_url: str = mock_get.call_args[0][0]
+    if mock_get.get.called:
+        called_url: str = mock_get.get.call_args[0][0]
         assert "//" not in called_url.split("//", 1)[1], (
             f"double slash in path: {called_url}"
         )
@@ -304,7 +328,7 @@ def _render_nodes(console_obj, monkeypatch) -> str:
     buf = io.StringIO()
     console_obj.file = buf
     monkeypatch.setattr(cli_module, "console", console_obj)
-    with patch("httpx.get", return_value=_mock_cluster_named(_LONG_NODES)):
+    with _patch_http(get=_mock_cluster_named(_LONG_NODES)):
         r = runner.invoke(app, ["nodes"])
     assert r.exit_code == 0, r.output
     return buf.getvalue()
@@ -372,3 +396,62 @@ def test_columns_env_var_still_wins_when_set(monkeypatch):
     monkeypatch.setenv("COLUMNS", "300")
     monkeypatch.setattr(sys, "stdout", io.StringIO())
     assert cli_module._console().width == 300
+
+
+# ---------------------------------------------------------------------------
+# One HTTP client per process, not one per call
+# ---------------------------------------------------------------------------
+
+_PER_CALL_HTTPX = re.compile(r"(?<![\w.])httpx\.(get|post|put|delete|head|patch|request|stream)\s*\(")
+
+# Files that talk to the control plane in a loop or on a user-facing hot path.
+_CLIENT_REUSE_REQUIRED = [
+    "meshpool/cli/main.py",
+    "meshpool/inference/bench.py",
+    "meshpool/launcher.py",
+]
+
+
+@pytest.mark.parametrize("relpath", _CLIENT_REUSE_REQUIRED)
+def test_no_module_level_httpx_wrappers_on_hot_paths(relpath):
+    """``httpx.get(...)`` and friends build a whole new client -- and TLS trust store.
+
+    Measured on this machine: ``httpx.Client()`` takes ~1.0 s, of which essentially all
+    is certificate loading (the same construction with ``verify=False`` takes 5 ms).
+    The module-level convenience wrappers construct one per call, so every CLI command
+    paid ~1 s of dead time before touching the network, ``launcher``'s 0.3 s poll loops
+    ran at ~1.3 s and burned their timeout budget on certificate parsing, and
+    ``bench.py`` -- whose docstring promises an *honest* benchmark -- started its
+    stopwatch before the construction and so folded ~1 s into every reported latency.
+
+    A static check rather than a behavioural one, deliberately: it covers every call
+    site in these files including ones no test happens to exercise, and it fails at the
+    moment the pattern is reintroduced rather than whenever someone next profiles.
+    """
+    src = (REPO_ROOT / relpath).read_text(encoding="utf-8")
+    hits = sorted({m.group(0) for m in _PER_CALL_HTTPX.finditer(src)})
+    assert not hits, (
+        f"{relpath} calls {hits} directly. Each such call constructs an httpx.Client "
+        f"and reloads the system TLS trust store (~1s). Route it through the module's "
+        f"shared _http() client instead.")
+
+
+def test_cli_reuses_one_http_client(monkeypatch):
+    """Successive CLI requests must ride the same client, not a fresh one each time."""
+    monkeypatch.setattr(cli_module, "_client", None)
+    first = cli_module._http()
+    try:
+        assert cli_module._http() is first, "a second call built a second client"
+        assert cli_module._http() is first
+    finally:
+        cli_module._close_http()
+    assert cli_module._client is None, "_close_http must clear the cached client"
+
+
+def test_cli_does_not_build_an_http_client_until_it_needs_one(monkeypatch):
+    """``meshpool --help`` and other offline work must not pay the trust-store cost."""
+    monkeypatch.setattr(cli_module, "_client", None)
+    r = runner.invoke(app, ["--help"])
+    assert r.exit_code == 0, r.output
+    assert cli_module._client is None, (
+        "a client (and its ~1s TLS trust store) was built just to print help")
