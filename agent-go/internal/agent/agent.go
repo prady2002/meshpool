@@ -30,6 +30,7 @@ import (
 	"meshd/internal/config"
 	"meshd/internal/identity"
 	"meshd/internal/probe"
+	quicclient "meshd/internal/quictransport"
 	"meshd/internal/tunnel"
 	"meshd/internal/wasmfn"
 )
@@ -53,6 +54,7 @@ type Agent struct {
 	mu                sync.RWMutex
 	nodeID            string
 	nodeToken         string
+	quicAddr          string
 	heartbeatInterval time.Duration
 	startedUnix       int64
 	reclaimed         bool
@@ -118,6 +120,12 @@ func (a *Agent) Run(ctx context.Context) error {
 		ControlPlaneURL: a.cfg.ControlPlaneURL,
 		LocalURL:        a.cfg.LocalURL(),
 		Session:         a,
+	}).Run(ctx)
+	go (&quicclient.Client{
+		Addr:     a.quicAddress(),
+		LocalURL: a.cfg.LocalURL(),
+		Session:  a,
+		Identity: a.id,
 	}).Run(ctx)
 
 	select {
@@ -225,6 +233,7 @@ func (a *Agent) registerOnce(ctx context.Context) bool {
 		NodeID            string  `json:"node_id"`
 		NodeToken         string  `json:"node_token"`
 		HeartbeatInterval float64 `json:"heartbeat_interval_s"`
+		QuicAddr          string  `json:"quic_addr"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil || out.NodeID == "" {
 		log.Printf("register: bad response: %s", truncate(string(raw), 160))
@@ -233,12 +242,26 @@ func (a *Agent) registerOnce(ctx context.Context) bool {
 	a.mu.Lock()
 	a.nodeID = out.NodeID
 	a.nodeToken = out.NodeToken
+	if out.QuicAddr != "" {
+		a.quicAddr = out.QuicAddr
+	}
 	if out.HeartbeatInterval > 0 {
 		a.heartbeatInterval = time.Duration(out.HeartbeatInterval * float64(time.Second))
 	}
 	a.mu.Unlock()
 	log.Printf("registered with control plane node=%s device=%s", out.NodeID, a.id.DeviceID)
 	return true
+}
+
+func (a *Agent) quicAddress() func() string {
+	return func() string {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		if a.cfg.QuicAddr != "" {
+			return a.cfg.QuicAddr
+		}
+		return a.quicAddr
+	}
 }
 
 func (a *Agent) registerLoop(ctx context.Context) {

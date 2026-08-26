@@ -18,6 +18,7 @@ dependencies = [
     "rich",
     "pyyaml",
     "cryptography",
+    "aioquic",
 ]
 
 [project.scripts]

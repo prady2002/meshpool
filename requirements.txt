@@ -7,6 +7,7 @@ typer
 rich
 pyyaml
 cryptography
+aioquic
 
 # Real checkpoint support. `gguf` is llama.cpp's own reference reader/writer:
 # its GGUFReader memory-maps the file, which is what lets a node load only the

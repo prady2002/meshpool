@@ -82,6 +82,11 @@ class Settings:
     # ``enforced`` — every non-public endpoint requires a valid capability token,
     #                session token, or node token. Suitable for public/cloud deployments.
     auth_mode: str = "open"
+    # Transport fabric behind AgentTransport. "http" keeps the original LAN/direct
+    # path only, "tunnel" uses the HTTPS reverse tunnel, and "quic"/"auto" also
+    # accepts agent-initiated QUIC sessions with transparent tunnel fallback.
+    transport: str = "tunnel"
+    quic_port: int = 0
 
     # --- construction ---------------------------------------------------- #
     @classmethod
@@ -112,6 +117,8 @@ class Settings:
             settings.advertise_host = lan_ip()
         if not explicit_cp_url:
             settings.control_plane_url = f"http://{settings.advertise_host}:{settings.port}"
+        if settings.quic_port <= 0:
+            settings.quic_port = settings.port + 100
         settings._apply_scale_preset()
         return settings
 
@@ -120,6 +127,7 @@ class Settings:
         self.heartbeat_interval_s = int(self.heartbeat_interval_s)
         self.node_timeout_s = int(self.node_timeout_s)
         self.trust_tier = int(self.trust_tier)
+        self.quic_port = int(self.quic_port)
         self.ha = str(self.ha).lower() in ("1", "true", "yes") if not isinstance(self.ha, bool) else self.ha
         self.require_enroll_token = (
             str(self.require_enroll_token).lower() in ("1", "true", "yes")
