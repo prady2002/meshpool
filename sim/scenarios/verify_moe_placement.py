@@ -140,6 +140,7 @@ def main() -> int:  # noqa: C901
         print("  PASS: the gate would fail if bad placements were accepted")
 
         print("\n== test 5: sharded MoE generation is bit-exact vs single process at temperature 0 ==")
+        print("  validates sharding equivalence only; MoE numerical semantics are covered by tests/test_moe_sharding.py oracle tests")
         prompt = [1, 5, 9, 13]
         full = G.load_full_params(path, info)
         single_logits = M.forward_full(full, info.config, prompt)
@@ -155,7 +156,7 @@ def main() -> int:  # noqa: C901
         print(f"  sharded={sharded}")
         assert sharded == single
         assert len(set(single)) > 1, f"degenerate output {single}; equality proves nothing"
-        print("  PASS: MoE layer-range sharding is mathematically identical")
+        print("  PASS: sharded and single-process MoE execution are identical for this checkpoint")
 
         print("\nALL MOE PLACEMENT CHECKS PASSED")
     except Exception as exc:  # noqa: BLE001

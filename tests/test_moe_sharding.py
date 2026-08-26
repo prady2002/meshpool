@@ -22,6 +22,58 @@ def _node(nid: str, ram_mb: int = 2, flops: float = 1.0) -> Node:
     )
 
 
+def _silu_ref(x: np.ndarray) -> np.ndarray:
+    return x / (1.0 + np.exp(-x))
+
+
+def _softmax_ref(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    shifted = x - x.max(axis=axis, keepdims=True)
+    e = np.exp(shifted)
+    return e / e.sum(axis=axis, keepdims=True)
+
+
+def _expert_ffn_ref(b: np.ndarray, gate: np.ndarray, up: np.ndarray, down: np.ndarray) -> np.ndarray:
+    return (_silu_ref(b @ gate) * (b @ up)) @ down
+
+
+def _naive_moe_ref(P: dict, cfg: M.ModelConfig, layer: int, b: np.ndarray) -> np.ndarray:
+    gate = P[f"h{layer}.mlp.Wgate_exps"]
+    up = P[f"h{layer}.mlp.Wup_exps"]
+    down = P[f"h{layer}.mlp.Wdown_exps"]
+    router = P[f"h{layer}.mlp.Wrouter"]
+    probs = _softmax_ref(b @ router, axis=-1)
+    out = np.zeros((b.shape[0], cfg.d_model), np.float32)
+    for t in range(b.shape[0]):
+        for e in range(gate.shape[0]):
+            out[t] += probs[t, e] * _expert_ffn_ref(b[t], gate[e], up[e], down[e])
+    if f"h{layer}.mlp.Wgate_shexp" in P:
+        out += _expert_ffn_ref(
+            b, P[f"h{layer}.mlp.Wgate_shexp"], P[f"h{layer}.mlp.Wup_shexp"],
+            P[f"h{layer}.mlp.Wdown_shexp"])
+    return out.astype(np.float32)
+
+
+def _moe_case(*, n_expert: int = 4, d_model: int = 6, d_ff: int = 5,
+              shared_ff: int = 3, top_k: int = 2, seed: int = 7) -> tuple[dict, M.ModelConfig, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    P = {
+        "h0.mlp.Wrouter": rng.standard_normal((d_model, n_expert)).astype(np.float32) * 0.4,
+        "h0.mlp.Wgate_exps": rng.standard_normal((n_expert, d_model, d_ff)).astype(np.float32) * 0.3,
+        "h0.mlp.Wup_exps": rng.standard_normal((n_expert, d_model, d_ff)).astype(np.float32) * 0.3,
+        "h0.mlp.Wdown_exps": rng.standard_normal((n_expert, d_ff, d_model)).astype(np.float32) * 0.3,
+    }
+    if shared_ff:
+        P.update({
+            "h0.mlp.Wgate_shexp": rng.standard_normal((d_model, shared_ff)).astype(np.float32) * 0.3,
+            "h0.mlp.Wup_shexp": rng.standard_normal((d_model, shared_ff)).astype(np.float32) * 0.3,
+            "h0.mlp.Wdown_shexp": rng.standard_normal((shared_ff, d_model)).astype(np.float32) * 0.3,
+        })
+    cfg = M.ModelConfig(d_model=d_model, n_head=2, n_layer=1, d_ff=d_ff,
+                        expert_count=n_expert, expert_used_count=top_k)
+    b = rng.standard_normal((4, d_model)).astype(np.float32)
+    return P, cfg, b
+
+
 @pytest.fixture(scope="module")
 def moe_ckpt(tmp_path_factory):
     path = str(tmp_path_factory.mktemp("moe") / "moe.gguf")
@@ -153,3 +205,73 @@ def test_gguf_backend_uses_measured_layer_bytes(moe_ckpt):
     parts = backend.plan_partition([_node("n1"), _node("n2"), _node("n3"), _node("n4"), _node("n5")], cfg)
     assert parts
     G.validate_moe_expert_colocation(info, parts)
+
+
+class TestMoEMathOracle:
+    def test_identical_experts_collapse_to_dense_ffn_for_any_router(self):
+        P, cfg, b = _moe_case(shared_ff=0, top_k=2)
+        dense_gate = P["h0.mlp.Wgate_exps"][0].copy()
+        dense_up = P["h0.mlp.Wup_exps"][0].copy()
+        dense_down = P["h0.mlp.Wdown_exps"][0].copy()
+        for e in range(cfg.expert_count):
+            P["h0.mlp.Wgate_exps"][e] = dense_gate
+            P["h0.mlp.Wup_exps"][e] = dense_up
+            P["h0.mlp.Wdown_exps"][e] = dense_down
+        P["h0.mlp.Wrouter"] = np.array([
+            [3.0, -1.0, 0.5, 2.0],
+            [-0.5, 2.5, 1.5, 0.0],
+            [1.0, 0.0, -2.0, 4.0],
+            [0.25, -0.75, 1.25, 2.25],
+            [2.0, 1.0, 0.0, -1.0],
+            [-1.5, 0.5, 3.5, 1.0],
+        ], dtype=np.float32)
+        expected = _expert_ffn_ref(b, dense_gate, dense_up, dense_down).astype(np.float32)
+        got = M._llama_moe(P, cfg, 0, b)
+        assert np.allclose(got, expected, rtol=1e-6, atol=1e-6)
+
+    def test_one_hot_router_selects_each_expert_exactly(self):
+        P, cfg, _b = _moe_case(shared_ff=0, top_k=1)
+        b = np.abs(np.random.default_rng(9).standard_normal((3, cfg.d_model))).astype(np.float32) + 0.25
+        for expert in range(cfg.expert_count):
+            P["h0.mlp.Wrouter"] = np.zeros((cfg.d_model, cfg.expert_count), np.float32)
+            P["h0.mlp.Wrouter"][:, expert] = 100.0
+            got = M._llama_moe(P, cfg, 0, b)
+            expected = np.vstack([
+                _expert_ffn_ref(row, P["h0.mlp.Wgate_exps"][expert],
+                                P["h0.mlp.Wup_exps"][expert],
+                                P["h0.mlp.Wdown_exps"][expert])
+                for row in b
+            ]).astype(np.float32)
+            assert np.allclose(got, expected, rtol=1e-6, atol=1e-6), expert
+
+    def test_full_routing_matches_independent_reference_loop(self):
+        P, cfg, b = _moe_case(shared_ff=3, top_k=4)
+        got = M._llama_moe(P, cfg, 0, b)
+        expected = _naive_moe_ref(P, cfg, 0, b)
+        assert np.allclose(got, expected, rtol=1e-6, atol=1e-6)
+
+    def test_shared_expert_term_is_numerically_required(self):
+        P, cfg, b = _moe_case(shared_ff=3, top_k=2)
+        with_shared = M._llama_moe(P, cfg, 0, b)
+        no_shared = {k: v for k, v in P.items() if "_shexp" not in k}
+        without_shared = M._llama_moe(no_shared, cfg, 0, b)
+        assert not np.allclose(with_shared, without_shared, rtol=1e-6, atol=1e-6)
+
+    def test_top_k_router_weights_are_renormalized_to_one(self):
+        P, cfg, b = _moe_case(shared_ff=0, top_k=2)
+        dense_gate = P["h0.mlp.Wgate_exps"][0].copy()
+        dense_up = P["h0.mlp.Wup_exps"][0].copy()
+        dense_down = P["h0.mlp.Wdown_exps"][0].copy()
+        for e in range(cfg.expert_count):
+            P["h0.mlp.Wgate_exps"][e] = dense_gate
+            P["h0.mlp.Wup_exps"][e] = dense_up
+            P["h0.mlp.Wdown_exps"][e] = dense_down
+        logits = b @ P["h0.mlp.Wrouter"]
+        probs = _softmax_ref(logits, axis=-1)
+        chosen = np.argsort(probs, axis=-1)[:, -cfg.expert_used_count:]
+        applied = probs[np.arange(b.shape[0])[:, None], chosen]
+        applied = applied / applied.sum(axis=-1, keepdims=True)
+        assert np.allclose(applied.sum(axis=-1), 1.0)
+        expected = _expert_ffn_ref(b, dense_gate, dense_up, dense_down).astype(np.float32)
+        got = M._llama_moe(P, cfg, 0, b)
+        assert np.allclose(got, expected, rtol=1e-6, atol=1e-6)
