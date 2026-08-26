@@ -94,7 +94,7 @@ credits the machines that did the work. Run your own coordinator with
 
 ## 🧪 Quickstart — simulate a whole cluster on one laptop (dev)
 
-**Requirements:** Python 3.11+ with `numpy fastapi uvicorn pydantic httpx typer rich pyyaml cryptography`
+**Requirements:** Python 3.11+ with `numpy fastapi uvicorn pydantic httpx typer rich pyyaml cryptography aioquic`
 (one `pip install -r requirements.txt`; all pure-Python + NumPy, no native toolchain). No Docker, no GPU, no cloud account.
 
 ```bash
@@ -466,6 +466,21 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   by) rather than SentencePiece's default `nmt_nfkc` normalizer. Both are pinned by test
   so they cannot be silently "fixed" into bugs. Byte-level BPE vocabularies
   (`tokenizer.ggml.model == "gpt2"`) are **refused with an error**, not approximated.
+- **Global transport is now QUIC-first, with the original outbound HTTP tunnel as a
+  first-class fallback.** When `MESHPOOL_TRANSPORT=quic`, the coordinator starts an
+  aioquic UDP listener and agents that support it (the Go `meshd` agent) authenticate
+  the QUIC session with the same persisted Ed25519 device key used for enrollment.
+  Control-plane calls and proxy requests then run on independent QUIC streams, so a
+  slow/lost stream does not head-of-line block unrelated work. The old
+  `GET /tunnel/stream` + `POST /tunnel/reply` path is still present and is deliberately
+  preferred when QUIC is blocked or absent; relayed/tunnel nodes are not second-class.
+  Local gates measure connection migration and fallback under emulation only:
+  [`verify_quic_migration.py`](sim/scenarios/verify_quic_migration.py) forces a UDP
+  address change mid-request and requires the request to complete, while
+  [`verify_transport_fallback.py`](sim/scenarios/verify_transport_fallback.py) configures
+  QUIC but proves a tunnel-only node still receives work. These are not real-internet
+  success-rate claims; the product still budgets for permanent relay dependency on
+  CGNAT/symmetric-NAT paths.
 - **The S3 SigV4 signature binds a *claimed* payload digest, not the bytes we received.**
   `x-amz-content-sha256` is read from the header and used verbatim in the canonical
   request; the body is never hashed and compared. So a captured, signed `PUT` can be
