@@ -158,6 +158,31 @@ def _rope_is_permuted(arch: str) -> bool:
         f"LLAMA_ROPE_TYPE_NORM) or _ROPE_HALF_ARCHES (for LLAMA_ROPE_TYPE_NEOX).")
 
 
+def _reject_latent_attention(tensors: dict, arch: str) -> None:
+    """Refuse checkpoints whose attention is not standard Q/K/V projections.
+
+    DeepSeek-V2/V3 (and therefore Kimi K2) use Multi-head Latent Attention: there
+    is no ``blk.N.attn_q.weight`` to un-permute, because Q and KV are factored
+    through low-rank latents and RoPE is carried on a separate decoupled subspace.
+    Such a file is not a harder version of the dense path, it is a different
+    algorithm, and the dense reader below would otherwise fail deep inside the
+    loop with a confusing "missing tensor" once it had already decided a rope
+    convention for it.
+
+    Detected from the file's own tensor names rather than an architecture list,
+    so a third-party or future MLA checkpoint is caught on structure instead of
+    on whether we remembered to add its name.
+    """
+    markers = ("attn_kv_a_mqa", "attn_kv_b", "attn_q_a", "attn_q_b")
+    found = sorted({m for m in markers
+                    for name in tensors if name.endswith(f".{m}.weight")})
+    if found:
+        raise GGUFUnsupported(
+            f"'{arch}' uses multi-head latent attention (found {', '.join(found)}); "
+            f"MeshPool's reader implements dense query/key/value projections only, "
+            f"so this checkpoint cannot be loaded -- not merely un-permuted wrongly")
+
+
 def unpermute_rope(w: np.ndarray, n_head: int) -> np.ndarray:
     """Invert llama.cpp's Q/K row permutation, restoring the HF rope layout.
 
@@ -447,6 +472,7 @@ def load_params(path: str, start: int, end: int, is_first: bool, is_last: bool,
 
     with _open_reader(path) as reader:
         tensors = {t.name: t for t in reader.tensors}
+        _reject_latent_attention(tensors, info.architecture)
         permute = _rope_is_permuted(info.architecture)
 
         def take(name: str) -> np.ndarray:

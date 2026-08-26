@@ -613,6 +613,18 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   same request body, which is impractical for any realistic checkpoint. This validates the
   distributed execution path, tokenization, sharding, and transport — not model quality or
   practical scale.
+- **GGUF RoPE conventions are mirrored from llama.cpp, and that is a standing liability.**
+  llama.cpp stores Q/K in one of two layouts and picks which by architecture alone —
+  `llama_model_rope_type()` switches on `model->arch` and nothing else, and **there is no
+  GGUF metadata field that records the layout**. A loader therefore has no choice but to
+  transcribe that switch. Ours does, programmatically rather than by hand, and an
+  architecture in neither list raises rather than defaulting to a guess. This matters
+  because getting an entry wrong does not crash: the model loads, generates fluently, and
+  is quietly wrong. An earlier hand-written allowlist had 4 of its 5 entries wrong,
+  including omitting `deepseek2` — the architecture behind DeepSeek-V3 and Kimi K2. Note
+  also that "llama.cpp rotates this architecture as NORM" is *not* the same claim as "the
+  converter permuted its Q/K weights"; the two coincide for ordinary attention and diverge
+  for MLA models, whose tensor layout this loader does not implement at all.
 - **Client-side encryption — and its real limitation.** Encryption happens in the client
   library before bytes leave the process. The server **cannot enforce it**: the raw
   `POST /api/v1/blobs` API accepts plaintext unconditionally — a caller who bypasses the

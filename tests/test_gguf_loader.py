@@ -472,3 +472,31 @@ class TestRopeConventionPerArchitecture:
     def test_the_two_lists_never_disagree(self):
         overlap = G._ROPE_PERMUTED_ARCHES & G._ROPE_HALF_ARCHES
         assert not overlap, f"architectures classified both ways: {sorted(overlap)}"
+
+
+class TestLatentAttentionIsRefused:
+    """MLA is a different algorithm, not a harder dense model."""
+
+    @pytest.mark.parametrize("marker", [
+        "attn_kv_a_mqa", "attn_kv_b", "attn_q_a", "attn_q_b",
+    ])
+    def test_each_latent_marker_is_refused(self, marker):
+        with pytest.raises(G.GGUFUnsupported, match="latent attention"):
+            G._reject_latent_attention({f"blk.0.{marker}.weight": object()}, "deepseek2")
+
+    def test_a_dense_checkpoint_is_still_accepted(self):
+        """Pairs with the refusals above. A guard that refused everything would
+        satisfy every other test in this class and reject every real model."""
+        G._reject_latent_attention(
+            {"blk.0.attn_q.weight": object(), "blk.0.attn_k.weight": object()}, "llama")
+
+    def test_the_refusal_names_the_architecture_and_the_evidence(self):
+        with pytest.raises(G.GGUFUnsupported) as ei:
+            G._reject_latent_attention({"blk.3.attn_kv_a_mqa.weight": object()}, "deepseek2")
+        assert "attn_kv_a_mqa" in str(ei.value) and "deepseek2" in str(ei.value)
+
+    def test_a_dense_tensor_with_a_similar_name_is_not_mistaken_for_latent(self):
+        """Guards the suffix match: attn_q.weight and attn_q_norm.weight must not
+        trip the attn_q_a / attn_q_b markers."""
+        G._reject_latent_attention({"blk.0.attn_q.weight": object(),
+                                    "blk.0.attn_q_norm.weight": object()}, "qwen3")
