@@ -276,6 +276,59 @@ MUTATIONS = [
             "is static and covers the whole file."
         ),
     },
+    {
+        "id": "streaming-is-generate-then-replay",
+        "path": "meshpool/inference/engine.py",
+        "old": b"            on_tokens=queue.put_nowait, **kw))",
+        "new": b"            on_tokens=None, **kw))",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_streaming.py",
+                "-m", "slow or not slow"],
+        "why": (
+            "The exact shape the real defect took. The batcher stops handing tokens "
+            "to the streaming caller, so nothing can be yielded until generation "
+            "finishes and the entire answer arrives as one final delta. Every SSE "
+            "frame is still well formed, the delta/finish_reason schema is still "
+            "correct, and [DONE] still arrives -- which is why verify_openai_compat "
+            "passed against a fake for as long as it existed. A format gate cannot "
+            "detect a fake. Only asserting that a callback fires WHILE the generation "
+            "task is still running can."
+        ),
+    },
+    {
+        "id": "scheduler-loop-dies-in-silence",
+        "path": "meshpool/inference/batching.py",
+        "old": b"                except Exception as exc:  # noqa: BLE001",
+        "new": b"                except ZeroDivisionError as exc:",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_streaming.py",
+                "tests/test_batching.py", "-m", "slow or not slow"],
+        "why": (
+            "Narrowing the guard around caller-supplied draft_factory() lets one bad "
+            "request escape into _loop and kill the shared scheduler. The task holds "
+            "the exception, the queue is never drained again, and EVERY tenant's "
+            "future hangs forever -- no error, no timeout, indistinguishable from a "
+            "slow model. The original defect was found only because a test hung, "
+            "which is the worst way to find it: a suite with no timeout simply stops. "
+            "The guard must assert that a poisoned request is rejected AND that an "
+            "unrelated request submitted afterwards still completes."
+        ),
+    },
+    {
+        "id": "harness-cannot-kill-fast-enough-to-test-failure",
+        "path": "sim/harness.py",
+        "old": b"    proc.kill()\n    if sys.platform == \"win32\":\n        threading.Thread(",
+        "new": b"    _kill_tree(proc)\n    if False:\n        threading.Thread(",
+        "cmd": [sys.executable, "sim/scenarios/verify_stage_failure_midstream.py"],
+        "why": (
+            "A defect in the instrument, not the product, and the most dangerous kind. "
+            "taskkill /T /F returns in ~367 ms while Popen.kill returns in ~0.3 ms "
+            "(measured, 1200x). A 44-token answer finishes INSIDE the slow kill, so "
+            "the gate killed a node 'mid-stream', got byte-identical output, and "
+            "declared the failover path healthy -- while the failover path had never "
+            "run. The tell was failovers=0 in a separate check. Any gate that times a "
+            "failure against live traffic must both kill instantly and assert that "
+            "work was provably done after the victim was confirmed dead."
+        ),
+    },
 ]
 
 
@@ -283,16 +336,35 @@ def _sha(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def _anchor(original: bytes, mut: dict) -> tuple[bytes, bytes]:
+    """Resolve the anchor against whatever line endings this checkout happens to use.
+
+    Mutation anchors are written with ``\\n`` because that is what the source files
+    contain in git, but on Windows a worktree is checked out with ``\\r\\n``. An
+    anchor that spans a newline would then match zero times and the whole entry
+    would report as "the code moved" -- a false alarm that trains you to loosen
+    anchors, which is the opposite of what this gate is for.
+    """
+    old, new = mut["old"], mut["new"]
+    if original.count(old) == 1:
+        return old, new
+    crlf_old = old.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    if original.count(crlf_old) == 1:
+        return crlf_old, new.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    return old, new
+
+
 def _apply(worktree: Path, mut: dict) -> bytes:
     target = worktree / mut["path"]
     original = target.read_bytes()
-    count = original.count(mut["old"])
+    old, new = _anchor(original, mut)
+    count = original.count(old)
     if count != 1:
         raise AssertionError(
             f"[{mut['id']}] anchor matched {count} times in {mut['path']}, expected "
             f"exactly 1. The code moved; update this mutation so it keeps testing "
-            f"the property it was written for.\n  anchor: {mut['old']!r}")
-    target.write_bytes(original.replace(mut["old"], mut["new"]))
+            f"the property it was written for.\n  anchor: {old!r}")
+    target.write_bytes(original.replace(old, new))
     return original
 
 
