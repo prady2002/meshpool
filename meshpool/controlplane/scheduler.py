@@ -18,9 +18,13 @@ atomically — see docs/durability.md §Locking model.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import math
 from typing import Callable, Optional
 
-from ..common.models import LayerAssignment, Node
+from ..common.models import LayerAssignment, Node, NodeStatus
+
+CONSTELLATION_RTT_THRESHOLD_MS = 25.0
 
 
 def best_fit_node(nodes: list[Node], cpu_pct: float, ram_mb: int,
@@ -187,6 +191,170 @@ class PartitionFit:
     reason: str
 
 
+@dataclass(frozen=True)
+class Constellation:
+    """Soft low-latency node neighbourhood discovered from measured RTT."""
+
+    id: str
+    node_ids: tuple[str, ...]
+    pooled_ram_mb: int
+    pooled_vram_mb: int
+    pooled_usable_mb: int
+    total_flops: float
+    max_internal_rtt_ms: float
+    avg_internal_rtt_ms: float
+
+    def fits_memory(self, required_mb: int) -> bool:
+        return self.pooled_usable_mb >= required_mb
+
+
+class ConstellationIndex:
+    """Pre-clustered lookup table for constellation-capacity placement.
+
+    Formation may inspect the node snapshot, but lookup is bucketed by required
+    memory so schedulers do not re-run a global optimization on every request.
+    ``lookup_scans`` is an acceptance-gate guard: fitting lookups must not
+    enumerate all nodes or all constellations.
+    """
+
+    def __init__(self, nodes_by_id: dict[str, Node], constellations: list[Constellation],
+                 bucket_mb: int = 1024) -> None:
+        self.nodes_by_id = dict(nodes_by_id)
+        self.constellations = sorted(
+            constellations,
+            key=lambda c: (c.avg_internal_rtt_ms, c.max_internal_rtt_ms, -c.pooled_usable_mb, c.id),
+        )
+        self.bucket_mb = max(1, int(bucket_mb))
+        self.lookup_scans = 0
+        self._fit_bucket: dict[int, Constellation] = {}
+        if self.constellations:
+            max_bucket = max(math.ceil(c.pooled_usable_mb / self.bucket_mb) for c in self.constellations)
+            for bucket in range(max_bucket + 1):
+                required = bucket * self.bucket_mb
+                for c in self.constellations:
+                    if c.fits_memory(required):
+                        self._fit_bucket[bucket] = c
+                        break
+
+    def fitting(self, required_mb: int) -> Optional[Constellation]:
+        bucket = math.ceil(max(0, int(required_mb)) / self.bucket_mb)
+        return self._fit_bucket.get(bucket)
+
+    def nodes_for(self, constellation: Constellation) -> list[Node]:
+        return [self.nodes_by_id[nid] for nid in constellation.node_ids if nid in self.nodes_by_id]
+
+
+def _constellation_id(node_ids: list[str]) -> str:
+    digest = hashlib.blake2b(",".join(sorted(node_ids)).encode("utf-8"), digest_size=5).hexdigest()
+    return f"constellation-{digest}"
+
+
+def build_constellation_index(
+    nodes: list[Node],
+    rtt_predictor: Callable[[str, str], Optional[float]],
+    *,
+    rtt_threshold_ms: float = CONSTELLATION_RTT_THRESHOLD_MS,
+    min_size: int = 2,
+) -> ConstellationIndex:
+    """Cluster shard-capable online nodes from measured RTT/Vivaldi predictions."""
+    usable_nodes = [
+        n for n in nodes
+        if n.status is NodeStatus.ONLINE and n.provides("shards") and usable_layer_memory_mb(n) > 0
+    ]
+    by_id = {n.id: n for n in usable_nodes}
+    adjacency: dict[str, set[str]] = {n.id: set() for n in usable_nodes}
+    pair_rtt: dict[tuple[str, str], float] = {}
+    for i, a in enumerate(usable_nodes):
+        for b in usable_nodes[i + 1:]:
+            rtt = _safe_rtt(rtt_predictor, a.id, b.id)
+            if rtt <= rtt_threshold_ms:
+                adjacency[a.id].add(b.id)
+                adjacency[b.id].add(a.id)
+                pair_rtt[(a.id, b.id)] = rtt
+                pair_rtt[(b.id, a.id)] = rtt
+
+    seen: set[str] = set()
+    constellations: list[Constellation] = []
+    for node_id in sorted(adjacency):
+        if node_id in seen:
+            continue
+        stack = [node_id]
+        component: list[str] = []
+        seen.add(node_id)
+        while stack:
+            cur = stack.pop()
+            component.append(cur)
+            for nxt in sorted(adjacency[cur]):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        if len(component) < min_size:
+            continue
+        rtts = [
+            pair_rtt.get((a, b), rtt_threshold_ms)
+            for i, a in enumerate(component)
+            for b in component[i + 1:]
+        ]
+        members = [by_id[nid] for nid in sorted(component)]
+        pooled_ram = sum(max(0, n.headroom_ram_mb()) for n in members)
+        pooled_vram = sum(max(0, int(n.capability.vram_mb or 0)) for n in members if n.capability.gpu)
+        pooled_usable = sum(
+            min(usable_layer_memory_mb(n), n.policy.ram_mb) if n.policy.ram_mb
+            else usable_layer_memory_mb(n)
+            for n in members
+        )
+        constellations.append(Constellation(
+            id=_constellation_id(component),
+            node_ids=tuple(sorted(component)),
+            pooled_ram_mb=pooled_ram,
+            pooled_vram_mb=pooled_vram,
+            pooled_usable_mb=int(pooled_usable),
+            total_flops=sum(max(1e-3, n.capability.flops_estimate or n.capability.cpu_cores)
+                            for n in members),
+            max_internal_rtt_ms=max(rtts) if rtts else 0.0,
+            avg_internal_rtt_ms=(sum(rtts) / len(rtts)) if rtts else 0.0,
+        ))
+    return ConstellationIndex(by_id, constellations)
+
+
+def select_pipeline_constellation(
+    index: ConstellationIndex,
+    *,
+    required_memory_mb: int,
+    pipeline_depth: int,
+) -> Optional[Constellation]:
+    """Return the best pre-clustered pool for a model, minimizing depth × RTT."""
+    candidates = [
+        c for c in index.constellations
+        if c.fits_memory(required_memory_mb) and len(c.node_ids) >= max(1, pipeline_depth)
+    ]
+    if not candidates:
+        return index.fitting(required_memory_mb)
+    return min(
+        candidates,
+        key=lambda c: (
+            max(0, pipeline_depth - 1) * c.avg_internal_rtt_ms,
+            c.max_internal_rtt_ms,
+            -c.pooled_usable_mb,
+            c.id,
+        ),
+    )
+
+
+def constellation_nodes_for_model(
+    nodes: list[Node],
+    rtt_predictor: Callable[[str, str], Optional[float]],
+    *,
+    required_memory_mb: int,
+    pipeline_depth: int,
+) -> list[Node]:
+    """O(1)-lookup constellation selection; empty means gracefully use flat pool."""
+    index = build_constellation_index(nodes, rtt_predictor)
+    c = select_pipeline_constellation(
+        index, required_memory_mb=required_memory_mb, pipeline_depth=pipeline_depth)
+    return index.nodes_for(c) if c is not None else []
+
+
 def explain_layer_bytes_fit(
     nodes: list[Node],
     layer_bytes: list[int] | tuple[int, ...],
@@ -230,6 +398,16 @@ def topology_partition_by_bytes(
     fit = explain_layer_bytes_fit(nodes, layer_bytes, headroom_fraction)
     if not fit.fits:
         return []
+
+    if rtt_predictor is not None and len(nodes) > 2 and layer_bytes:
+        required_mb = math.ceil(sum(layer_bytes) / (1024 * 1024))
+        c_nodes = constellation_nodes_for_model(
+            nodes, rtt_predictor,
+            required_memory_mb=required_mb,
+            pipeline_depth=min(len(nodes), len(layer_bytes)),
+        )
+        if c_nodes and explain_layer_bytes_fit(c_nodes, layer_bytes, headroom_fraction).fits:
+            nodes = c_nodes
 
     usable = _usable_shard_nodes(nodes, headroom_fraction)
     usable = [u for u in usable if u["cap_bytes"] >= min(layer_bytes or (0,))]
@@ -339,6 +517,22 @@ def topology_partition(
     if total_capacity < n_layers:
         # Not enough pooled memory to host the whole model.
         return []
+
+    if rtt_predictor is not None and len(nodes) > 2:
+        c_nodes = constellation_nodes_for_model(
+            nodes, rtt_predictor,
+            required_memory_mb=n_layers * per_layer_mb,
+            pipeline_depth=min(len(nodes), n_layers),
+        )
+        if c_nodes:
+            c_usable = []
+            for u0 in _usable_shard_nodes(c_nodes, headroom_fraction):
+                n = u0["node"]
+                cap_layers = int(u0["cap_mb"] // max(1, per_layer_mb))
+                if cap_layers > 0:
+                    c_usable.append({"node": n, "cap": cap_layers, "flops": u0["flops"]})
+            if sum(u["cap"] for u in c_usable) >= n_layers:
+                usable = c_usable
 
     # Latency-aware ordering: reorder nodes so consecutive stages have low RTT.
     # Only applied when a predictor is available; otherwise the original order

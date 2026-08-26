@@ -500,6 +500,16 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   [`verify_churn_membership.py`](sim/scenarios/verify_churn_membership.py) gate injects
   30%+ churn and proves convergence in deterministic one-machine emulation, plus proves
   the registry lookup path is indexed. It is not a real 10k-node internet deployment.
+- **Constellations are soft RTT-derived clusters, not user-configured regions.**
+  The scheduler forms low-latency neighbourhoods from measured Vivaldi/RTT predictions
+  using the plan's <25 ms threshold, advertises pooled RAM/VRAM/usable-memory capacity,
+  and does O(1) capacity lookup from the pre-clustered index. Pipeline placement prefers
+  minimizing `pipeline_depth × RTT`, so a slower metro can beat faster scattered nodes
+  when the RTT term dominates. The
+  [`verify_constellation_formation.py`](sim/scenarios/verify_constellation_formation.py)
+  gate injects known metro/scattered topologies and verifies clustering, capacity fit,
+  churn re-formation, and degenerate 2-node/all-scattered cases under emulation only.
+  It is not a public-internet or throughput measurement.
 - **The S3 SigV4 signature binds a *claimed* payload digest, not the bytes we received.**
   `x-amz-content-sha256` is read from the header and used verbatim in the canonical
   request; the body is never hashed and compared. So a captured, signed `PUT` can be
