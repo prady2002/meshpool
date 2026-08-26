@@ -308,3 +308,28 @@ export interface MeshAggregate {
     nodes: Node[]
   }>
 }
+
+/**
+ * Node role class inferred client-side from observable telemetry.
+ * Not part of the wire API — this is a calibrated projection.
+ *
+ *   anchor       — long-running, high-trust, low-latency dedicated node
+ *   relay        — high-bandwidth node currently idle (routing specialist)
+ *   constellation — general pool member (the majority class)
+ *   drifter      — new, high-latency, or low-trust transient contributor
+ */
+export type NodeClass = 'anchor' | 'relay' | 'constellation' | 'drifter'
+
+/**
+ * A latency neighbourhood: nodes whose control-plane RTT falls within a 25-ms
+ * bucket. Used as a geographic-proximity proxy — MeshPool has no geoIP.
+ * Any capacity figure derived from this grouping is a 'calibrated projection'.
+ */
+export interface ConstellationGroup {
+  id: string
+  latencyBucketMs: number
+  nodeIds: string[]
+  totalCompute: number
+  onlineCount: number
+  label: string
+}

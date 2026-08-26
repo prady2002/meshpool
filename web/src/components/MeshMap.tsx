@@ -1,6 +1,6 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { BatchJob, ModelDeployment, Node, NodeStatus } from '../api/types'
-import { aggregateNodes } from '../mesh'
+import type { BatchJob, ConstellationGroup, ModelDeployment, Node, NodeClass, NodeStatus } from '../api/types'
+import { aggregateNodes, groupConstellations, inferNodeClass } from '../mesh'
 import { Metric } from './ui'
 
 // ── canvas dimensions ──────────────────────────────────────────────────────────
@@ -30,6 +30,7 @@ interface SNode {
   count: number
   label: string
   raw: Node[]
+  nodeClass: NodeClass | null   // non-null only when raw.length === 1
 }
 
 interface SEdge {
@@ -44,6 +45,21 @@ interface Particle {
   t: number; speed: number
 }
 
+// Token traversing model pipeline stages (ingress → relay → egress)
+interface PipelineTokenParticle {
+  modelIdx: number
+  stageIdx: number
+  progress: number  // 0..1 within the current stage
+  speed: number
+}
+
+// Failover event: a node went offline while another took over
+interface FailoverAnim {
+  failedSNodeId: string
+  spareSNodeId: string | null
+  startMs: number  // performance.now() at detection
+}
+
 /**
  * Cap on rows rendered in the accessible table. Each row is 9 cells, so an
  * uncapped table on a 5000-node mesh is 45,000 DOM elements -- enough to make
@@ -51,6 +67,61 @@ interface Particle {
  * are hidden rather than pretending the list is complete.
  */
 const TABLE_ROW_LIMIT = 80
+
+// ── node class canvas marker ───────────────────────────────────────────────────
+
+function drawNodeClassMarker(
+  ctx: CanvasRenderingContext2D,
+  nodeClass: NodeClass,
+  cx: number, cy: number, r: number,
+): void {
+  switch (nodeClass) {
+    case 'anchor': {
+      // 4-point gold star — stable, dedicated hardware
+      ctx.save()
+      ctx.translate(cx, cy)
+      const sr = r * 0.42
+      ctx.beginPath()
+      for (let p = 0; p < 4; p++) {
+        const a = (p / 4) * Math.PI * 2 - Math.PI / 4
+        const b = a + Math.PI / 4
+        if (p === 0) ctx.moveTo(Math.cos(a) * sr, Math.sin(a) * sr)
+        else ctx.lineTo(Math.cos(a) * sr, Math.sin(a) * sr)
+        ctx.lineTo(Math.cos(b) * sr * 0.38, Math.sin(b) * sr * 0.38)
+      }
+      ctx.closePath()
+      ctx.fillStyle = '#fbbf24'; ctx.fill()
+      ctx.restore()
+      break
+    }
+    case 'relay': {
+      // Forward-pointing cyan triangle — routing specialist
+      ctx.save()
+      ctx.translate(cx, cy)
+      const tr = r * 0.38
+      ctx.beginPath()
+      ctx.moveTo(tr * 0.9, 0)
+      ctx.lineTo(-tr * 0.55, -tr * 0.8)
+      ctx.lineTo(-tr * 0.55, tr * 0.8)
+      ctx.closePath()
+      ctx.fillStyle = '#38bdf8'; ctx.fill()
+      ctx.restore()
+      break
+    }
+    case 'drifter': {
+      // Dashed outer ring — transient / uncertain node
+      ctx.save()
+      ctx.setLineDash([3, 4])
+      ctx.beginPath()
+      ctx.arc(cx, cy, r + 5, 0, Math.PI * 2)
+      ctx.strokeStyle = 'rgba(156,163,175,0.55)'; ctx.lineWidth = 1.5; ctx.stroke()
+      ctx.setLineDash([])
+      ctx.restore()
+      break
+    }
+    // 'constellation' — default circle, no extra marker
+  }
+}
 
 // ── physics helpers ────────────────────────────────────────────────────────────
 
@@ -79,6 +150,7 @@ function buildSNodes(
       count: item.count,
       label: item.label,
       raw: item.nodes,
+      nodeClass: item.nodes.length === 1 ? inferNodeClass(item.nodes[0]) : null,
     }
   })
 }
@@ -155,6 +227,11 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
   const rafRef      = useRef(0)
   const frameRef    = useRef(0)
   const prevKeyRef  = useRef('')
+  const modelsRef              = useRef<ModelDeployment[]>([])
+  const constellationGroupsRef = useRef<ConstellationGroup[]>([])
+  const pipelineTokensRef      = useRef<PipelineTokenParticle[]>([])
+  const failoverAnimsRef       = useRef<FailoverAnim[]>([])
+  const prevStatusRef          = useRef<Map<string, NodeStatus>>(new Map())
 
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [showTable, setShowTable]   = useState(false)
@@ -168,6 +245,10 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
 
   const aggregate = useMemo(() => aggregateNodes(nodes), [nodes])
   aggregateRef.current = aggregate
+
+  const constellations = useMemo(() => groupConstellations(nodes), [nodes])
+  constellationGroupsRef.current = constellations
+  modelsRef.current = models
 
   const activeNodeIds = useMemo<Set<string>>(() => {
     const s = new Set<string>()
@@ -200,6 +281,33 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
       }
     }
     sEdgesRef.current = buildSEdges(sNodesRef.current, models)
+
+    // Detect failover transitions (online → draining/offline) and schedule
+    // a short animation so the reliability story is rendered visually.
+    const snapshot = new Map<string, NodeStatus>()
+    for (const item of aggregate.items) {
+      for (const raw of item.nodes) {
+        snapshot.set(raw.id, raw.status)
+        const prev = prevStatusRef.current.get(raw.id)
+        if (prev === 'online' && raw.status !== 'online') {
+          const failedSNode = sNodesRef.current.find((sn) => sn.raw.some((r) => r.id === raw.id))
+          if (failedSNode) {
+            const spare = [...sNodesRef.current]
+              .filter((sn) => sn.status === 'online' && sn.id !== failedSNode.id)
+              .sort((a, b) =>
+                Math.hypot(a.x - failedSNode.x, a.y - failedSNode.y) -
+                Math.hypot(b.x - failedSNode.x, b.y - failedSNode.y),
+              )[0]
+            failoverAnimsRef.current.push({
+              failedSNodeId: failedSNode.id,
+              spareSNodeId: spare?.id ?? null,
+              startMs: performance.now(),
+            })
+          }
+        }
+      }
+    }
+    prevStatusRef.current = snapshot
   }, [aggregate, models])
 
   // ── Effect 2: RAF animation loop (started once; restarts only if
@@ -253,6 +361,26 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
           ctx.font      = '13px sans-serif'
           ctx.fillText('Use the Contribute page to add your first machine', W / 2, H / 2 + 14)
         } else {
+          // Constellation halos — drawn before nodes so they appear behind
+          for (const cg of constellationGroupsRef.current) {
+            if (cg.nodeIds.length < 2) continue
+            const cgSet = new Set(cg.nodeIds)
+            const members = sNodesRef.current.filter((sn) => sn.raw.some((r) => cgSet.has(r.id)))
+            if (members.length < 2) continue
+            const hcx = members.reduce((s, n) => s + n.x, 0) / members.length
+            const hcy = members.reduce((s, n) => s + n.y, 0) / members.length
+            const maxR = members.reduce((mx, n) =>
+              Math.max(mx, Math.hypot(n.x - hcx, n.y - hcy) + n.r), 0) + 28
+            if (maxR < 44) continue
+            const grad = ctx.createRadialGradient(hcx, hcy, Math.max(maxR - 36, 0), hcx, hcy, maxR)
+            grad.addColorStop(0, 'rgba(129,140,248,0.07)')
+            grad.addColorStop(1, 'rgba(129,140,248,0)')
+            ctx.beginPath(); ctx.arc(hcx, hcy, maxR, 0, Math.PI * 2); ctx.fillStyle = grad; ctx.fill()
+            ctx.beginPath(); ctx.arc(hcx, hcy, maxR - 3, 0, Math.PI * 2)
+            ctx.strokeStyle = 'rgba(129,140,248,0.18)'; ctx.lineWidth = 1
+            ctx.setLineDash([4, 6]); ctx.stroke(); ctx.setLineDash([])
+          }
+
           // Pipeline edges
           for (const e of sEdgesRef.current) {
             const na = sNodesRef.current[e.a]; const nb = sNodesRef.current[e.b]
@@ -261,13 +389,14 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
             ctx.moveTo(na.x, na.y); ctx.lineTo(nb.x, nb.y); ctx.stroke()
           }
 
-          // Proximity edges (faint mesh feel for small, static meshes)
+          // Proximity edges (full-mesh for ≤5 nodes; proximity-gated otherwise)
           if (sNodesRef.current.length > 1 && sNodesRef.current.length <= 30) {
-            ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(100,116,139,0.1)'
+            ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(100,116,139,0.15)'
             for (let i = 0; i < sNodesRef.current.length; i++) {
               for (let j = i + 1; j < sNodesRef.current.length; j++) {
                 const na = sNodesRef.current[i]; const nb = sNodesRef.current[j]
-                if (Math.hypot(nb.x - na.x, nb.y - na.y) < 220) {
+                const dist = Math.hypot(nb.x - na.x, nb.y - na.y)
+                if (sNodesRef.current.length <= 5 || dist < 220) {
                   ctx.beginPath(); ctx.moveTo(na.x, na.y); ctx.lineTo(nb.x, nb.y); ctx.stroke()
                 }
               }
@@ -281,6 +410,45 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
             const a  = (Math.sin(p.t * Math.PI) * 0.9).toFixed(2)
             ctx.beginPath(); ctx.arc(px, py, 2.5, 0, Math.PI * 2)
             ctx.fillStyle = `rgba(99,102,241,${a})`; ctx.fill()
+          }
+
+          // Pipeline token particles — bright amber dots following the pipeline
+          // stage→stage to visualise the t_token ≈ Σ compute_i + (N-1)×RTT path
+          if (!reducedMotion) {
+            const nextTokens: PipelineTokenParticle[] = []
+            // Advance existing tokens
+            for (const pt of pipelineTokensRef.current) {
+              const m = modelsRef.current[pt.modelIdx]
+              if (!m) continue
+              const sorted = [...m.partition].sort((a, b) => a.start_layer - b.start_layer)
+              let stageIdx = pt.stageIdx
+              let progress = pt.progress + pt.speed
+              if (progress >= 1) { progress = 0; stageIdx++ }
+              if (stageIdx >= sorted.length - 1) continue
+              const aId = sorted[stageIdx].node_id
+              const bId = sorted[stageIdx + 1].node_id
+              const aSNode = sNodesRef.current.find((sn) => sn.raw.some((r) => r.id === aId))
+              const bSNode = sNodesRef.current.find((sn) => sn.raw.some((r) => r.id === bId))
+              if (aSNode && bSNode) {
+                const px = aSNode.x + (bSNode.x - aSNode.x) * progress
+                const py = aSNode.y + (bSNode.y - aSNode.y) * progress
+                ctx.beginPath(); ctx.arc(px, py, 3, 0, Math.PI * 2)
+                ctx.fillStyle = '#fcd34d'
+                ctx.shadowColor = '#f59e0b'; ctx.shadowBlur = 6; ctx.fill(); ctx.shadowBlur = 0
+              }
+              nextTokens.push({ modelIdx: pt.modelIdx, stageIdx, progress, speed: pt.speed })
+            }
+            // Spawn new tokens for running models
+            for (let mi = 0; mi < modelsRef.current.length; mi++) {
+              const m = modelsRef.current[mi]
+              if (m.status !== 'running' || !m.tokens_per_sec || m.partition.length < 2) continue
+              const spawnP = Math.min(0.12, (m.tokens_per_sec) / 60)
+              if (Math.random() < spawnP) {
+                nextTokens.push({ modelIdx: mi, stageIdx: 0, progress: 0, speed: 0.018 + Math.random() * 0.012 })
+              }
+            }
+            if (nextTokens.length > 60) nextTokens.splice(0, nextTokens.length - 60)
+            pipelineTokensRef.current = nextTokens
           }
 
           // Nodes
@@ -308,6 +476,11 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
             ctx.fillStyle   = STATUS_COLOR[sn.status]; ctx.fill()
             ctx.globalAlpha = 1
 
+            // Node class marker (only for individual, non-aggregated nodes)
+            if (sn.nodeClass && sn.raw.length === 1) {
+              drawNodeClassMarker(ctx, sn.nodeClass, sn.x, sn.y, sn.r)
+            }
+
             if (sn.count > 1) {
               const fs = clamp(sn.r * 0.65, 9, 14)
               ctx.font = `bold ${fs}px sans-serif`; ctx.fillStyle = '#0f172a'
@@ -320,6 +493,32 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
             const lbl = sn.label.length > 20 ? `${sn.label.slice(0, 18)}…` : sn.label
             ctx.fillText(lbl, sn.x, sn.y + sn.r + 5)
           }
+
+          // Failover animations — drawn after nodes so rings appear on top
+          const nowMs = performance.now()
+          failoverAnimsRef.current = failoverAnimsRef.current.filter((anim) => {
+            const elapsed = nowMs - anim.startMs
+            if (elapsed >= 3000) return false
+            const intensity = 1 - elapsed / 3000
+            const failedSNode = sNodesRef.current.find((sn) => sn.id === anim.failedSNodeId)
+            if (failedSNode) {
+              ctx.beginPath(); ctx.arc(failedSNode.x, failedSNode.y, failedSNode.r + 14 * intensity, 0, Math.PI * 2)
+              ctx.strokeStyle = `rgba(239,68,68,${0.7 * intensity})`; ctx.lineWidth = 2.5; ctx.stroke()
+            }
+            if (anim.spareSNodeId) {
+              const spareSNode = sNodesRef.current.find((sn) => sn.id === anim.spareSNodeId)
+              if (spareSNode) {
+                ctx.beginPath(); ctx.arc(spareSNode.x, spareSNode.y, spareSNode.r + 12 * intensity, 0, Math.PI * 2)
+                ctx.strokeStyle = `rgba(245,158,11,${0.8 * intensity})`; ctx.lineWidth = 2; ctx.stroke()
+                if (failedSNode && intensity > 0.2) {
+                  ctx.beginPath(); ctx.moveTo(failedSNode.x, failedSNode.y); ctx.lineTo(spareSNode.x, spareSNode.y)
+                  ctx.strokeStyle = `rgba(245,158,11,${0.3 * intensity})`; ctx.lineWidth = 1
+                  ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([])
+                }
+              }
+            }
+            return true
+          })
 
           ctx.font = '11px sans-serif'; ctx.fillStyle = 'rgba(100,116,139,0.55)'
           ctx.textAlign = 'left'; ctx.textBaseline = 'top'
@@ -439,13 +638,27 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
             onKeyDown={handleCanvasKeyDown}
           />
           {/* Legend */}
-          <div className="pointer-events-none absolute bottom-3 left-3 flex gap-2">
-            {(['online', 'draining', 'offline'] as const).map((s) => (
-              <span key={s} className="flex items-center gap-1.5 rounded-full bg-slate-950/80 px-2.5 py-1 text-xs text-slate-300">
-                <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: STATUS_COLOR[s] }} aria-hidden="true" />
-                {s}
-              </span>
-            ))}
+          <div className="pointer-events-none absolute bottom-3 left-3 space-y-1.5">
+            <div className="flex gap-2">
+              {(['online', 'draining', 'offline'] as const).map((s) => (
+                <span key={s} className="flex items-center gap-1.5 rounded-full bg-slate-950/80 px-2.5 py-1 text-xs text-slate-300">
+                  <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: STATUS_COLOR[s] }} aria-hidden="true" />
+                  {s}
+                </span>
+              ))}
+            </div>
+            <div className="flex gap-2">
+              {([
+                { cls: 'anchor', icon: '★', color: '#fbbf24' },
+                { cls: 'relay', icon: '▶', color: '#38bdf8' },
+                { cls: 'drifter', icon: '⊙', color: '#9ca3af' },
+              ] as const).map(({ cls, icon, color }) => (
+                <span key={cls} className="flex items-center gap-1 rounded-full bg-slate-950/80 px-2.5 py-1 text-xs text-slate-300">
+                  <span style={{ color }} aria-hidden="true">{icon}</span>
+                  {cls}
+                </span>
+              ))}
+            </div>
           </div>
           {activeNodeIds.size > 0 && (
             <Metric label="Nodes running work" value={activeNodeIds.size} tier="measured" density="compact" className="pointer-events-none absolute right-3 top-3 border-indigo-500/30 bg-indigo-500/20 text-indigo-300" />
@@ -521,6 +734,27 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
                 <p className="text-xs text-slate-500">
                   Click a node or use ↑↓←→ keys to inspect
                 </p>
+              )}
+              {nodes.length > 0 && (
+                <div className="mt-1 w-full text-left">
+                  <p className="text-xs uppercase tracking-widest text-slate-500">Node classes</p>
+                  <div className="mt-2 space-y-1.5">
+                    {([
+                      { cls: 'anchor', icon: '★', color: '#fbbf24', desc: 'High-trust · stable' },
+                      { cls: 'relay', icon: '▶', color: '#38bdf8', desc: 'High-bandwidth · routing' },
+                      { cls: 'constellation', icon: '●', color: '#818cf8', desc: 'General pool member' },
+                      { cls: 'drifter', icon: '⊙', color: '#9ca3af', desc: 'New or high-latency' },
+                    ] as const).map(({ cls, icon, color, desc }) => (
+                      <div key={cls} className="flex items-center gap-2">
+                        <span style={{ color }} aria-hidden="true" className="w-4 text-center text-sm">{icon}</span>
+                        <span className="text-xs text-slate-400"><span className="font-medium text-slate-300">{cls}</span> — {desc}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="mt-2 text-xs text-slate-500/70">
+                    Classes are calibrated projections from latency, uptime, and bandwidth.
+                  </p>
+                </div>
               )}
             </div>
           )}
