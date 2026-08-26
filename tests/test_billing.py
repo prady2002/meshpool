@@ -41,7 +41,7 @@ def test_receipt_records_gross_fee_and_balanced_ledger(tmp_store):
         sum(v["consumed"] for v in totals.values()))
 
 
-def test_retry_idempotency_bills_accepted_unit_once(tmp_store):
+def test_duplicate_accepted_result_bills_same_unit_once(tmp_store):
     ledger = ContributionLedger(tmp_store)
     billing = BillingManager(tmp_store, ledger, platform_fee_rate=0.10)
 
@@ -55,6 +55,20 @@ def test_retry_idempotency_bills_accepted_unit_once(tmp_store):
     assert len(receipt["lines"]) == 1
     assert receipt["totals"]["total_charged"] == pytest.approx(11.0)
     assert ledger.store.ledger_totals_by_owner()["cons:alice"]["consumed"] == pytest.approx(11.0)
+
+
+def test_missing_idempotency_key_fails_loudly(tmp_store):
+    ledger = ContributionLedger(tmp_store)
+    billing = BillingManager(tmp_store, ledger, platform_fee_rate=0.10)
+
+    with pytest.raises(ValueError, match="idempotency_key"):
+        billing.record_charge("batch", "job1", "cons:alice", "node1", "dev:node1",
+                              measured_seconds=1.0, resource_class="batch",
+                              resource_units=10.0, idempotency_key="",
+                              detail="batch:job1")
+
+    assert billing.receipt("batch", "job1") is None
+    assert tmp_store.ledger_totals_by_owner() == {}
 
 
 def test_live_meter_labels_measured_and_projection_tiers(tmp_store):

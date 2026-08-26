@@ -64,6 +64,34 @@ class _Transport:
         }
 
 
+class _DuplicateAcceptedBillingProxy:
+    """Inject a duplicate accepted completion at the billing boundary.
+
+    BatchManager normally suppresses late speculative completions before billing,
+    which is good production behaviour but cannot prove BillingManager's
+    idempotency key.  This proxy deliberately calls the real billing layer twice
+    with the exact same accepted unit arguments, equivalent to two completed
+    attempts reaching the billing boundary for one unit.
+    """
+
+    def __init__(self, inner: BillingManager) -> None:
+        self.inner = inner
+        self.meter = inner.meter
+        self.duplicates_injected = 0
+
+    def record_charge(self, *args, **kwargs):
+        first = self.inner.record_charge(*args, **kwargs)
+        self.inner.record_charge(*args, **kwargs)
+        self.duplicates_injected += 1
+        return first
+
+    def receipt(self, *args, **kwargs):
+        return self.inner.receipt(*args, **kwargs)
+
+    def live_meter(self, *args, **kwargs):
+        return self.inner.live_meter(*args, **kwargs)
+
+
 def _node(node_id: str, cpu_slots: int = 1) -> Node:
     return Node(
         id=node_id,
@@ -135,7 +163,7 @@ def main() -> int:
         assert meter.unit == MESH_SECOND and meter.pricing_dimensions == 1
         print(f"  PASS: one unit ({MESH_SECOND}), one price dimension, costs={costs}")
 
-        print("\n== test 2: a retried unit is billed exactly once ==")
+        print("\n== test 2: a failed first attempt is not billed ==")
         store = Store(":memory:")
         node = _node("node1")
         node_retry = _node("node-retry")
@@ -151,9 +179,27 @@ def main() -> int:
         assert receipt is not None and len(receipt["lines"]) == 1, receipt
         assert receipt["totals"]["gross_earnings"] == 10.0, receipt
         assert ledger.credits("cons:alice") == -11.0, store.ledger_totals_by_owner()
-        print("  PASS: first attempt failed, retry succeeded, one receipt line recorded")
+        print("  PASS: first attempt failed before billing; retry produced one charge")
 
-        print("\n== test 3: hitting a cap stops work rather than warning ==")
+        print("\n== test 3: duplicate accepted completion bills one unit once ==")
+        store_dup = Store(":memory:")
+        node_dup = _node("node-dup")
+        mgr_dup, _, billing_dup, _ = _manager(
+            store_dup, [node_dup], _Transport(compute_ms=1000))
+        proxy = _DuplicateAcceptedBillingProxy(billing_dup)
+        mgr_dup.billing = proxy
+        job_dup = mgr_dup.submit("dup", "square", [{"x": 3}], cpu_pct=10,
+                                 ram_mb=64, owner="cons:dup")
+        asyncio.run(_run_until_stable(mgr_dup, job_dup.id))
+        receipt_dup = billing_dup.receipt("batch", job_dup.id)
+        assert proxy.duplicates_injected == 1, "duplicate billing path did not execute"
+        assert receipt_dup is not None and len(receipt_dup["lines"]) == 1, receipt_dup
+        assert receipt_dup["totals"]["total_charged"] == 11.0, receipt_dup
+        assert store_dup.ledger_totals_by_owner()["cons:dup"]["consumed"] == 11.0, (
+            store_dup.ledger_totals_by_owner())
+        print("  PASS: duplicate accepted billing call was idempotent in receipt and ledger")
+
+        print("\n== test 4: hitting a cap stops work rather than warning ==")
         store2 = Store(":memory:")
         node2 = _node("node2")
         mgr2, _, billing2, caps = _manager(
@@ -168,14 +214,14 @@ def main() -> int:
         assert billing2.receipt("batch", job2.id)["totals"]["total_charged"] == 11.0
         print("  PASS: cap reached after first unit; remaining work stayed pending")
 
-        print("\n== test 4: receipt totals reconcile exactly with ledger movements ==")
+        print("\n== test 5: receipt totals reconcile exactly with ledger movements ==")
         _assert_receipt_reconciles(store, receipt)
         donated, consumed = _totals(store)
         assert donated == consumed == receipt["totals"]["total_charged"], (
             donated, consumed, receipt)
         print(f"  PASS: donated={donated} consumed={consumed} receipt={receipt['totals']}")
 
-        print("\n== test 5: NON-VACUITY reconciliation detects forged ledger movement ==")
+        print("\n== test 6: NON-VACUITY reconciliation detects forged ledger movement ==")
         store.add_ledger(LedgerEntry(
             id=new_id("led"), node_id="mutant", owner="dev:mutant",
             kind="donated", compute_units=1.0, detail="MUTATION: forged credit"))

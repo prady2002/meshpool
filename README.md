@@ -567,7 +567,9 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
 - **Metering has one unit: the measured mesh-second.** Batch, functions, inference,
   hosting, and storage all normalize resource-weighted node time into the same
   `mesh-second`; receipts carry `pricing_dimensions: 1` so a second billing axis
-  cannot be hidden in the API. Per-job receipts show gross contributor earnings,
+  cannot be hidden in the API. The production receipt call site is currently batch
+  accepted-unit billing; the other service classes are defined in the meter but not
+  yet wired to production receipts. Per-job receipts show gross contributor earnings,
   the platform fee as a separate line item, and the total charged to the consumer;
   fees are never silently netted out of contributor earnings. The meter labels
   observed runtime/cost as **measured** and live forward-looking fields as

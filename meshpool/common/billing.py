@@ -7,12 +7,11 @@ earnings and the platform fee as separate lines; nothing is silently netted.
 """
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from .models import LedgerEntry, new_id, now_ms
+from .models import LedgerEntry, now_ms
 from .trust import ContributionLedger
 
 MESH_SECOND = "mesh-second"
@@ -156,9 +155,10 @@ class BillingManager:
         node_id: str,
         provider_owner: str,
         measured_seconds: float,
+        *,
+        idempotency_key: str,
         resource_class: str = "standard",
         resource_units: float = 1.0,
-        idempotency_key: str = "",
         detail: str = "",
         earning_recorder: Optional[Callable[[str, str, float, str], object]] = None,
     ) -> dict:
@@ -168,7 +168,9 @@ class BillingManager:
         same accepted unit return the existing receipt line and do not touch the
         ledger again.
         """
-        idem = idempotency_key or new_id("usage")
+        idem = (idempotency_key or "").strip()
+        if not idem:
+            raise ValueError("billing idempotency_key is required")
         rid = self._ensure_receipt(service, job_id, consumer_owner)
         line_id = f"{rid}:{idem}"
         mesh_seconds = self.meter.measure(measured_seconds, resource_class, resource_units)
