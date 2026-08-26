@@ -44,3 +44,11 @@ report_*.xml
 .DS_Store
 Thumbs.db
 meshpool_build_spec.md
+# --- Ad-hoc run logs ---
+# Gate/pytest output captured via PowerShell redirection. These have previously been
+# committed by accident and contained a private IP and live invite tokens, so the
+# pattern is ignored rather than relying on discipline.
+pytest_*.txt
+*_out.txt
+*_out[0-9].txt
+_gatelogs/
