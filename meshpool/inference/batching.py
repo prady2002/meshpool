@@ -236,6 +236,7 @@ class ContinuousBatcher:
         self.stats = BatcherStats()
         self._queue: list[_Seq] = []
         self._active: list[_Seq] = []
+        self._admitting: Optional[_Seq] = None
         self._task: Optional[asyncio.Task] = None
         self._stopping = False
         self._wake = asyncio.Event()
@@ -308,6 +309,7 @@ class ContinuousBatcher:
             # escapes the per-step handler must therefore take the whole batcher down
             # loudly and hand the exception to everyone who was waiting.
             log.exception("batcher loop terminated", error=str(exc))
+            self._fail_admitting(exc)
             self._fail_active(exc)
             self._fail_queued(exc)
             raise
@@ -354,6 +356,13 @@ class ContinuousBatcher:
             seq = self._queue.pop(0)
             if seq.future.cancelled():
                 continue
+            # A sequence that has left the queue but not yet joined the active set is
+            # owned by neither, so if the loop dies here _fail_queued and _fail_active
+            # both miss it and its caller waits forever. Hold it somewhere the failure
+            # path can see, and clear it only on the paths that leave normally -- a
+            # ``finally`` would clear it while the exception was still propagating,
+            # which is exactly the case it exists for.
+            self._admitting = seq
             self.pipe.drop_session(seq.session)
             if seq.req.draft_factory is not None:
                 # A caller-supplied factory is arbitrary code. Letting it raise here
@@ -366,10 +375,12 @@ class ContinuousBatcher:
                     if not seq.future.done():
                         seq.future.set_exception(exc)
                     self.stats.rejected += 1
+                    self._admitting = None
                     continue
             seq.started_at = time.perf_counter()
             self._active.append(seq)
             self.stats.admitted += 1
+            self._admitting = None
 
     async def _step(self) -> None:
         """One shared traversal on behalf of every active sequence."""
@@ -655,6 +666,19 @@ class ContinuousBatcher:
             self.pipe.drop_session(seq.session)
             if not seq.future.done():
                 seq.future.set_exception(exc)
+
+    def _fail_admitting(self, exc: BaseException) -> None:
+        """Resolve the sequence caught mid-admission, if there is one.
+
+        _admit pops from the queue before appending to the active set. A failure in
+        that window leaves the sequence referenced by neither list, so without this
+        its caller is the one tenant the loud-failure path silently misses -- and it
+        is precisely the tenant whose request caused the failure.
+        """
+        seq = self._admitting
+        self._admitting = None
+        if seq is not None and not seq.future.done():
+            seq.future.set_exception(exc)
 
     def _fail_queued(self, exc: BaseException) -> None:
         for seq in list(self._queue):

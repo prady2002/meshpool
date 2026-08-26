@@ -249,8 +249,13 @@ class TestSchedulerLoopSurvival:
                     draft_k=4)))
                 good = asyncio.create_task(b.generate(BatchRequest(
                     prompt=PROMPT, max_new_tokens=8, seed=2)))
+                # Every await here is bounded on purpose. The failure this class
+                # guards against is "everything hangs forever", and a test that
+                # detects a hang by hanging is barely a test: with no global pytest
+                # timeout installed, the suite simply stops. Bounded waits turn a
+                # 30-minute wedge into a 10-second assertion failure.
                 with pytest.raises(ValueError):
-                    await bad
+                    await asyncio.wait_for(bad, timeout=10)
                 res = await asyncio.wait_for(good, timeout=10)
                 return res, b.alive, b.stats.rejected
             finally:
@@ -306,8 +311,44 @@ class TestSchedulerLoopSurvival:
         assert all(isinstance(r, RuntimeError) for r in results), (
             f"a caller was left hanging after the loop died: {results}")
 
+    def test_a_request_caught_mid_admission_is_not_forgotten(self, cfg_params):
+        """The one tenant the loud-failure path used to miss.
 
-def _boom():
+        _admit pops a sequence off the queue and only later appends it to the active
+        set. A failure inside that window leaves it referenced by neither list, so
+        _fail_queued and _fail_active both skip it -- and it is the request that
+        *caused* the failure, i.e. the caller most entitled to an error. Before
+        _fail_admitting existed this future was never resolved and the caller hung
+        forever while every other tenant got a clean exception.
+        """
+        cfg, P = cfg_params
+
+        async def go():
+            pipe = _pipe(cfg, P)
+            b = ContinuousBatcher(pipe, max_batch=1)
+            await b.start()
+            # drop_session runs after the sequence has left the queue and before it
+            # joins the active set: precisely the unowned window.
+            pipe.drop_session = _boom
+            victim = asyncio.create_task(b.generate(
+                BatchRequest(prompt=PROMPT, max_new_tokens=8, seed=1)))
+            try:
+                return await asyncio.wait_for(victim, timeout=10)
+            except asyncio.TimeoutError:
+                return "HUNG"
+            except RuntimeError as exc:
+                return exc
+            finally:
+                await b.aclose()
+
+        got = asyncio.run(go())
+        assert got != "HUNG", (
+            "a request that failed during admission was never resolved; its caller "
+            "would wait forever while every other tenant got a clean error")
+        assert isinstance(got, RuntimeError)
+
+
+def _boom(*args, **kwargs):
     raise RuntimeError("scheduler exploded")
 
 
