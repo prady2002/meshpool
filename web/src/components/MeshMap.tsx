@@ -1,6 +1,6 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { BatchJob, ConstellationGroup, ModelDeployment, Node, NodeClass, NodeStatus } from '../api/types'
-import { aggregateNodes, groupConstellations, inferNodeClass } from '../mesh'
+import { aggregateNodes, groupConstellations, inferNodeClass, resolveConstellationHalos } from '../mesh'
 import { Metric } from './ui'
 
 // ── canvas dimensions ──────────────────────────────────────────────────────────
@@ -232,6 +232,9 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
   const pipelineTokensRef      = useRef<PipelineTokenParticle[]>([])
   const failoverAnimsRef       = useRef<FailoverAnim[]>([])
   const prevStatusRef          = useRef<Map<string, NodeStatus>>(new Map())
+  // Pre-resolved halo membership — populated once per node-set change in Effect 1,
+  // NOT on every frame. The draw loop reads this as pure index lookups.
+  const halosRef = useRef<Array<{ constellationId: string; memberIndices: number[] }>>([])
 
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [showTable, setShowTable]   = useState(false)
@@ -281,6 +284,14 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
       }
     }
     sEdgesRef.current = buildSEdges(sNodesRef.current, models)
+
+    // Recompute halo membership whenever nodes or models change.
+    // resolveConstellationHalos is O(S×R + C×N) and runs at most every 10 s
+    // (the API poll interval) — not in the RAF draw loop.
+    halosRef.current = resolveConstellationHalos(
+      constellationGroupsRef.current,
+      sNodesRef.current.map((sn) => sn.raw.map((r) => r.id)),
+    )
 
     // Detect failover transitions (online → draining/offline) and schedule
     // a short animation so the reliability story is rendered visually.
@@ -361,11 +372,13 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
           ctx.font      = '13px sans-serif'
           ctx.fillText('Use the Contribute page to add your first machine', W / 2, H / 2 + 14)
         } else {
-          // Constellation halos — drawn before nodes so they appear behind
-          for (const cg of constellationGroupsRef.current) {
-            if (cg.nodeIds.length < 2) continue
-            const cgSet = new Set(cg.nodeIds)
-            const members = sNodesRef.current.filter((sn) => sn.raw.some((r) => cgSet.has(r.id)))
+          // Constellation halos — only shown for source:'measured' groups (Vivaldi-confirmed
+          // pairwise RTT). groupConstellations() marks all groups 'approximated', so halosRef
+          // is currently empty and no halo is drawn. When the server agent lands constellation
+          // data, it will arrive here as source:'measured' and halos will appear.
+          // Draw loop is O(halos × members) index lookups — no per-frame allocation.
+          for (const halo of halosRef.current) {
+            const members = halo.memberIndices.map((i) => sNodesRef.current[i]).filter(Boolean)
             if (members.length < 2) continue
             const hcx = members.reduce((s, n) => s + n.x, 0) / members.length
             const hcy = members.reduce((s, n) => s + n.y, 0) / members.length
@@ -523,7 +536,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
           ctx.font = '11px sans-serif'; ctx.fillStyle = 'rgba(100,116,139,0.55)'
           ctx.textAlign = 'left'; ctx.textBaseline = 'top'
           ctx.fillText(
-            `Topology view (${aggregateRef.current.mode}) · positions are synthetic`,
+            `Topology view (${aggregateRef.current.mode}) · positions synthetic · latency bands are RTT approximations`,
             14, 10,
           )
         }
@@ -753,6 +766,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
                   </div>
                   <p className="mt-2 text-xs text-slate-500/70">
                     Classes are calibrated projections from latency, uptime, and bandwidth.
+                    Latency is node→control-plane only — inter-node RTT is not measured.
                   </p>
                 </div>
               )}

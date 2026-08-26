@@ -324,6 +324,11 @@ export type NodeClass = 'anchor' | 'relay' | 'constellation' | 'drifter'
  * A latency neighbourhood: nodes whose control-plane RTT falls within a 25-ms
  * bucket. Used as a geographic-proximity proxy — MeshPool has no geoIP.
  * Any capacity figure derived from this grouping is a 'calibrated projection'.
+ * `source: 'approximated'` — the RTT is node→control-plane only; pairwise
+ * inter-node latency is not measured. The scheduler uses Vivaldi coordinates
+ * for confirmed constellations; until that data reaches the client, groups from
+ * `groupConstellations()` are an approximation and must not be labelled as
+ * measured pairwise neighbourhoods.
  */
 export interface ConstellationGroup {
   id: string
@@ -332,4 +337,5 @@ export interface ConstellationGroup {
   totalCompute: number
   onlineCount: number
   label: string
+  source: 'measured' | 'approximated'
 }

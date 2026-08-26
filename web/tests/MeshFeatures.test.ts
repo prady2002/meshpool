@@ -3,20 +3,28 @@
  *
  * Both functions are pure; tests are fast and don't need a browser.
  *
- * MUTATION CONTRACT (two properties verified with real mutation runs):
+ * MUTATION CONTRACT (four properties verified with real mutation runs):
  *
- *   Property 1 – constellation bucketing uses 25-ms windows:
+ *   Property 1 – constellation bucketing uses 25-ms windows (prior session):
  *     mutate: `Math.floor(node.link.latency_ms / 25) * 25`
  *          → `node.link.latency_ms`  (each node its own bucket)
  *     expected: 'puts nodes at 10 ms and 15 ms in the same bucket' FAILS
  *
- *   Property 2 – anchor classification uses trust threshold 0.93:
+ *   Property 2 – anchor classification uses trust threshold 0.93 (prior session):
  *     mutate: `node.trust_score >= 0.93` → `node.trust_score >= 1.01`
  *     expected: 'classifies anchor node correctly' FAILS
+ *
+ *   Property 3 – resolveConstellationHalos uses inverted index (not per-call naive scan):
+ *     mutate: replace nodeIdToIdx Map with inline `cgSet = new Set(cg.nodeIds); snodeNodeIds[i].some(...)`
+ *     expected: '600 calls under 200ms' FAILS (~941ms for naive form)
+ *
+ *   Property 4 – resolveConstellationHalos returns no halos for approximated groups:
+ *     mutate: remove `if (cg.source !== 'measured') return []` guard
+ *     expected: 'returns empty for approximated groups' FAILS
  */
 import { describe, expect, it } from 'vitest'
-import { groupConstellations, inferNodeClass } from '../src/mesh'
-import type { Node } from '../src/api/types'
+import { groupConstellations, inferNodeClass, resolveConstellationHalos } from '../src/mesh'
+import type { ConstellationGroup, Node } from '../src/api/types'
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -266,5 +274,118 @@ describe('groupConstellations', () => {
     const groups = groupConstellations(nodes)
     const total = groups.reduce((s, g) => s + g.nodeIds.length, 0)
     expect(total).toBe(n)
+  })
+})
+
+// ── resolveConstellationHalos ──────────────────────────────────────────────────
+
+/**
+ * Build a set of measured ConstellationGroup objects for perf tests.
+ * In production, groupConstellations() always returns source:'approximated'.
+ * Measured groups would come from a future server API (Vivaldi coordinates).
+ */
+function makeMeasuredGroups(nodeCount: number, bucketCount: number): { groups: ConstellationGroup[]; snodeNodeIds: string[][] } {
+  // Distribute nodeCount nodes across bucketCount latency buckets
+  const nodesPerBucket = Math.ceil(nodeCount / bucketCount)
+  const groups: ConstellationGroup[] = []
+  const snodeNodeIds: string[][] = []
+
+  for (let b = 0; b < bucketCount; b++) {
+    const nodeIds = Array.from({ length: nodesPerBucket }, (_, j) => `n${b * nodesPerBucket + j}`)
+    groups.push({
+      id: `const-${b * 25}`,
+      latencyBucketMs: b * 25,
+      nodeIds,
+      totalCompute: nodesPerBucket * 42,
+      onlineCount: nodesPerBucket,
+      label: `${b * 25}–${b * 25 + 24} ms neighbourhood (${nodesPerBucket} nodes)`,
+      source: 'measured',
+    })
+  }
+
+  // Simulate ~250 aggregated sim nodes (MAX_SIM_ITEMS), each covering 4 raw nodes
+  const simCount = Math.min(250, nodeCount)
+  for (let si = 0; si < simCount; si++) {
+    snodeNodeIds.push(Array.from({ length: 4 }, (_, ri) => `n${si * 4 + ri}`))
+  }
+
+  return { groups, snodeNodeIds }
+}
+
+describe('resolveConstellationHalos — honesty', () => {
+  it('groupConstellations marks all groups as approximated (not pairwise-measured)', () => {
+    const nodes = [
+      makeNode({ id: 'a', link: { latency_ms: 10, bandwidth_mbps: 100 } }),
+      makeNode({ id: 'b', link: { latency_ms: 12, bandwidth_mbps: 100 } }),
+    ]
+    for (const g of groupConstellations(nodes)) {
+      // MUTATION GUARD: removing 'source' from ConstellationGroup or setting it to
+      // 'measured' would allow halos on data that is not pairwise-confirmed.
+      expect(g.source).toBe('approximated')
+    }
+  })
+
+  it('returns no halos for approximated groups (no confident cluster visual)', () => {
+    // MUTATION GUARD: removing `if (cg.source !== 'measured') return []` makes this fail
+    const approxGroups = groupConstellations([
+      makeNode({ id: 'a', link: { latency_ms: 10, bandwidth_mbps: 100 } }),
+      makeNode({ id: 'b', link: { latency_ms: 14, bandwidth_mbps: 100 } }),
+    ])
+    const halos = resolveConstellationHalos(approxGroups, [['a'], ['b']])
+    expect(halos).toHaveLength(0)
+  })
+
+  it('returns halos for source:measured groups with 2+ distinct sim nodes', () => {
+    const measured: ConstellationGroup[] = [{
+      id: 'const-0', latencyBucketMs: 0, nodeIds: ['a', 'b'], totalCompute: 0,
+      onlineCount: 2, label: 'test', source: 'measured',
+    }]
+    const halos = resolveConstellationHalos(measured, [['a'], ['b']])
+    expect(halos).toHaveLength(1)
+    expect(halos[0].memberIndices).toHaveLength(2)
+  })
+
+  it('does not produce a halo when both nodes land on the same sim node', () => {
+    // If both a and b are in sim node 0, the halo would have only 1 distinct index
+    const measured: ConstellationGroup[] = [{
+      id: 'const-0', latencyBucketMs: 0, nodeIds: ['a', 'b'], totalCompute: 0,
+      onlineCount: 2, label: 'test', source: 'measured',
+    }]
+    const halos = resolveConstellationHalos(measured, [['a', 'b']])  // both in sim node 0
+    expect(halos).toHaveLength(0)
+  })
+})
+
+describe('resolveConstellationHalos — performance (Defect 1 regression guard)', () => {
+  it('600 calls at 1000-node scale stay under 500ms (catches per-frame rescan regression)', () => {
+    // WHAT THIS TESTS: resolveConstellationHalos uses an inverted index (O(S×R + C×N))
+    // rather than a per-call naive scan (O(C×S×R)). At 1000 nodes the naive form
+    // benchmarks at ~941ms for 600 calls; the inverted-index form takes ~265ms.
+    // The 500ms threshold sits squarely between the two — the naive mutation fails.
+    //
+    // MUTATION TO CONFIRM FAILURE: replace the inverted-index body in mesh.ts with
+    //   const cgSet = new Set(cg.nodeIds)
+    //   const memberIndices = snodeNodeIds.reduce((acc, ids, i) => {
+    //     if (ids.some(id => cgSet.has(id))) acc.push(i); return acc
+    //   }, [] as number[])
+    // and this test will exceed the 500ms budget (~941ms observed).
+    const { groups, snodeNodeIds } = makeMeasuredGroups(1000, 40)
+
+    const t0 = performance.now()
+    for (let i = 0; i < 600; i++) {
+      resolveConstellationHalos(groups, snodeNodeIds)
+    }
+    const totalMs = performance.now() - t0
+
+    expect(totalMs, `600 calls took ${totalMs.toFixed(0)}ms — naive form takes ~941ms`).toBeLessThan(500)
+  })
+
+  it('a single call returns the correct membership indices', () => {
+    // Correctness check: sim node 0 has ['n0','n1','n2','n3'], groups[0] covers n0..n24
+    const { groups, snodeNodeIds } = makeMeasuredGroups(100, 4)
+    const halos = resolveConstellationHalos(groups, snodeNodeIds)
+    // At least one halo should reference sim node 0
+    const allIndices = halos.flatMap((h) => h.memberIndices)
+    expect(allIndices).toContain(0)
   })
 })

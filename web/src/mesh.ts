@@ -118,5 +118,51 @@ export function groupConstellations(nodes: Node[]): ConstellationGroup[] {
     label: members.length === 1
       ? members[0].name
       : `${bucket}–${bucket + 24} ms neighbourhood (${members.length} nodes)`,
+    // link.latency_ms is node→control-plane RTT, not pairwise inter-node RTT.
+    // Two nodes both 30 ms from the CP can be on opposite sides of the planet.
+    // Mark every group as approximated until the server provides Vivaldi-based
+    // pairwise measurements.
+    source: 'approximated' as const,
   }))
+}
+
+/**
+ * Map constellation groups to the indices of simulated nodes that contain their
+ * members. Must be called **once** when the node set changes (in a React effect),
+ * NOT every animation frame.
+ *
+ * Only `source:'measured'` groups produce halos — approximated groups (RTT from
+ * a common control-plane, not pairwise inter-node) must not be rendered as
+ * confident cluster boundaries. The result is consumed by the RAF draw loop as
+ * pure O(halos × members) index lookups; no per-frame allocation.
+ *
+ * Complexity: O(S×R + C×N)
+ *   S = simulated nodes, R = avg raw nodes per sim item,
+ *   C = constellation groups, N = avg nodeIds per group
+ * vs. naive scan O(C×S×R) — about 33× slower at 1000-node scale.
+ */
+export function resolveConstellationHalos(
+  constellations: ConstellationGroup[],
+  snodeNodeIds: string[][],   // snodeNodeIds[i] = raw nodeIds belonging to simulated node i
+): Array<{ constellationId: string; memberIndices: number[] }> {
+  // Inverted index: raw nodeId → simulated-node index. O(S×R) to build.
+  const nodeIdToIdx = new Map<string, number>()
+  for (let i = 0; i < snodeNodeIds.length; i++) {
+    for (const id of snodeNodeIds[i]) nodeIdToIdx.set(id, i)
+  }
+
+  return constellations.flatMap((cg) => {
+    // MUTATION GUARD: changing this condition to `cg.source !== 'measured'` (i.e., keeping
+    // approximated groups) is the honesty defect. Tests assert halos.length === 0 for
+    // approximated source, so this guard must stay.
+    if (cg.source !== 'measured') return []
+
+    const seenIdx = new Set<number>()
+    for (const nodeId of cg.nodeIds) {
+      const idx = nodeIdToIdx.get(nodeId)
+      if (idx !== undefined) seenIdx.add(idx)
+    }
+    const memberIndices = [...seenIdx]
+    return memberIndices.length >= 2 ? [{ constellationId: cg.id, memberIndices }] : []
+  })
 }
