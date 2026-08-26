@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { apiClient } from '../api/client'
 import type { SpendCapStatus, WalletResponse } from '../api/types'
+import { Metric } from '../components/ui'
 
 export function AccountPage() {
   const [wallet, setWallet] = useState<WalletResponse | null>(null)
@@ -29,20 +30,22 @@ export function AccountPage() {
         <h2 className="mt-2 text-3xl font-semibold">Usage, spend caps, and API keys (capability tokens)</h2>
       </div>
       <div className="grid gap-4 md:grid-cols-3">
-        <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75"><p className="text-sm text-slate-500 dark:text-slate-400">Current balance</p><p className="mt-2 text-3xl font-semibold">{typeof wallet?.balance === 'number' ? wallet.balance.toFixed(1) : '—'}</p></div>
-        <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75"><p className="text-sm text-slate-500 dark:text-slate-400">Spend this month</p><p className="mt-2 text-3xl font-semibold">{typeof wallet?.consumed === 'number' ? wallet.consumed.toFixed(1) : '—'}</p></div>
+        <Metric label="Current balance" value={typeof wallet?.balance === 'number' ? wallet.balance.toFixed(1) : '—'} unit="credits" tier="measured" className="rounded-[28px] bg-white/90 dark:bg-slate-950/75" />
+        <Metric label="Spend this month" value={typeof wallet?.consumed === 'number' ? wallet.consumed.toFixed(1) : '—'} unit="credits" tier="measured" className="rounded-[28px] bg-white/90 dark:bg-slate-950/75" />
         <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75">
-          <p className="text-sm text-slate-500 dark:text-slate-400">Hard spend cap</p>
-          <p className="mt-2 text-3xl font-semibold">{cap?.enforced && typeof cap.cap === 'number' ? cap.cap.toFixed(1) : '—'}</p>
+          <Metric label="Hard spend cap" value={cap?.enforced && typeof cap.cap === 'number' ? cap.cap.toFixed(1) : '—'} unit={cap?.enforced ? 'credits' : undefined} tier="measured" className="border-0 bg-transparent p-0 shadow-none" />
           {cap?.enforced ? (
             <p className={`mt-1 text-xs ${cap.exceeded ? 'text-rose-500' : 'text-slate-500 dark:text-slate-400'}`}>
               {cap.exceeded
                 ? 'Cap reached — work is stopped, not just flagged.'
-                : `${(cap.remaining ?? 0).toFixed(1)} remaining · stops work when reached.`}
+                : 'Stops work when reached.'}
             </p>
           ) : (
             <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">No cap set — spending is unlimited.</p>
           )}
+          {cap?.enforced && !cap.exceeded ? (
+            <Metric label="Remaining cap" value={(cap.remaining ?? 0).toFixed(1)} unit="remaining credits" tier="measured" density="compact" className="mt-3" />
+          ) : null}
           <div className="mt-3 flex gap-2">
             <input
               value={capDraft}

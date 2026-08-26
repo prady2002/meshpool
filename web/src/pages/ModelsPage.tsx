@@ -49,7 +49,7 @@ export function ModelsPage() {
                 <p className="text-sm text-[var(--color-muted)]">{model.backend}</p>
                 <h3 className="text-xl font-semibold">{model.model}</h3>
               </div>
-              <Metric label="Tokens/sec" value={model.tokens_per_sec != null ? model.tokens_per_sec.toFixed(1) : '—'} tier="measured" />
+              <Metric label="Tokens/sec" value={model.tokens_per_sec != null ? model.tokens_per_sec.toFixed(1) : '—'} unit="tok/s" tier="measured" />
             </div>
             <div className="mt-5 flex gap-3 overflow-x-auto pb-2">
               {model.partition.map((slice) => (

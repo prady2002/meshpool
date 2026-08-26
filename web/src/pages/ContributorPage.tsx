@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { apiClient } from '../api/client'
 import type { LedgerResponse, Node, OnboardingResponse, WalletResponse } from '../api/types'
 import { NodeCard } from '../components/NodeCard'
+import { Metric } from '../components/ui'
 
 export function ContributorPage() {
   const [wallet, setWallet] = useState<WalletResponse | null>(null)
@@ -21,10 +22,10 @@ export function ContributorPage() {
   return (
     <section className="space-y-6">
       <div className="grid gap-4 xl:grid-cols-4">
-        <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75"><p className="text-sm text-slate-500 dark:text-slate-400">Balance</p><p className="mt-2 text-3xl font-semibold">{wallet ? `${wallet.balance.toFixed(1)} credits` : '—'}</p></div>
-        <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75"><p className="text-sm text-slate-500 dark:text-slate-400">Donated</p><p className="mt-2 text-3xl font-semibold">{wallet ? wallet.donated.toFixed(1) : '—'}</p></div>
-        <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75"><p className="text-sm text-slate-500 dark:text-slate-400">Consumed</p><p className="mt-2 text-3xl font-semibold">{wallet ? wallet.consumed.toFixed(1) : '—'}</p></div>
-        <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75"><p className="text-sm text-slate-500 dark:text-slate-400">Reputation</p><p className="mt-2 text-3xl font-semibold">{wallet ? `${Math.round(wallet.reputation * 100)}%` : '—'}</p></div>
+        <Metric label="Balance" value={wallet ? wallet.balance.toFixed(1) : '—'} unit="credits" tier="measured" className="rounded-[28px] bg-white/90 dark:bg-slate-950/75" />
+        <Metric label="Donated" value={wallet ? wallet.donated.toFixed(1) : '—'} unit="credits" tier="measured" className="rounded-[28px] bg-white/90 dark:bg-slate-950/75" />
+        <Metric label="Consumed" value={wallet ? wallet.consumed.toFixed(1) : '—'} unit="credits" tier="measured" className="rounded-[28px] bg-white/90 dark:bg-slate-950/75" />
+        <Metric label="Reputation" value={wallet ? Math.round(wallet.reputation * 100) : '—'} unit="%" tier="measured" className="rounded-[28px] bg-white/90 dark:bg-slate-950/75" />
       </div>
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.15fr)_360px]">
         <div className="space-y-4">

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { apiClient } from '../api/client'
 import type { JobTimeline, TimelineEvent } from '../api/types'
+import { Metric } from '../components/ui'
 
 function fmtTime(ms: number | null) {
   if (ms == null) return 'running'
@@ -59,8 +60,10 @@ export function JobTimelinePage() {
             {timeline.job_id} · trace {timeline.trace_id.slice(0, 12)}… · {timeline.status} · {fmtDuration(timeline.duration_ms)}
           </p>
         </div>
-        <div className="rounded-2xl bg-slate-900 px-4 py-3 text-sm text-slate-200">
-          {timeline.events.length} events · {timeline.lanes.length} lanes
+        <div className="grid gap-2 sm:grid-cols-3">
+          <Metric label="Duration" value={fmtDuration(timeline.duration_ms)} tier="measured" density="compact" />
+          <Metric label="Events" value={timeline.events.length} tier="measured" density="compact" />
+          <Metric label="Lanes" value={timeline.lanes.length} tier="measured" density="compact" />
         </div>
       </div>
 

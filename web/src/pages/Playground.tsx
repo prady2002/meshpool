@@ -6,6 +6,7 @@ import type { ModelDeployment, Node } from '../api/types'
 import { ChatMessage } from '../components/ChatMessage'
 import { NodeCard } from '../components/NodeCard'
 import { Skeleton } from '../components/Skeleton'
+import { Metric } from '../components/ui'
 import { useChat } from '../hooks/useChat'
 
 export function Playground() {
@@ -56,13 +57,13 @@ export function Playground() {
             )}
           </label>
           <div className="rounded-3xl border border-slate-200 p-4 dark:border-slate-800">
-            <div className="flex justify-between text-sm text-slate-500 dark:text-slate-400"><span>Temperature</span><span>{temperature[0].toFixed(1)}</span></div>
+            <Metric label="Temperature setting" value={temperature[0].toFixed(1)} tier="measured" density="compact" className="border-0 bg-transparent p-0" />
             <Slider.Root value={temperature} min={0} max={1} step={0.1} onValueChange={setTemperature} className="mt-5 flex h-5 items-center">
               <Slider.Track className="relative h-2 grow rounded-full bg-slate-800"><Slider.Range className="absolute h-full rounded-full bg-indigo-500" /></Slider.Track><Slider.Thumb className="block h-5 w-5 rounded-full bg-white shadow" />
             </Slider.Root>
           </div>
           <div className="rounded-3xl border border-slate-200 p-4 dark:border-slate-800">
-            <div className="flex justify-between text-sm text-slate-500 dark:text-slate-400"><span>Max tokens</span><span>{maxTokens[0]}</span></div>
+            <Metric label="Max tokens setting" value={maxTokens[0]} tier="measured" density="compact" className="border-0 bg-transparent p-0" />
             <Slider.Root value={maxTokens} min={64} max={1024} step={32} onValueChange={setMaxTokens} className="mt-5 flex h-5 items-center">
               <Slider.Track className="relative h-2 grow rounded-full bg-slate-800"><Slider.Range className="absolute h-full rounded-full bg-violet-500" /></Slider.Track><Slider.Thumb className="block h-5 w-5 rounded-full bg-white shadow" />
             </Slider.Root>

@@ -2,6 +2,7 @@
 import { Link } from 'react-router-dom'
 import { apiClient } from '../api/client'
 import type { BatchJob } from '../api/types'
+import { Metric } from '../components/ui'
 import { ProgressBar } from '../components/ProgressBar'
 
 export function JobsPage() {
@@ -31,7 +32,7 @@ export function JobsPage() {
                   <h3 className="text-xl font-semibold">{job.name}</h3>
                   <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{job.status} · {job.progress.total} total tasks</p>
                 </div>
-                <div className="rounded-2xl bg-slate-900 px-3 py-2 text-sm text-slate-200">{percent}% complete</div>
+                <Metric label="Complete" value={percent} unit="%" tier="measured" density="compact" />
               </div>
               <div className="mt-5"><ProgressBar value={percent} /></div>
               <div className="mt-5 grid gap-3 md:grid-cols-5">

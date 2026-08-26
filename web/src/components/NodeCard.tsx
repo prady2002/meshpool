@@ -1,6 +1,6 @@
 ﻿import type { Node } from '../api/types'
-import { formatNumber } from '../utils'
 import { StatusBadge } from './StatusBadge'
+import { Metric } from './ui'
 
 export function NodeCard({ node, active }: { node: Node; active?: boolean }) {
   return (
@@ -12,12 +12,12 @@ export function NodeCard({ node, active }: { node: Node; active?: boolean }) {
         </div>
         <StatusBadge status={node.status} />
       </div>
-      <dl className="mt-4 grid grid-cols-2 gap-3 text-sm text-slate-300">
-        <div><dt className="text-slate-500">CPU</dt><dd>{node.capability.cpu_cores} cores</dd></div>
-        <div><dt className="text-slate-500">RAM</dt><dd>{formatNumber(node.capability.ram_mb / 1024, 1)} GB</dd></div>
-        <div><dt className="text-slate-500">Load</dt><dd>{node.load.cpu_load_pct}%</dd></div>
-        <div><dt className="text-slate-500">Trust</dt><dd>{Math.round(node.trust_score * 100)}%</dd></div>
-      </dl>
+      <div className="mt-4 grid grid-cols-2 gap-3">
+        <Metric label="CPU" value={node.capability.cpu_cores} unit="cores" tier="measured" density="compact" />
+        <Metric label="RAM" value={(node.capability.ram_mb / 1024).toFixed(1)} unit="GB" tier="measured" density="compact" />
+        <Metric label="Load" value={node.load.cpu_load_pct} unit="%" tier="measured" density="compact" />
+        <Metric label="Trust" value={Math.round(node.trust_score * 100)} unit="%" tier="measured" density="compact" />
+      </div>
     </article>
   )
 }

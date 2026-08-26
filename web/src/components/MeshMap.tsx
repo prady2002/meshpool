@@ -1,6 +1,7 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { BatchJob, ModelDeployment, Node, NodeStatus } from '../api/types'
 import { aggregateNodes } from '../mesh'
+import { Metric } from './ui'
 
 // ── canvas dimensions ──────────────────────────────────────────────────────────
 const W = 1000
@@ -49,7 +50,7 @@ interface Particle {
  * the page janky purely from layout. The caption states plainly how many rows
  * are hidden rather than pretending the list is complete.
  */
-const TABLE_ROW_LIMIT = 250
+const TABLE_ROW_LIMIT = 80
 
 // ── physics helpers ────────────────────────────────────────────────────────────
 
@@ -447,9 +448,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
             ))}
           </div>
           {activeNodeIds.size > 0 && (
-            <span className="pointer-events-none absolute right-3 top-3 rounded-full bg-indigo-500/20 px-2.5 py-1 text-xs font-medium text-indigo-300">
-              ⟳ {activeNodeIds.size} node{activeNodeIds.size !== 1 ? 's' : ''} running work
-            </span>
+            <Metric label="Nodes running work" value={activeNodeIds.size} tier="measured" density="compact" className="pointer-events-none absolute right-3 top-3 border-indigo-500/30 bg-indigo-500/20 text-indigo-300" />
           )}
         </div>
 
@@ -478,22 +477,16 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
                   {selectedNode.status}
                 </span>
               </div>
-              <dl className="space-y-2 text-sm">
-                {[
-                  ['CPU', `${selectedNode.capability.cpu_cores} cores · ${selectedNode.capability.cpu_arch} · ${selectedNode.load.cpu_load_pct}% load`],
-                  ['RAM', `${selectedNode.load.ram_used_mb} / ${selectedNode.capability.ram_mb} MB`],
-                  ['GPU', selectedNode.capability.gpu ? `Yes · ${selectedNode.capability.vram_mb} MB VRAM` : 'No'],
-                  ['Trust', `${Math.round(selectedNode.trust_score * 100)}%`],
-                  ['Running units', `${selectedNode.load.running_units}`],
-                  ['Latency', `${selectedNode.link.latency_ms} ms`],
-                  ['Bandwidth', `${selectedNode.link.bandwidth_mbps} Mbps`],
-                ].map(([label, value]) => (
-                  <div key={label} className="flex justify-between gap-2">
-                    <dt className="text-slate-500">{label}</dt>
-                    <dd className="text-right text-slate-200">{value}</dd>
-                  </div>
-                ))}
-              </dl>
+              <div className="grid grid-cols-2 gap-2">
+                <Metric label="CPU cores" value={selectedNode.capability.cpu_cores} unit={selectedNode.capability.cpu_arch} tier="measured" density="compact" />
+                <Metric label="CPU load" value={selectedNode.load.cpu_load_pct} unit="%" tier="measured" density="compact" />
+                <Metric label="RAM used" value={`${selectedNode.load.ram_used_mb}/${selectedNode.capability.ram_mb}`} unit="MB" tier="measured" density="compact" />
+                <Metric label="GPU VRAM" value={selectedNode.capability.gpu ? selectedNode.capability.vram_mb : '—'} unit={selectedNode.capability.gpu ? 'MB' : undefined} tier="measured" density="compact" />
+                <Metric label="Trust" value={Math.round(selectedNode.trust_score * 100)} unit="%" tier="measured" density="compact" />
+                <Metric label="Running units" value={selectedNode.load.running_units} tier="measured" density="compact" />
+                <Metric label="Latency" value={selectedNode.link.latency_ms} unit="ms" tier="measured" density="compact" />
+                <Metric label="Bandwidth" value={selectedNode.link.bandwidth_mbps} unit="Mbps" tier="measured" density="compact" />
+              </div>
               {nodeModels.length > 0 && (
                 <div>
                   <p className="text-xs uppercase tracking-widest text-slate-500">Model layers</p>
@@ -550,9 +543,9 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-medium text-slate-200">{m.model}</span>
                     <span className="rounded-full bg-slate-800 px-2 py-0.5 text-xs text-slate-400">{m.backend}</span>
-                    {m.tokens_per_sec != null && (
-                      <span className="text-xs text-emerald-400">{m.tokens_per_sec.toFixed(1)} tok/s</span>
-                    )}
+                    {m.tokens_per_sec != null ? (
+                      <Metric label="Tokens/sec" value={m.tokens_per_sec.toFixed(1)} unit="tok/s" tier="measured" density="compact" className="border-emerald-500/30" />
+                    ) : null}
                     <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${m.status === 'running' ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/15 text-amber-300'}`}>
                       {m.status}
                     </span>
@@ -594,9 +587,10 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
           className="rounded-2xl border border-slate-700 px-3 py-2 text-xs text-slate-400 hover:bg-slate-800">
           {showTable ? 'Hide accessible table' : 'Show as accessible table'}
         </button>
-        <p className="text-xs text-slate-600">
-          {nodes.length} node{nodes.length !== 1 ? 's' : ''} · {nodes.filter((n) => n.status === 'online').length} online
-        </p>
+        <div className="flex gap-2">
+          <Metric label="Nodes" value={nodes.length} tier="measured" density="compact" />
+          <Metric label="Online" value={nodes.filter((n) => n.status === 'online').length} tier="measured" density="compact" />
+        </div>
       </div>
 
       {/* ── accessible table (sr-only until toggled; always in DOM for
@@ -640,12 +634,12 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
                         </span>
                       </td>
                       <td className="px-4 py-3 text-slate-400">{node.capability.cpu_arch}</td>
-                      <td className="px-4 py-3 text-slate-300">{node.capability.cpu_cores}</td>
-                      <td className="px-4 py-3 text-slate-300">{node.load.cpu_load_pct}%</td>
-                      <td className="px-4 py-3 text-slate-300">{node.capability.ram_mb}</td>
-                      <td className="px-4 py-3 text-slate-400">{node.capability.gpu ? `Yes · ${node.capability.vram_mb}MB` : 'No'}</td>
-                      <td className="px-4 py-3 text-slate-300">{Math.round(node.trust_score * 100)}%</td>
-                      <td className="px-4 py-3 text-slate-300">{node.load.running_units}</td>
+                      <td className="px-4 py-3 text-slate-300"><Metric label="CPU cores" value={node.capability.cpu_cores} tier="measured" density="compact" /></td>
+                      <td className="px-4 py-3 text-slate-300"><Metric label="CPU load" value={node.load.cpu_load_pct} unit="%" tier="measured" density="compact" /></td>
+                      <td className="px-4 py-3 text-slate-300"><Metric label="RAM" value={node.capability.ram_mb} unit="MB" tier="measured" density="compact" /></td>
+                      <td className="px-4 py-3 text-slate-400">{node.capability.gpu ? <Metric label="GPU VRAM" value={node.capability.vram_mb} unit="MB" tier="measured" density="compact" /> : 'No'}</td>
+                      <td className="px-4 py-3 text-slate-300"><Metric label="Trust" value={Math.round(node.trust_score * 100)} unit="%" tier="measured" density="compact" /></td>
+                      <td className="px-4 py-3 text-slate-300"><Metric label="Running units" value={node.load.running_units} tier="measured" density="compact" /></td>
                     </tr>
                   )
                 })}

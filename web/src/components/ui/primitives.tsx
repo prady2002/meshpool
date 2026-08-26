@@ -92,7 +92,7 @@ export function Toolbar({ className, ...props }: PrimitiveProps<'div'>) {
   return <div role="toolbar" className={cn('flex flex-wrap items-center gap-2 rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-panel)] p-2', className)} {...props} />
 }
 
-export function Metric({ label, value, unit, tier, className }: { label: string; value: number | string; unit?: string; tier: MetricTier; className?: string }) {
+export function Metric({ label, value, unit, tier, density = 'regular', className }: { label: string; value: number | string; unit?: string; tier: MetricTier; density?: 'regular' | 'compact'; className?: string }) {
   if (tier == null) throw new Error('Metric requires a measurement tier label')
-  return <div className={cn('rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface)] p-4', className)}><p className="text-xs font-medium uppercase tracking-[0.16em] text-[var(--color-muted)]">{label}</p><p className="mt-2 text-2xl font-semibold text-[var(--color-text)]">{value}{unit ? <span className="ml-1 text-sm text-[var(--color-muted)]">{unit}</span> : null}</p><p className="mt-1 text-xs text-[var(--color-muted)]">{tier}</p></div>
+  return <div className={cn('rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface)]', density === 'compact' ? 'p-2' : 'p-4', className)}><p className={cn('font-medium uppercase tracking-[0.16em] text-[var(--color-muted)]', density === 'compact' ? 'text-[10px]' : 'text-xs')}>{label}</p><p className={cn('font-semibold text-[var(--color-text)]', density === 'compact' ? 'mt-1 text-sm' : 'mt-2 text-2xl')}><span>{value}</span>{unit ? <span> {unit}</span> : null}</p>{unit ? <span aria-hidden="true" className="sr-only">{value} {unit}</span> : null}<p className="mt-1 text-[10px] text-[var(--color-muted)]">{tier}</p></div>
 }
