@@ -284,6 +284,16 @@ class Harness:
         else:
             self.stall_ms[idx] = ms
 
+    def set_corrupt_blobs(self, idx: int, on: Optional[bool]) -> None:
+        """Make agent ``idx`` serve wrong bytes for content-addressed blobs.
+
+        Raises on refusal for the same reason set_stall does: an integrity test with
+        no dishonest peer in it passes trivially and proves nothing.
+        """
+        url = f"http://{self.host}:{self.agent_ports[idx]}/fault/corrupt_blobs"
+        r = httpx.post(url, json={"on": on}, timeout=10)
+        r.raise_for_status()
+
     def stop_agent(self, idx: int, fast: bool = False) -> None:
         """Stop agent ``idx``. ``fast=True`` returns in microseconds (see _kill_now)."""
         (_kill_now if fast else _kill_tree)(self.agent_procs[idx])

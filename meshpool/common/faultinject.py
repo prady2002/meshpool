@@ -52,6 +52,9 @@ log = logging.getLogger("meshpool.faultinject")
 # "fall back to the environment variable".
 _runtime_stall_ms: "Optional[float]" = None
 
+# Set only through set_corrupt_blobs(). None means "fall back to the environment".
+_runtime_corrupt_blobs: "Optional[bool]" = None
+
 
 def _opt_in() -> bool:
     """True if this process is allowed to use fault injection at all."""
@@ -90,6 +93,11 @@ class FaultProfile:
     stall_seconds: float = 0.0
     # Report a fabricated (inflated) capability / FLOPS figure.
     lie_capability: bool = False
+    # Serve well-formed but WRONG bytes for a content-addressed blob. Distinct from
+    # corrupt_results: the node stays healthy, the response parses, and only the
+    # content hash reveals the lie -- which is the exact attack content addressing
+    # is supposed to defeat, and therefore the only honest way to test it.
+    corrupt_blobs: bool = False
 
     @property
     def any_active(self) -> bool:
@@ -98,6 +106,7 @@ class FaultProfile:
             or self.drop_work
             or self.stall_seconds > 0
             or self.lie_capability
+            or self.corrupt_blobs
         )
 
 
@@ -114,7 +123,49 @@ def active_profile() -> FaultProfile:
         return FaultProfile()
 
     lie = os.environ.get("MESHPOOL_LIE", "").strip().lower() in ("1", "true", "yes", "on")
-    return FaultProfile(corrupt_results=lie, stall_seconds=_stall_seconds())
+    return FaultProfile(corrupt_results=lie, stall_seconds=_stall_seconds(),
+                        corrupt_blobs=_corrupt_blobs_active())
+
+
+def _corrupt_blobs_active() -> bool:
+    if _runtime_corrupt_blobs is not None:
+        return _runtime_corrupt_blobs
+    return os.environ.get("MESHPOOL_CORRUPT_BLOBS", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def set_corrupt_blobs(on: Optional[bool]) -> bool:
+    """Make this node serve wrong bytes for content-addressed blobs (None = clear).
+
+    Returns False when not opted in, for the same reason set_stall_ms does: a
+    scenario that believes it planted a dishonest peer, and did not, reports a
+    passing integrity test that never had anything dishonest in it.
+    """
+    global _runtime_corrupt_blobs
+    if not _opt_in():
+        log.warning("refusing to enable blob corruption: fault injection is not enabled")
+        return False
+    _runtime_corrupt_blobs = None if on is None else bool(on)
+    log.warning("FAULT INJECTION ACTIVE - corrupt_blobs=%r "
+                "(test-only dishonest-peer emulation; never active in production)",
+                _runtime_corrupt_blobs)
+    return True
+
+
+def corrupt_bytes(raw: bytes, profile: FaultProfile | None = None) -> bytes:
+    """Return bytes that are the right *shape* but the wrong *content*.
+
+    Same length, same base64-decodability, one byte different. Anything more
+    obvious -- truncating, emptying, returning garbage -- would be caught by a
+    length or parse check and would let a puller that never hashes anything pass.
+    """
+    p = profile if profile is not None else active_profile()
+    if not p.corrupt_blobs or not raw:
+        return raw
+    log.warning("FAULT INJECTION ACTIVE - corrupt_blobs: serving %d WRONG bytes "
+                "(test-only dishonest-peer emulation; never active in production)",
+                len(raw))
+    return bytes([raw[0] ^ 0xFF]) + raw[1:]
 
 
 def _stall_seconds() -> float:

@@ -32,8 +32,8 @@ from ..common.models import (
 from ..common.identity import enrollment_challenge
 from .donation import DonationController
 from .probe import measure_link, network_class_from_link, probe_capability
-from ..common.faultinject import (active_profile, corrupt_result, set_stall_ms,
-                                  stall)
+from ..common.faultinject import (active_profile, corrupt_bytes, corrupt_result,
+                                  set_corrupt_blobs, set_stall_ms, stall)
 from .runtime import ProcessRuntime, free_port, start_app_process, LogBuffer
 from ..inference import model as M
 from ..inference.pipeline import CachedShard
@@ -715,6 +715,7 @@ async def blob_get(req: BlobRequest) -> dict:
     data = state.blobs.get(req.blob_id)
     if data is None:
         return {"blob_id": req.blob_id, "found": False, "data": ""}
+    data = corrupt_bytes(data)   # no-op unless this node is a test-only dishonest peer
     return {"blob_id": req.blob_id, "found": True,
             "data": base64.b64encode(data).decode("ascii")}
 
@@ -926,6 +927,27 @@ async def fault_stall(req: StallRequest) -> dict:
             status_code=403,
             detail="fault injection is not enabled on this node")
     return {"ok": True, "stall_ms": req.ms}
+
+
+class CorruptBlobsRequest(BaseModel):
+    on: Optional[bool] = None
+
+
+@app.post("/fault/corrupt_blobs")
+async def fault_corrupt_blobs(req: CorruptBlobsRequest) -> dict:
+    """Make this node a dishonest weight source. Test-only, same opt-in as above.
+
+    The node keeps answering /blob_get with a well-formed 200 carrying valid base64
+    of exactly the right length -- only the content is wrong. That is deliberate: a
+    peer that returns an error, an empty body or the wrong number of bytes is caught
+    by checks that prove nothing about content addressing. Only a puller that
+    actually hashes what it received can catch this one.
+    """
+    if not set_corrupt_blobs(req.on):
+        raise HTTPException(
+            status_code=403,
+            detail="fault injection is not enabled on this node")
+    return {"ok": True, "corrupt_blobs": req.on}
 
 
 @app.post("/shard/forward")

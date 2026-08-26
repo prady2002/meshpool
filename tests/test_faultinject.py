@@ -129,3 +129,76 @@ class TestCorruptResult:
             assert abs(result - expected) < 1e-9
         else:
             assert result == expected
+
+
+class TestDishonestPeerEmulation:
+    """The dishonest-peer fault is the one that must never fire in production.
+
+    Every other fault is loud: a killed node is gone, a stalled node is slow. A node
+    that serves subtly wrong weight bytes is silent -- the model loads and answers
+    fluently and is simply wrong -- so the guards on this one carry more weight than
+    the guards on the others, and they are tested rather than assumed.
+    """
+
+    def test_inert_when_not_opted_in(self, monkeypatch):
+        """The exact production configuration: no opt-in, no env var, nothing set."""
+        monkeypatch.delenv("MESHPOOL_ALLOW_FAULT_INJECTION", raising=False)
+        monkeypatch.delenv("MESHPOOL_CORRUPT_BLOBS", raising=False)
+        monkeypatch.delenv("MESHPOOL_LIE", raising=False)
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        monkeypatch.delenv("MESHPOOL_SIM_HARNESS", raising=False)
+        importlib.reload(fi)
+        raw = b"the weights of a model somebody is paying to run"
+        assert not fi.active_profile().corrupt_blobs
+        assert fi.corrupt_bytes(raw) == raw
+
+    def test_env_var_alone_does_not_arm_it(self, monkeypatch):
+        """MESHPOOL_CORRUPT_BLOBS=1 without the opt-in gate must still be inert.
+
+        A single stray environment variable inherited from a CI job must not be able
+        to turn a production node into a poisoned-weight source.
+        """
+        monkeypatch.delenv("MESHPOOL_ALLOW_FAULT_INJECTION", raising=False)
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        monkeypatch.delenv("MESHPOOL_SIM_HARNESS", raising=False)
+        monkeypatch.setenv("MESHPOOL_CORRUPT_BLOBS", "1")
+        importlib.reload(fi)
+        raw = b"the weights of a model somebody is paying to run"
+        assert not fi._opt_in()
+        assert not fi.active_profile().corrupt_blobs
+        assert fi.corrupt_bytes(raw) == raw
+
+    def test_setter_refuses_without_optin(self, monkeypatch):
+        monkeypatch.delenv("MESHPOOL_ALLOW_FAULT_INJECTION", raising=False)
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        monkeypatch.delenv("MESHPOOL_SIM_HARNESS", raising=False)
+        importlib.reload(fi)
+        assert fi.set_corrupt_blobs(True) is False
+        assert fi.corrupt_bytes(b"abc") == b"abc"
+
+    def test_corruption_is_shaped_to_defeat_everything_but_a_hash(self):
+        """Same length, still valid base64, exactly one byte wrong.
+
+        If the fault truncated or emptied the payload, a puller that checked only the
+        length would pass the integrity gate without ever hashing anything -- so the
+        gate would prove nothing about content addressing. The shape of the lie is
+        what makes the test meaningful.
+        """
+        import base64
+        import hashlib
+        raw = bytes(range(256)) * 8
+        bad = fi.corrupt_bytes(raw, fi.FaultProfile(corrupt_blobs=True))
+        assert len(bad) == len(raw), "a length check must not be able to catch it"
+        assert bad != raw
+        assert sum(a != b for a, b in zip(raw, bad)) == 1, "exactly one byte differs"
+        assert hashlib.sha256(bad).hexdigest() != hashlib.sha256(raw).hexdigest()
+        assert base64.b64decode(base64.b64encode(bad), validate=True) == bad
+
+    def test_empty_payload_is_left_alone(self):
+        """Nothing to corrupt, and returning junk for an empty blob would be a
+        different bug wearing this fault's clothes."""
+        assert fi.corrupt_bytes(b"", fi.FaultProfile(corrupt_blobs=True)) == b""
+
+    def test_any_active_reports_it(self):
+        assert fi.FaultProfile(corrupt_blobs=True).any_active
+        assert not fi.FaultProfile().any_active

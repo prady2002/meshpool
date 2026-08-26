@@ -46,6 +46,7 @@ The fault injector exists solely to emulate a **dishonest node** in the Tier-2 t
 | `corrupt_results` | Deterministically mutates the work-unit result (bool flipped, int/float +1, string appended "X", list head-dropped, dict values mutated) |
 | `drop_work` | (API surface; not yet wired up) Silently ignore a work unit |
 | `stall_seconds` | Delays every inference shard hop by a fixed amount, turning a healthy node into a straggler. Settable at startup via `MESHPOOL_STALL_MS`, or at runtime via `POST /fault/stall` on the agent (403 unless fault injection is opted in). Drives `verify_straggler_tolerance.py` |
+| `corrupt_blobs` | Turns a node into a **dishonest peer**: every content-addressed blob it serves comes back with one byte flipped. Deliberately the *hardest* lie to catch — same length, still valid base64 — so only a digest check rejects it, and a puller that checks anything cheaper fails the gate. Settable at runtime via `POST /fault/corrupt_blobs` on the agent (403 unless fault injection is opted in). Drives `verify_weight_swarm_coldstart.py` |
 | `lie_capability` | (API surface; not yet wired up) Advertise false hardware specs |
 
 ### How to enable in tests / the sim harness
