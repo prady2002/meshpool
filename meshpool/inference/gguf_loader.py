@@ -51,6 +51,29 @@ _LAYER_MAP: tuple[tuple[str, str, bool], ...] = (
     ("ffn_down.weight", "mlp.Wdown", True),
 )
 
+_ATTN_LAYER_MAP: tuple[tuple[str, str, bool], ...] = _LAYER_MAP[:6]
+_DENSE_FFN_MAP: tuple[tuple[str, str, bool], ...] = _LAYER_MAP[6:]
+_MOE_TENSOR_SUFFIXES: tuple[str, ...] = (
+    "ffn_gate_exps.weight",
+    "ffn_down_exps.weight",
+    "ffn_up_exps.weight",
+    "ffn_gate_inp.weight",
+    "ffn_gate_shexp.weight",
+    "ffn_down_shexp.weight",
+    "ffn_up_shexp.weight",
+    "ffn_gate_inp_shexp.weight",
+)
+_MOE_EXPERT_SUFFIXES = {"ffn_gate_exps.weight", "ffn_down_exps.weight", "ffn_up_exps.weight"}
+_MOE_LOAD_MAP: tuple[tuple[str, str, bool], ...] = (
+    ("ffn_gate_inp.weight", "mlp.Wrouter", True),
+    ("ffn_gate_exps.weight", "mlp.Wgate_exps", True),
+    ("ffn_up_exps.weight", "mlp.Wup_exps", True),
+    ("ffn_down_exps.weight", "mlp.Wdown_exps", True),
+    ("ffn_gate_shexp.weight", "mlp.Wgate_shexp", True),
+    ("ffn_up_shexp.weight", "mlp.Wup_shexp", True),
+    ("ffn_down_shexp.weight", "mlp.Wdown_shexp", True),
+)
+
 # Architectures whose GGUF files carry llama.cpp's rope permutation on Q/K.
 # These are the ones whose HuggingFace implementation uses rotate_half, which is
 # every model llama.cpp converts through the LlamaModel/Qwen2Model paths.
@@ -103,6 +126,16 @@ def unpermute_rope(w: np.ndarray, n_head: int) -> np.ndarray:
 
 
 @dataclass(frozen=True)
+class GGUFLayerMoEInfo:
+    layer: int
+    is_moe: bool
+    expert_count: int
+    expert_used_count: int
+    bytes: int
+    tensor_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class GGUFInfo:
     """What MeshPool needs to know about a checkpoint before placing it."""
 
@@ -113,6 +146,7 @@ class GGUFInfo:
     quantizations: dict[str, int]
     layer_bytes: list[int]
     total_bytes: int
+    moe_layers: tuple[GGUFLayerMoEInfo, ...] = ()
 
     @property
     def per_layer_mb(self) -> int:
@@ -137,6 +171,28 @@ def _arch(reader) -> str:
     if not arch:
         raise GGUFUnsupported("GGUF file declares no general.architecture")
     return str(arch)
+
+
+def _moe_metadata(reader, arch: str) -> dict[str, Optional[int]]:
+    return {
+        "expert_count": _field(reader, f"{arch}.expert_count"),
+        "expert_used_count": _field(reader, f"{arch}.expert_used_count"),
+        "expert_feed_forward_length": _field(reader, f"{arch}.expert_feed_forward_length"),
+        "expert_shared_feed_forward_length": _field(reader, f"{arch}.expert_shared_feed_forward_length"),
+    }
+
+
+def _is_moe_tensor(name: str) -> bool:
+    return name.startswith("blk.") and any(name.endswith(s) for s in _MOE_TENSOR_SUFFIXES)
+
+
+def _layer_index(name: str) -> Optional[int]:
+    if not name.startswith("blk."):
+        return None
+    try:
+        return int(name.split(".", 2)[1])
+    except (IndexError, ValueError):
+        return None
 
 
 def _open_reader(path: str):
@@ -182,9 +238,12 @@ def read_info(path: str) -> GGUFInfo:
     tensors = {t.name: t for t in reader.tensors}
     if d_ff is None:
         gate = tensors.get("blk.0.ffn_gate.weight") or tensors.get("blk.0.ffn_up.weight")
-        if gate is None:
+        if gate is None and a("expert_feed_forward_length") is not None:
+            d_ff = int(a("expert_feed_forward_length"))
+        elif gate is None:
             raise GGUFUnsupported(f"GGUF '{arch}' has no feed_forward_length and no ffn tensors")
-        d_ff = int(gate.data.shape[0])
+        else:
+            d_ff = int(gate.data.shape[0])
 
     vocab = _field(reader, "tokenizer.ggml.tokens")
     if vocab is None:
@@ -195,6 +254,9 @@ def read_info(path: str) -> GGUFInfo:
     else:
         vocab_size = len(reader.fields["tokenizer.ggml.tokens"].data)
 
+    moe_meta = _moe_metadata(reader, arch)
+    expert_count = int(moe_meta["expert_count"] or 0)
+    expert_used_count = int(moe_meta["expert_used_count"] or 0)
     cfg = ModelConfig(
         name=str(_field(reader, "general.name") or arch),
         vocab_size=int(vocab_size),
@@ -207,9 +269,18 @@ def read_info(path: str) -> GGUFInfo:
         architecture="llama",
         rope_theta=float(a("rope.freq_base", 10000.0) or 10000.0),
         rms_norm_eps=float(a("attention.layer_norm_rms_epsilon", 1e-5) or 1e-5),
+        expert_count=expert_count,
+        expert_used_count=expert_used_count,
+        expert_feed_forward_length=(
+            int(moe_meta["expert_feed_forward_length"])
+            if moe_meta["expert_feed_forward_length"] is not None else None),
+        expert_shared_feed_forward_length=(
+            int(moe_meta["expert_shared_feed_forward_length"])
+            if moe_meta["expert_shared_feed_forward_length"] is not None else None),
     )
 
     layer_bytes = [0] * int(n_layer)
+    moe_tensor_names: list[list[str]] = [[] for _ in range(int(n_layer))]
     quantizations: dict[str, int] = {}
     total = 0
     for name, t in tensors.items():
@@ -217,13 +288,26 @@ def read_info(path: str) -> GGUFInfo:
         total += nbytes
         qname = t.tensor_type.name
         quantizations[qname] = quantizations.get(qname, 0) + nbytes
-        if name.startswith("blk."):
-            try:
-                idx = int(name.split(".", 2)[1])
-            except (IndexError, ValueError):
-                continue
-            if 0 <= idx < len(layer_bytes):
-                layer_bytes[idx] += nbytes
+        idx = _layer_index(name)
+        if idx is not None and 0 <= idx < len(layer_bytes):
+            layer_bytes[idx] += nbytes
+            if _is_moe_tensor(name):
+                moe_tensor_names[idx].append(name)
+
+    moe_layers = []
+    for idx, names in enumerate(moe_tensor_names):
+        actual_experts = expert_count
+        for name in names:
+            if any(name.endswith(s) for s in _MOE_EXPERT_SUFFIXES):
+                actual_experts = int(tensors[name].data.shape[0])
+                break
+        moe_layers.append(GGUFLayerMoEInfo(
+            layer=idx,
+            is_moe=bool(names),
+            expert_count=int(actual_experts or 0),
+            expert_used_count=int(expert_used_count or (1 if names else 0)),
+            bytes=int(layer_bytes[idx]),
+            tensor_names=tuple(sorted(names))))
 
     info = GGUFInfo(
         path=path,
@@ -233,16 +317,24 @@ def read_info(path: str) -> GGUFInfo:
         quantizations=quantizations,
         layer_bytes=layer_bytes,
         total_bytes=total,
+        moe_layers=tuple(moe_layers),
     )
     # per_layer_mb drives placement, so derive it from the file rather than the
     # simulated default the toy model uses.
-    object.__setattr__(info, "config", _with_per_layer_mb(cfg, info.per_layer_mb))
+    object.__setattr__(info, "config", _with_per_layer_mb(
+        cfg, info.per_layer_mb, tuple(layer_bytes), tuple(m.is_moe for m in moe_layers)))
     return info
 
 
-def _with_per_layer_mb(cfg: ModelConfig, per_layer_mb: int) -> ModelConfig:
+def _with_per_layer_mb(
+    cfg: ModelConfig,
+    per_layer_mb: int,
+    layer_bytes: Optional[tuple[int, ...]] = None,
+    moe_layers: Optional[tuple[bool, ...]] = None,
+) -> ModelConfig:
     from dataclasses import replace
-    return replace(cfg, per_layer_mb=max(1, int(per_layer_mb)))
+    return replace(cfg, per_layer_mb=max(1, int(per_layer_mb)),
+                   layer_bytes=layer_bytes, moe_layers=moe_layers)
 
 
 def _dequant(gguf, tensor) -> np.ndarray:
@@ -289,7 +381,8 @@ def load_params(path: str, start: int, end: int, is_first: bool, is_last: bool,
 
     P: dict[str, np.ndarray] = {}
     for i in range(start, end):
-        for suffix, param, transpose in _LAYER_MAP:
+        is_moe = bool(info.moe_layers and info.moe_layers[i].is_moe)
+        for suffix, param, transpose in _ATTN_LAYER_MAP:
             w = take(f"blk.{i}.{suffix}")
             if permute and suffix == "attn_q.weight":
                 w = unpermute_rope(w, cfg.n_head)
@@ -297,6 +390,31 @@ def load_params(path: str, start: int, end: int, is_first: bool, is_last: bool,
                 w = unpermute_rope(w, cfg.kv_heads)
             P[f"h{i}.{param}"] = np.ascontiguousarray(w.T if transpose else w,
                                                       dtype=np.float32)
+        if is_moe:
+            router = take(f"blk.{i}.ffn_gate_inp.weight")
+            P[f"h{i}.mlp.Wrouter"] = np.ascontiguousarray(router.T, dtype=np.float32)
+            for suffix, param in (
+                ("ffn_gate_exps.weight", "Wgate_exps"),
+                ("ffn_up_exps.weight", "Wup_exps"),
+                ("ffn_down_exps.weight", "Wdown_exps"),
+            ):
+                w = take(f"blk.{i}.{suffix}")
+                P[f"h{i}.mlp.{param}"] = np.ascontiguousarray(
+                    np.swapaxes(w, -1, -2), dtype=np.float32)
+            for suffix, param in (
+                ("ffn_gate_shexp.weight", "Wgate_shexp"),
+                ("ffn_up_shexp.weight", "Wup_shexp"),
+                ("ffn_down_shexp.weight", "Wdown_shexp"),
+            ):
+                name = f"blk.{i}.{suffix}"
+                if name in tensors:
+                    w = take(name)
+                    P[f"h{i}.mlp.{param}"] = np.ascontiguousarray(w.T, dtype=np.float32)
+        else:
+            for suffix, param, transpose in _DENSE_FFN_MAP:
+                w = take(f"blk.{i}.{suffix}")
+                P[f"h{i}.{param}"] = np.ascontiguousarray(w.T if transpose else w,
+                                                          dtype=np.float32)
 
     if is_first or is_last:
         P["wte"] = take("token_embd.weight")
@@ -362,14 +480,43 @@ def describe(info: GGUFInfo) -> str:
     """One-line human summary for logs and the console."""
     cfg = info.config
     quant = max(info.quantizations.items(), key=lambda kv: kv[1])[0] if info.quantizations else "?"
+    moe = sum(1 for m in info.moe_layers if m.is_moe)
+    moe_text = f" moe={moe}L/{cfg.expert_count}e" if moe else ""
     return (f"{cfg.name} [{info.architecture}] {cfg.n_layer}L d={cfg.d_model} "
             f"heads={cfg.n_head}/{cfg.kv_heads} ff={cfg.d_ff} "
-            f"vocab={cfg.vocab_size} {quant} "
+            f"vocab={cfg.vocab_size}{moe_text} {quant} "
             f"{info.total_bytes / 1e9:.2f}GB ~{info.per_layer_mb}MB/layer")
 
 
 def iter_layer_tensor_names(cfg: ModelConfig, layers: Iterable[int]) -> Iterable[str]:
     """GGUF tensor names a given set of layers depends on (for prefetching)."""
     for i in layers:
-        for suffix, _param, _t in _LAYER_MAP:
+        is_moe = bool(cfg.moe_layers and cfg.moe_layers[i])
+        maps = _ATTN_LAYER_MAP + (_MOE_LOAD_MAP if is_moe else _DENSE_FFN_MAP)
+        for suffix, _param, _t in maps:
             yield f"blk.{i}.{suffix}"
+
+
+def validate_moe_expert_colocation(
+    info: GGUFInfo,
+    assignments,
+    tensor_node_ids: Optional[dict[str, str]] = None,
+) -> None:
+    """Raise if any MoE layer's expert tensors are split across nodes."""
+    owners: dict[int, str] = {}
+    for a in assignments:
+        for layer in range(int(a.start_layer), int(a.end_layer)):
+            if layer in owners:
+                raise ValueError(f"layer {layer} is assigned to both {owners[layer]} and {a.node_id}")
+            owners[layer] = a.node_id
+    for m in info.moe_layers:
+        if not m.is_moe:
+            continue
+        owner = owners.get(m.layer)
+        if owner is None:
+            raise ValueError(f"MoE layer {m.layer} is not assigned to any node")
+        if tensor_node_ids:
+            seen = {tensor_node_ids.get(t, owner) for t in m.tensor_names}
+            if len(seen) != 1:
+                raise ValueError(
+                    f"MoE layer {m.layer} experts are split across nodes: {sorted(seen)}")

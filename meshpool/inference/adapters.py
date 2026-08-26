@@ -27,7 +27,7 @@ import os
 from typing import Optional, Protocol
 
 from ..common.models import LayerAssignment, Node
-from ..controlplane.scheduler import topology_partition
+from ..controlplane.scheduler import topology_partition, topology_partition_by_bytes
 from . import gguf_loader
 from . import model as M
 from .gguf_tokenizer import GGUFTokenizer
@@ -261,6 +261,13 @@ class GGUFBackend:
         the file, not from a constant. Placement therefore fails honestly when
         the pool genuinely lacks the memory instead of succeeding on paper.
         """
+        if cfg.layer_bytes:
+            measured_mb = max(1, int(max(cfg.layer_bytes) / (1024 * 1024)))
+            if cfg.per_layer_mb <= measured_mb:
+                return topology_partition_by_bytes(nodes, cfg.layer_bytes)
+            # Tests and callers may deliberately override per_layer_mb upward to
+            # simulate a too-large model; keep honouring that conservative bound.
+            return topology_partition(nodes, cfg.n_layer, cfg.per_layer_mb)
         return topology_partition(nodes, cfg.n_layer, cfg.per_layer_mb)
 
     def tokenizer(self, cfg: M.ModelConfig, meta: Optional[dict]):

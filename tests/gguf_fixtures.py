@@ -130,3 +130,86 @@ def build_llama_gguf(path: str, *, n_layer: int = 4, d_model: int = 32,
     w.write_tensors_to_file()
     w.close()
     return truth
+
+
+def build_moe_llama_gguf(path: str, *, n_layer: int = 4, d_model: int = 32,
+                         n_head: int = 4, n_kv_head: int = 2, d_ff: int = 32,
+                         expert_count: int = 4, expert_used_count: int = 2,
+                         expert_ff: int = 128, shared_ff: int = 16,
+                         vocab_size: int = 64, dense_layers: tuple[int, ...] = (0,),
+                         seed: int = 20240827) -> dict[str, np.ndarray]:
+    """Write a mixed dense/MoE GGUF using llama.cpp's reference tensor names."""
+    import gguf
+
+    hd = d_model // n_head
+    rng = np.random.default_rng(seed)
+
+    def rand(*shape: int) -> np.ndarray:
+        return (rng.standard_normal(shape) * 0.05).astype(np.float32)
+
+    truth: dict[str, np.ndarray] = {
+        "token_embd.weight": rand(vocab_size, d_model),
+        "output_norm.weight": (rng.random(d_model).astype(np.float32) + 0.5),
+        "output.weight": rand(vocab_size, d_model),
+    }
+    dense = set(dense_layers)
+    for i in range(n_layer):
+        truth[f"blk.{i}.attn_norm.weight"] = rng.random(d_model).astype(np.float32) + 0.5
+        truth[f"blk.{i}.attn_q.weight"] = rand(n_head * hd, d_model)
+        truth[f"blk.{i}.attn_k.weight"] = rand(n_kv_head * hd, d_model)
+        truth[f"blk.{i}.attn_v.weight"] = rand(n_kv_head * hd, d_model)
+        truth[f"blk.{i}.attn_output.weight"] = rand(d_model, n_head * hd)
+        truth[f"blk.{i}.ffn_norm.weight"] = rng.random(d_model).astype(np.float32) + 0.5
+        if i in dense:
+            truth[f"blk.{i}.ffn_gate.weight"] = rand(d_ff, d_model)
+            truth[f"blk.{i}.ffn_up.weight"] = rand(d_ff, d_model)
+            truth[f"blk.{i}.ffn_down.weight"] = rand(d_model, d_ff)
+        else:
+            truth[f"blk.{i}.ffn_gate_inp.weight"] = rand(expert_count, d_model)
+            truth[f"blk.{i}.ffn_gate_exps.weight"] = rand(expert_count, expert_ff, d_model)
+            truth[f"blk.{i}.ffn_up_exps.weight"] = rand(expert_count, expert_ff, d_model)
+            truth[f"blk.{i}.ffn_down_exps.weight"] = rand(expert_count, d_model, expert_ff)
+            if shared_ff:
+                truth[f"blk.{i}.ffn_gate_shexp.weight"] = rand(shared_ff, d_model)
+                truth[f"blk.{i}.ffn_up_shexp.weight"] = rand(shared_ff, d_model)
+                truth[f"blk.{i}.ffn_down_shexp.weight"] = rand(d_model, shared_ff)
+
+    w = gguf.GGUFWriter(path, "llama")
+    w.add_block_count(n_layer)
+    w.add_context_length(256)
+    w.add_embedding_length(d_model)
+    w.add_feed_forward_length(d_ff)
+    w.add_expert_count(expert_count)
+    w.add_expert_used_count(expert_used_count)
+    w.add_expert_feed_forward_length(expert_ff)
+    if shared_ff:
+        w.add_expert_shared_feed_forward_length(shared_ff)
+    w.add_head_count(n_head)
+    w.add_head_count_kv(n_kv_head)
+    w.add_layer_norm_rms_eps(1e-5)
+    w.add_rope_freq_base(10000.0)
+    w.add_rope_dimension_count(hd)
+    w.add_tokenizer_model("llama")
+    tokens = ["<unk>", "<s>", "</s>"] + [f"<0x{b:02X}>" for b in range(256)][:vocab_size - 3]
+    tokens = tokens[:vocab_size]
+    while len(tokens) < vocab_size:
+        tokens.append(f"\u2581w{len(tokens)}")
+    w.add_token_list(tokens)
+    w.add_token_scores([0.0] * vocab_size)
+    w.add_token_types([3, 3, 3] + [6] * (vocab_size - 3))
+    w.add_bos_token_id(1)
+    w.add_eos_token_id(2)
+
+    for name, arr in truth.items():
+        out = arr
+        if name.endswith("attn_q.weight"):
+            out = permute_rope_reference(out, n_head)
+        elif name.endswith("attn_k.weight"):
+            out = permute_rope_reference(out, n_kv_head)
+        w.add_tensor(name, np.ascontiguousarray(out))
+
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    return truth

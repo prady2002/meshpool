@@ -51,6 +51,12 @@ class ModelConfig:
     architecture: str = "gpt"
     rope_theta: float = 10000.0
     rms_norm_eps: float = 1e-6
+    expert_count: int = 0
+    expert_used_count: int = 0
+    expert_feed_forward_length: Optional[int] = None
+    expert_shared_feed_forward_length: Optional[int] = None
+    layer_bytes: Optional[tuple[int, ...]] = None
+    moe_layers: Optional[tuple[bool, ...]] = None
     # a representative per-layer memory footprint (MB) used only by the topology
     # partitioner so it plans placement as it would for a genuinely large model;
     # the actual NumPy weights are tiny. Documented simulation choice.
@@ -349,11 +355,17 @@ def slice_params(full: dict, start: int, end: int,
     is shipped just its slice, and no node ever needs the full (possibly larger than
     one machine) checkpoint."""
     sub: dict = {}
-    suffixes = _suffixes_from_params(full)
-    if suffixes is None:
-        cfg = _infer_cfg_from_params(full)
-        suffixes = _layer_suffixes(cfg) if cfg is not None else _LAYER_SUFFIXES
     for i in range(start, end):
+        prefix = f"h{i}."
+        keys = [k for k in full if k.startswith(prefix)]
+        if keys:
+            for k in keys:
+                sub[k] = full[k]
+            continue
+        suffixes = _suffixes_from_params(full)
+        if suffixes is None:
+            cfg = _infer_cfg_from_params(full)
+            suffixes = _layer_suffixes(cfg) if cfg is not None else _LAYER_SUFFIXES
         for suf in suffixes:
             sub[f"h{i}.{suf}"] = full[f"h{i}.{suf}"]
     if is_first:
@@ -553,9 +565,36 @@ def _llama_block(P: dict, cfg: ModelConfig, i: int, x: np.ndarray,
     out = (att @ v_rep).transpose(1, 0, 2).reshape(T, D)
     x = x + out @ P[f"h{i}.attn.Wo"]
     b = _rmsnorm(x, P[f"h{i}.rms2.g"], cfg.rms_norm_eps)
-    h = _silu(b @ P[f"h{i}.mlp.Wgate"]) * (b @ P[f"h{i}.mlp.Wup"])
-    x = x + h @ P[f"h{i}.mlp.Wdown"]
+    if f"h{i}.mlp.Wgate_exps" in P:
+        h = _llama_moe(P, cfg, i, b)
+    else:
+        h = _silu(b @ P[f"h{i}.mlp.Wgate"]) * (b @ P[f"h{i}.mlp.Wup"])
+        h = h @ P[f"h{i}.mlp.Wdown"]
+    x = x + h
     return x.astype(np.float32)
+
+
+def _llama_moe(P: dict, cfg: ModelConfig, i: int, b: np.ndarray) -> np.ndarray:
+    router = P.get(f"h{i}.mlp.Wrouter")
+    gate = P[f"h{i}.mlp.Wgate_exps"]
+    up = P[f"h{i}.mlp.Wup_exps"]
+    down = P[f"h{i}.mlp.Wdown_exps"]
+    n_exp = int(gate.shape[0])
+    top_k = max(1, min(int(cfg.expert_used_count or 1), n_exp))
+    logits = b @ router if router is not None else np.zeros((b.shape[0], n_exp), np.float32)
+    probs = _softmax(logits, axis=-1)
+    chosen = np.argsort(probs, axis=-1)[:, -top_k:]
+    norm = probs[np.arange(b.shape[0])[:, None], chosen].sum(axis=-1, keepdims=True)
+    weights = probs[np.arange(b.shape[0])[:, None], chosen] / np.maximum(norm, 1e-12)
+    out = np.zeros((b.shape[0], cfg.d_model), np.float32)
+    for t in range(b.shape[0]):
+        for rank, e in enumerate(chosen[t]):
+            hidden = _silu(b[t] @ gate[int(e)]) * (b[t] @ up[int(e)])
+            out[t] += weights[t, rank] * (hidden @ down[int(e)])
+    if f"h{i}.mlp.Wgate_shexp" in P:
+        shared = _silu(b @ P[f"h{i}.mlp.Wgate_shexp"]) * (b @ P[f"h{i}.mlp.Wup_shexp"])
+        out += shared @ P[f"h{i}.mlp.Wdown_shexp"]
+    return out.astype(np.float32)
 
 
 def run_layers(P, cfg, x, start, end):
