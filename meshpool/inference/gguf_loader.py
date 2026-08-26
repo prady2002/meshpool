@@ -183,7 +183,13 @@ def _moe_metadata(reader, arch: str) -> dict[str, Optional[int]]:
 
 
 def _is_moe_tensor(name: str) -> bool:
-    return name.startswith("blk.") and any(name.endswith(s) for s in _MOE_TENSOR_SUFFIXES)
+    if not name.startswith("blk."):
+        return False
+    try:
+        suffix = name.split(".", 2)[2]
+    except IndexError:
+        return False
+    return suffix in _MOE_TENSOR_SUFFIXES
 
 
 def _layer_index(name: str) -> Optional[int]:
@@ -308,6 +314,9 @@ def read_info(path: str) -> GGUFInfo:
             expert_used_count=int(expert_used_count or (1 if names else 0)),
             bytes=int(layer_bytes[idx]),
             tensor_names=tuple(sorted(names))))
+    if expert_count > 0 and not any(m.is_moe for m in moe_layers):
+        raise GGUFUnsupported(
+            f"GGUF '{arch}' declares expert_count={expert_count} but has no MoE expert tensors")
 
     info = GGUFInfo(
         path=path,

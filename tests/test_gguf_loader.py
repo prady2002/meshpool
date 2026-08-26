@@ -21,7 +21,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from gguf_fixtures import build_llama_gguf, permute_rope_reference
+from gguf_fixtures import build_llama_gguf, build_moe_llama_gguf, permute_rope_reference
 from meshpool.inference import gguf_loader as G
 from meshpool.inference import model as M
 
@@ -35,6 +35,16 @@ GEOM = dict(n_layer=6, d_model=32, n_head=4, n_kv_head=2, d_ff=64, vocab_size=64
 def ckpt(tmp_path_factory):
     path = str(tmp_path_factory.mktemp("gguf") / "model.gguf")
     truth = build_llama_gguf(path, **GEOM)
+    return path, truth, G.read_info(path)
+
+
+@pytest.fixture(scope="module")
+def moe_ckpt(tmp_path_factory):
+    path = str(tmp_path_factory.mktemp("moe_gguf") / "moe.gguf")
+    truth = build_moe_llama_gguf(
+        path, n_layer=6, d_model=32, n_head=4, n_kv_head=2, d_ff=32,
+        expert_count=4, expert_used_count=2, expert_ff=768, shared_ff=16,
+        vocab_size=128, dense_layers=(0,), seed=20240820)
     return path, truth, G.read_info(path)
 
 
@@ -102,6 +112,75 @@ class TestMetadata:
         _path, _truth, info = ckpt
         text = G.describe(info)
         assert "llama" in text and "6L" in text and "vocab=64" in text
+
+
+class TestMoEMetadata:
+    def test_dense_checkpoint_reports_no_experts_without_guessing(self, ckpt):
+        _path, _truth, info = ckpt
+        assert info.config.expert_count == 0
+        assert info.config.expert_used_count == 0
+        assert info.config.expert_feed_forward_length is None
+        assert info.config.expert_shared_feed_forward_length is None
+        assert all(not m.is_moe for m in info.moe_layers)
+
+    def test_moe_metadata_comes_from_real_gguf_kv_fields(self, moe_ckpt):
+        _path, _truth, info = moe_ckpt
+        assert info.config.expert_count == 4
+        assert info.config.expert_used_count == 2
+        assert info.config.expert_feed_forward_length == 768
+        assert info.config.expert_shared_feed_forward_length == 16
+        assert [m.is_moe for m in info.moe_layers] == [False, True, True, True, True, True]
+
+    def test_expert_tensor_names_are_attributed_to_their_layers(self, moe_ckpt):
+        _path, _truth, info = moe_ckpt
+        layer1 = info.moe_layers[1]
+        assert layer1.expert_count == 4
+        assert {
+            "blk.1.ffn_gate_exps.weight",
+            "blk.1.ffn_up_exps.weight",
+            "blk.1.ffn_down_exps.weight",
+            "blk.1.ffn_gate_shexp.weight",
+            "blk.1.ffn_up_shexp.weight",
+            "blk.1.ffn_down_shexp.weight",
+        }.issubset(set(layer1.tensor_names))
+        assert all(name.startswith("blk.1.") for name in layer1.tensor_names)
+
+    def test_similar_tensor_names_are_not_misclassified_as_experts(self):
+        assert G._is_moe_tensor("blk.1.ffn_gate_exps.weight")
+        assert not G._is_moe_tensor("blk.1.not_ffn_gate_exps.weight")
+        assert not G._is_moe_tensor("notblk.1.ffn_gate_exps.weight")
+
+    def test_layer_bytes_include_expert_tensors(self, moe_ckpt):
+        _path, truth, info = moe_ckpt
+        dense = info.layer_bytes[0]
+        moe = info.layer_bytes[1]
+        expert_truth_bytes = sum(
+            arr.nbytes for name, arr in truth.items()
+            if name.startswith("blk.1.") and ("_exps.weight" in name or "_shexp.weight" in name))
+        assert dense == 24_832
+        assert moe == 1_198_848
+        assert moe > dense * 40
+        assert moe >= expert_truth_bytes
+        assert G.layer_span_bytes(info, 1, 2) == moe
+
+    def test_loading_moe_range_materializes_only_assigned_experts(self, moe_ckpt):
+        path, _truth, info = moe_ckpt
+        p = G.load_params(path, 1, 3, False, False, info=info)
+        expected_suffixes = {"mlp.Wrouter", "mlp.Wgate_exps", "mlp.Wup_exps", "mlp.Wdown_exps",
+                             "mlp.Wgate_shexp", "mlp.Wup_shexp", "mlp.Wdown_shexp"}
+        for layer in (1, 2):
+            loaded = {name.split(".", 1)[1] for name in p if name.startswith(f"h{layer}.")}
+            assert expected_suffixes.issubset(loaded)
+        assert not any(name.startswith("h0.") or name.startswith("h3.") for name in p)
+
+    def test_declared_moe_without_expert_tensors_fails_loudly(self, tmp_path):
+        p = str(tmp_path / "declared_but_dense.gguf")
+        build_moe_llama_gguf(
+            p, n_layer=2, d_model=32, n_head=4, n_kv_head=2, d_ff=32,
+            expert_count=4, expert_used_count=2, expert_ff=64, shared_ff=0,
+            vocab_size=64, dense_layers=(0, 1))
+        with pytest.raises(G.GGUFUnsupported, match="declares expert_count=4"):
+            G.read_info(p)
 
 
 class TestPartialLoad:
