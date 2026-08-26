@@ -58,6 +58,7 @@ log = get_logger("controlplane.spend")
 # Unset, empty, or <= 0 means "no default cap" (owners are uncapped until one is
 # set).  A deployment that bills real money should set this.
 DEFAULT_SPEND_CAP_ENV = "MESHPOOL_DEFAULT_SPEND_CAP"
+PUBLIC_DEFAULT_SPEND_CAP = 1_000.0
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS spend_caps (
@@ -69,11 +70,11 @@ CREATE TABLE IF NOT EXISTS spend_caps (
 """
 
 
-def default_cap_from_env() -> Optional[float]:
+def default_cap_from_env(fallback: Optional[float] = None) -> Optional[float]:
     """Read the deployment-wide default cap, or None when uncapped."""
     raw = (os.environ.get(DEFAULT_SPEND_CAP_ENV) or "").strip()
     if not raw:
-        return None
+        return fallback
     try:
         val = float(raw)
     except ValueError:

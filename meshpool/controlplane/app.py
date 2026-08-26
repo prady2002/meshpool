@@ -37,7 +37,7 @@ from ..batch.dag import DagError, DagManager
 from ..cloud.tunnel import CompositeTransport, TunnelHub, HDR_NODE_TOKEN
 from ..cloud.quic import QuicFallbackTransport, QuicHub, start_quic_server
 from .accounts import AccountManager, MAX_ACTIVE_JOBS_PER_OWNER
-from .spend import SpendCapManager
+from .spend import PUBLIC_DEFAULT_SPEND_CAP, SpendCapManager, default_cap_from_env
 from .registry import EventBus, NodeRegistry, schedulable
 from .timeline import JobTimeline
 
@@ -102,7 +102,14 @@ class ControlPlane:
         # it afterwards. Enforced at every tier -- protection from bill shock is a
         # user safety property, not a public-mesh billing feature. Owners are
         # uncapped unless a cap is set or MESHPOOL_DEFAULT_SPEND_CAP is configured.
-        self.spend_caps = SpendCapManager(self.store)
+        self.spend_caps = SpendCapManager(
+            self.store,
+            default_cap=(
+                default_cap_from_env(PUBLIC_DEFAULT_SPEND_CAP)
+                if settings.trust_tier >= 2 else None),
+        )
+        from ..common.billing import BillingManager
+        self.billing = BillingManager(self.store, self.ledger)
         # S3-compatible API: access_key_id -> (secret_key, owner_subject).
         # Durable (see storage/s3_credentials.py) -- an in-memory dict silently
         # invalidated every boto3 client on control-plane restart, surfacing as
@@ -135,6 +142,7 @@ class ControlPlane:
         self.store.recover_inflight_units()
         self.batch = BatchManager(self.registry, self.store, self.ledger,
                                   self.trust, self.events, self.transport, self.secrets)
+        self.batch.billing = self.billing
         self.timeline.instrument_batch(self.batch)
         self.dags = DagManager(self.store, self.batch)
         # a one-time invite token powers the "magic" pairing onboarding
@@ -887,6 +895,7 @@ def _register_routes(app: FastAPI) -> None:
     _declare_route("POST",   "/api/v1/jobs",                  Scope.JOBS_WRITE)
     _declare_route("GET",    "/api/v1/jobs",                  Scope.JOBS_READ)
     _declare_route("GET",    "/api/v1/jobs/{job_id}",         Scope.JOBS_READ)
+    _declare_route("GET",    "/api/v1/jobs/{job_id}/receipt", Scope.JOBS_READ)
     _declare_route("GET",    "/api/v1/jobs/{job_id}/timeline", Scope.JOBS_READ)
     _declare_route("GET",    "/api/v1/verification",           Scope.JOBS_READ)
     _declare_route("POST",   "/api/v1/dags",                  Scope.JOBS_WRITE)
@@ -1422,7 +1431,24 @@ def _register_routes(app: FastAPI) -> None:
         job = cp.batch.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="unknown job")
-        return {**job.model_dump(mode="json"), "progress": job.progress()}
+        progress = job.progress()
+        receipt = cp.billing.receipt("batch", job_id)
+        running = progress.get("running", 0) + progress.get("assigned", 0)
+        return {
+            **job.model_dump(mode="json"),
+            "progress": progress,
+            "receipt": receipt,
+            "cost_meter": cp.billing.live_meter("batch", job_id, job.owner,
+                                                running_units=running),
+        }
+
+    @app.get("/api/v1/jobs/{job_id}/receipt")
+    async def get_job_receipt(job_id: str) -> dict:
+        cp = _cp()
+        receipt = cp.billing.receipt("batch", job_id)
+        if receipt is None:
+            raise HTTPException(status_code=404, detail="receipt not found")
+        return receipt
 
     @app.get("/api/v1/jobs/{job_id}/timeline")
     async def get_job_timeline(job_id: str) -> dict:

@@ -554,6 +554,16 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   agent returning a bad answer over the production transport is caught and slashed.
   Before anonymous public supply opens, this must be complemented by a multi-process
   gate using real agents and the real transport.
+- **Metering has one unit: the measured mesh-second.** Batch, functions, inference,
+  hosting, and storage all normalize resource-weighted node time into the same
+  `mesh-second`; receipts carry `pricing_dimensions: 1` so a second billing axis
+  cannot be hidden in the API. Per-job receipts show gross contributor earnings,
+  the platform fee as a separate line item, and the total charged to the consumer;
+  fees are never silently netted out of contributor earnings. The meter labels
+  observed runtime/cost as **measured** and live forward-looking fields as
+  **calibrated projection**. What is not implemented yet: fiat invoices, payouts,
+  taxes, regional price books, or a guarantee that today's in-process metering gate
+  proves every future service adapter's production transport path.
 - **Proof-of-storage audits are per-chunk hashes, not a Merkle tree or PoRep.** Nodes are
   challenged on a random chunk offset and must return its SHA-256. A node that deleted the
   bytes fails. A determined cheater *can* defeat this by caching the chunk hash table

@@ -101,6 +101,9 @@ class BatchManager:
         # (same pattern as .storage). None means caps are not enforced, which is
         # what the standalone engine tests want.
         self.spend_caps = None
+        # BillingManager | None.  When present, accepted units are metered in the
+        # single mesh-second unit and durable per-job receipts are emitted.
+        self.billing = None
         # Jobs already announced as spend-capped, so the SSE stream carries one
         # explanation per pause instead of one per dispatch tick.
         self._capped_announced: set[str] = set()
@@ -515,7 +518,9 @@ class BatchManager:
                     elapsed_s = max(0.001, float(unit.payload["_meshpool_billing_ms"]) / 1000.0)
                 except (TypeError, ValueError):
                     pass
-            cost = job.cpu_pct_per_unit * elapsed_s
+            cost = (self.billing.meter.batch(elapsed_s, job.cpu_pct_per_unit)
+                    if self.billing is not None
+                    else job.cpu_pct_per_unit * elapsed_s)
             if self.verifier is not None:
                 self.verifier.ensure_stake(node.id, node.owner, cost)
             # Track redundant-check verdict across both the oracle and redundant paths.
@@ -588,14 +593,26 @@ class BatchManager:
                 # Donor earns; consumer spends the same amount -> the ledger conserves
                 # (net zero when producer == consumer, e.g. a single owner). Only the
                 # first accepted attempt records credit, so a backup task cannot double-pay.
-                if self.verifier is not None:
+                if self.billing is not None:
+                    self.billing.record_charge(
+                        "batch", job.id, job.owner, node.id, node.owner,
+                        measured_seconds=elapsed_s,
+                        resource_class="batch",
+                        resource_units=job.cpu_pct_per_unit,
+                        idempotency_key=unit.id,
+                        detail=f"batch:{job.id}",
+                        earning_recorder=(
+                            self.verifier.record_earning
+                            if self.verifier is not None else None),
+                    )
+                elif self.verifier is not None:
                     self.verifier.record_earning(node.id, node.owner, cost,
                                                  detail=f"batch:{job.id}")
                 else:
                     self.ledger.record_donation(node.id, node.owner, cost,
                                                 detail=f"batch:{job.id}")
-                self.ledger.record_consumption(node.id, job.owner, cost,
-                                               detail=f"batch:{job.id}")
+                    self.ledger.record_consumption(node.id, job.owner, cost,
+                                                   detail=f"batch:{job.id}")
                 self.trust.record_task_result(node.id, True)
                 # Escrow: redundant check confirmed this result — accrue bonus credit.
                 if self.verifier is not None and _redundant_verdict is True:
