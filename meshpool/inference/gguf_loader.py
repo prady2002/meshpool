@@ -75,10 +75,45 @@ _MOE_LOAD_MAP: tuple[tuple[str, str, bool], ...] = (
     ("ffn_down_shexp.weight", "mlp.Wdown_shexp", True),
 )
 
-# Architectures whose GGUF files carry llama.cpp's rope permutation on Q/K.
-# These are the ones whose HuggingFace implementation uses rotate_half, which is
-# every model llama.cpp converts through the LlamaModel/Qwen2Model paths.
-_ROPE_PERMUTED_ARCHES = frozenset({"llama", "qwen2", "qwen3", "mistral", "gemma"})
+# Which architectures store Q/K permuted is not a matter of taste: llama.cpp
+# picks one of two rope conventions per architecture, and the converter permutes
+# Q/K only for the "NORM" ones so that rotating adjacent pairs reproduces
+# rotating halves. Our attention implements rotate_half, so we must undo the
+# permutation for exactly the NORM set and leave the NEOX set alone.
+#
+# There is no metadata field to read: llama.cpp's llama_model_rope_type()
+# switches on model->arch and nothing else, so mirroring that switch is the only
+# correct approach. Both lists below are transcribed programmatically from it
+# (src/llama-model.cpp) rather than by hand. [tier: cited]
+#
+# Getting an entry wrong is the worst failure this loader has, because it does
+# not crash: the model loads, generates fluently, and is quietly wrong.
+_ROPE_PERMUTED_ARCHES = frozenset({
+    "arcee", "arctic", "baichuan", "bailingmoe", "bailingmoe3", "chameleon",
+    "chatglm", "cohere2", "cohere2moe", "command_r", "deci", "deepseek",
+    "deepseek2", "deepseek2ocr", "deepseek32", "deepseek4", "dots3note",
+    "eagle3", "ernie4_5", "ernie4_5_moe", "glm_dsa", "granite",
+    "granite_hybrid", "granite_moe", "granite_swa", "granite_switch",
+    "internlm2", "llada", "llama", "llama4", "llama_embed", "maincoder",
+    "minicpm", "mistral3", "mistral4", "muse_glimmer", "nanbeige", "neo_bert",
+    "olmo", "plm", "pockettts", "smollm3", "starcoder", "xverse"
+})
+
+# Architectures that keep the HuggingFace rotate_half layout, needing no fixup.
+_ROPE_HALF_ARCHES = frozenset({
+    "afmoe", "apertus", "bailingmoe2", "bert", "bitnet", "codeshell",
+    "cogvlm", "dbrx", "dots1", "dream", "eurobert", "exaone", "exaone4",
+    "exaone_moe", "falcon", "falcon_h1", "gemma", "gemma2", "gemma3",
+    "gemma3n", "gemma4", "gemma4_assistant", "gemma_embedding", "gptneox",
+    "grok", "grovemoe", "hunyuan_dense", "hunyuan_moe", "hy_v3", "jais2",
+    "jina_bert_v3", "laguna", "lfm2", "lfm2moe", "llada_moe", "mellum",
+    "mimo2", "minicpm3", "minimax_01", "minimax_m2", "minimax_m3",
+    "modern_bert", "nemotron", "nomic_bert", "nomic_bert_moe", "olmo2",
+    "olmoe", "openai_moe", "openelm", "orion", "pangu_embed", "phi2", "phi3",
+    "phimoe", "plamo", "plamo2", "plamo3", "qwen", "qwen2", "qwen2moe",
+    "qwen3", "qwen3moe", "qwen3next", "rnd1", "seed_oss", "smallthinker",
+    "stablelm", "starcoder2", "step35", "talkie"
+})
 
 
 class GGUFUnsupported(RuntimeError):
@@ -99,6 +134,28 @@ def _require_gguf():
             "(pip install gguf). It is the reference implementation from "
             "llama.cpp and is pure Python + numpy.") from exc
     return __import__("gguf")
+
+
+def _rope_is_permuted(arch: str) -> bool:
+    """Whether this architecture's GGUF stores Q/K in llama.cpp's paired layout.
+
+    Deliberately refuses to guess. An architecture in neither list is one whose
+    convention nobody has checked, and defaulting either way would load the
+    model, generate fluent text, and be silently wrong — exactly the failure this
+    module exists to prevent. A loud refusal costs someone five minutes; a wrong
+    guess costs them their trust in every answer the model gives.
+    """
+    if arch in _ROPE_PERMUTED_ARCHES:
+        return True
+    if arch in _ROPE_HALF_ARCHES:
+        return False
+    raise GGUFUnsupported(
+        f"unknown rope convention for architecture {arch!r}. MeshPool has not "
+        f"verified whether llama.cpp stores this architecture's Q/K weights "
+        f"permuted, and guessing would produce fluent but incorrect output. "
+        f"Look up {arch!r} in llama_model_rope_type() in llama.cpp's "
+        f"src/llama-model.cpp and add it to _ROPE_PERMUTED_ARCHES (for "
+        f"LLAMA_ROPE_TYPE_NORM) or _ROPE_HALF_ARCHES (for LLAMA_ROPE_TYPE_NEOX).")
 
 
 def unpermute_rope(w: np.ndarray, n_head: int) -> np.ndarray:
@@ -390,7 +447,7 @@ def load_params(path: str, start: int, end: int, is_first: bool, is_last: bool,
 
     with _open_reader(path) as reader:
         tensors = {t.name: t for t in reader.tensors}
-        permute = info.architecture in _ROPE_PERMUTED_ARCHES
+        permute = _rope_is_permuted(info.architecture)
 
         def take(name: str) -> np.ndarray:
             t = tensors.get(name)

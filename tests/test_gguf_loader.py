@@ -428,3 +428,47 @@ class TestArchitectureDetection:
         sub = M.slice_params(full, 0, 2, False, False)
         assert any(k.endswith(".ln1.g") for k in sub)
         assert not any(k.endswith(".rms1.g") for k in sub)
+
+class TestRopeConventionPerArchitecture:
+    """Which architectures need un-permuting is an external fact, not a choice.
+
+    These five entries were once all asserted to be permuted. Four were wrong,
+    and nothing failed: the models would have loaded, generated fluent text, and
+    been quietly incorrect. The values below are transcribed from
+    llama_model_rope_type() in llama.cpp's src/llama-model.cpp, which is the only
+    place the convention is decided -- GGUF carries no rope-type field.
+    """
+
+    @pytest.mark.parametrize("arch, permuted", [
+        ("llama", True),        # LLAMA_ROPE_TYPE_NORM
+        ("mistral3", True),     # Mistral ships as mistral3/mistral4, never "mistral"
+        ("mistral4", True),
+        ("deepseek2", True),    # DeepSeek-V3 and Kimi K2, the flagship targets
+        ("qwen2", False),       # LLAMA_ROPE_TYPE_NEOX - was wrongly permuted
+        ("qwen3", False),
+        ("gemma", False),
+        ("gemma2", False),
+        ("gemma3", False),
+        ("phi3", False),
+        ("falcon", False),
+    ])
+    def test_rope_convention_matches_llama_cpp(self, arch, permuted):
+        assert G._rope_is_permuted(arch) is permuted
+
+    def test_mistral_is_not_a_real_gguf_architecture(self):
+        """The old allowlist contained "mistral", which no converter ever emits.
+
+        It was dead weight hiding two genuine omissions. HF MistralForCausalLM
+        converts through LlamaModel and writes "llama"; Mistral's own format
+        writes "mistral3"/"mistral4".
+        """
+        with pytest.raises(G.GGUFUnsupported, match="unknown rope convention"):
+            G._rope_is_permuted("mistral")
+
+    def test_an_unknown_architecture_refuses_rather_than_guessing(self):
+        with pytest.raises(G.GGUFUnsupported, match="unknown rope convention"):
+            G._rope_is_permuted("some-model-invented-next-tuesday")
+
+    def test_the_two_lists_never_disagree(self):
+        overlap = G._ROPE_PERMUTED_ARCHES & G._ROPE_HALF_ARCHES
+        assert not overlap, f"architectures classified both ways: {sorted(overlap)}"
