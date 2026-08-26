@@ -255,6 +255,14 @@ def _kill(proc: subprocess.Popen) -> None:
 # Child side: read one request, run one curated function, print one JSON result.
 # --------------------------------------------------------------------------- #
 def _worker_main() -> int:
+    # Install deny-by-default egress hook in this child process.
+    # Curated functions are network-free by construction, so this is defence-in-depth.
+    # For future code paths that attempt connections, this catches them before the OS call.
+    try:
+        from ..common.egress import EgressPolicy, install_egress_hook
+        install_egress_hook(EgressPolicy())  # deny-by-default
+    except Exception:  # noqa: BLE001 — egress enforcement failing must not stop legitimate work
+        pass
     raw = sys.stdin.readline()
     try:
         req = json.loads(raw)

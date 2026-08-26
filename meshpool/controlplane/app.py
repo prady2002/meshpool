@@ -108,6 +108,10 @@ class ControlPlane:
                 default_cap_from_env(PUBLIC_DEFAULT_SPEND_CAP)
                 if settings.trust_tier >= 2 else None),
         )
+        # Abuse reporting (spec §6.3)
+        from ..common.egress import AbuseReportStore, RateLimiter
+        self._abuse_reports = AbuseReportStore()
+        self._abuse_rate_limiter = RateLimiter(limit=10, window_s=60.0)
         from ..common.billing import BillingManager
         self.billing = BillingManager(self.store, self.ledger)
         # S3-compatible API: access_key_id -> (secret_key, owner_subject).
@@ -900,6 +904,10 @@ def _register_routes(app: FastAPI) -> None:
     _declare_route("GET",    "/api/v1/jobs/{job_id}/receipt", Scope.JOBS_READ)
     _declare_route("GET",    "/api/v1/jobs/{job_id}/timeline", Scope.JOBS_READ)
     _declare_route("GET",    "/api/v1/verification",           Scope.JOBS_READ)
+    # ---- egress policy (spec §6.3) --------------------------------------- #
+    _declare_route("GET",    "/api/v1/egress/policy",          Scope.JOBS_READ)
+    _declare_route("POST",   "/api/v1/abuse/report",           None,
+                   "public abuse reporting — anyone can report suspected abuse")
     _declare_route("POST",   "/api/v1/dags",                  Scope.JOBS_WRITE)
     _declare_route("GET",    "/api/v1/dags",                  Scope.JOBS_READ)
     _declare_route("GET",    "/api/v1/dags/{dag_id}",         Scope.JOBS_READ)
@@ -1505,6 +1513,42 @@ def _register_routes(app: FastAPI) -> None:
                 "not_verifiable": sorted(NOT_VERIFIABLE_FUNCS),
             },
         }
+
+    @app.get("/api/v1/egress/policy")
+    async def get_egress_policy() -> dict:
+        """Report the active egress policy for this cluster."""
+        from ..common.egress import HARD_BLOCKED_PORTS, _BLOCKED_NETWORKS
+        return {
+            "hard_blocked_ports": sorted(HARD_BLOCKED_PORTS),
+            "blocked_network_count": len(_BLOCKED_NETWORKS),
+            "blocked_networks": [str(n) for n in _BLOCKED_NETWORKS],
+            "default": "deny",
+        }
+
+    @app.post("/api/v1/abuse/report")
+    async def submit_abuse_report(request: Request) -> dict:
+        """Accept an abuse report from any caller (public endpoint).
+
+        Rate-limited per IP: at most 10 reports per minute.
+        Reports are queued in memory and logged for operator review.
+        """
+        cp = _cp()
+        ip = request.client.host if request.client else "unknown"
+        if not cp._abuse_rate_limiter.is_allowed(ip):
+            raise HTTPException(status_code=429, detail="too many abuse reports from this IP")
+        body = await request.json()
+        from ..common.egress import AbuseReport
+        report = AbuseReport(
+            reporter_ip=ip,
+            node_id=str(body.get("node_id", "")),
+            description=str(body.get("description", ""))[:1000],
+            evidence=str(body.get("evidence", ""))[:2000],
+            ts=time.time(),
+        )
+        cp._abuse_reports.append(report)
+        log.warning("abuse report received", reporter_ip=ip, node_id=report.node_id,
+                    description=report.description[:100])
+        return {"accepted": True, "queue_depth": cp._abuse_reports.count()}
 
     # ---- DAG workflows ---------------------------------------------------- #
     @app.post("/api/v1/dags")
