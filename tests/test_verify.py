@@ -105,7 +105,12 @@ def test_honest_unit_credits_donor_and_consumer(tmp_store):
     donated = totals["dev:donorA"]["donated"]
     consumed = totals["cons:alice"]["consumed"]
     assert donated > 0 and abs(donated - consumed) < 1e-9   # conserved
-    assert mgr.trust.score("nodeA") == 1.0                  # passed the spot-check
+    # Passed the spot-check. Trust is beta reputation with decay (plan 6.2), not an
+    # EMA, so a single honest observation moves the score above the 0.5 prior but
+    # cannot reach certainty -- that ceiling is exactly what stops a Sybil buying
+    # trust with a farm of cheap jobs.
+    scored = mgr.trust.score("nodeA")
+    assert 0.5 < scored < 1.0, scored
 
 
 # --- lying node: rejected, penalised, paid nothing ------------------------- #
