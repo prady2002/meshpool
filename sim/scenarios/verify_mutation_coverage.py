@@ -329,6 +329,39 @@ MUTATIONS = [
             "work was provably done after the victim was confirmed dead."
         ),
     },
+    {
+        "id": "straggler-threshold-becomes-absolute",
+        "path": "meshpool/inference/remote.py",
+        "old": b"STRAGGLER_RATIO = _env_float(\"MESHPOOL_STRAGGLER_RATIO\", 3.0)",
+        "new": b"STRAGGLER_RATIO = _env_float(\"MESHPOOL_STRAGGLER_RATIO\", 1.0)",
+        "cmd": [sys.executable, "sim/scenarios/verify_straggler_tolerance.py"],
+        "why": (
+            "At ratio 1.0 the comparison is 'slower than the median peer', which the "
+            "maximum of any set satisfies by definition -- so every deployment always "
+            "contains a straggler and the pool rotates forever, paying a KV rebuild "
+            "each time to swap one node for another drawn from the same population. "
+            "This is what an absolute threshold degenerates into, and it is invisible "
+            "to every check that only looks at a healthy mesh or at a single slow "
+            "node: those still pass. Only the uniformly-slow check can see it, which "
+            "is precisely why that check exists."
+        ),
+    },
+    {
+        "id": "slowness-never-triggers-rotation",
+        "path": "meshpool/inference/batching.py",
+        "old": b"            self._check_stragglers()",
+        "new": b"            pass  # self._check_stragglers()",
+        "cmd": [sys.executable, "sim/scenarios/verify_straggler_tolerance.py"],
+        "why": (
+            "Detaches straggler detection from the scheduler loop. Nothing fails, no "
+            "answer changes, no request errors -- the deployment simply keeps serving "
+            "through the slow node forever at a fraction of its throughput. That is "
+            "the whole failure mode consumer hardware produces, and it is silent, so "
+            "the gate cannot rely on an error appearing anywhere. It has to assert "
+            "that a rotation happened, that it retired the exact node being slowed, "
+            "and that throughput came back."
+        ),
+    },
 ]
 
 
