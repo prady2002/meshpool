@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { apiClient } from '../api/client'
 import type { SpendCapStatus, WalletResponse } from '../api/types'
 
@@ -11,8 +11,8 @@ export function AccountPage() {
   const [capDraft, setCapDraft] = useState('')
 
   const load = () => {
-    apiClient.getWallet().then(setWallet)
-    apiClient.getSecrets().then(setSecrets)
+    apiClient.getWallet().then(setWallet).catch(() => setWallet(null))
+    apiClient.getSecrets().then(setSecrets).catch(() => setSecrets([]))
     apiClient.getSpendCap().then(setCap).catch(() => setCap(null))
   }
 
@@ -26,7 +26,7 @@ export function AccountPage() {
     <section className="space-y-6">
       <div>
         <p className="text-sm uppercase tracking-[0.28em] text-indigo-400">Account & Billing</p>
-        <h2 className="mt-2 text-3xl font-semibold">Usage, spend caps, and API keys</h2>
+        <h2 className="mt-2 text-3xl font-semibold">Usage, spend caps, and API keys (capability tokens)</h2>
       </div>
       <div className="grid gap-4 md:grid-cols-3">
         <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75"><p className="text-sm text-slate-500 dark:text-slate-400">Current balance</p><p className="mt-2 text-3xl font-semibold">{typeof wallet?.balance === 'number' ? wallet.balance.toFixed(1) : '—'}</p></div>
@@ -65,7 +65,7 @@ export function AccountPage() {
       </div>
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
         <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75">
-          <h3 className="text-xl font-semibold">API keys / secrets</h3>
+          <h3 className="text-xl font-semibold">Capability tokens / secrets</h3>
           <div className="mt-4 grid gap-3 md:grid-cols-[1fr_1fr_auto]">
             <input value={secretName} onChange={(event) => setSecretName(event.target.value)} placeholder="Name" className="rounded-2xl border border-slate-200 bg-transparent px-4 py-3 dark:border-slate-800" />
             <input value={secretValue} onChange={(event) => setSecretValue(event.target.value)} placeholder="Value" className="rounded-2xl border border-slate-200 bg-transparent px-4 py-3 dark:border-slate-800" />

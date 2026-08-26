@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { apiClient } from '../api/client'
 import type { LedgerResponse, Node, OnboardingResponse, WalletResponse } from '../api/types'
 import { NodeCard } from '../components/NodeCard'
@@ -10,10 +10,10 @@ export function ContributorPage() {
   const [onboarding, setOnboarding] = useState<OnboardingResponse | null>(null)
 
   const load = () => {
-    apiClient.getWallet().then(setWallet)
-    apiClient.getLedger().then(setLedger)
-    apiClient.getNodes().then(setNodes)
-    apiClient.getOnboarding().then(setOnboarding)
+    apiClient.getWallet().then(setWallet).catch(() => setWallet(null))
+    apiClient.getLedger().then(setLedger).catch(() => setLedger(null))
+    apiClient.getNodes().then(setNodes).catch(() => setNodes([]))
+    apiClient.getOnboarding().then(setOnboarding).catch(() => setOnboarding(null))
   }
 
   useEffect(load, [])

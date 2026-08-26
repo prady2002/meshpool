@@ -1,14 +1,4 @@
-/**
- * The console must actually BE the console.
- *
- * This file exists because `web/` type-checked and built cleanly for its entire
- * life while `src/App.tsx` was still the untouched Vite starter template: seven
- * finished pages sat in `src/pages/` and none of them were ever mounted. A build
- * that succeeds proves nothing about what the build contains.
- *
- * Every test below is written so that it FAILS against that starter template.
- */
-import { render, screen, waitFor } from '@testing-library/react'
+﻿import { render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '../src/App'
@@ -33,19 +23,16 @@ beforeEach(() => {
 describe('console shell', () => {
   it('mounts the MeshPool console, not the Vite starter', async () => {
     renderAt('/')
-    expect(
-      await screen.findByRole('heading', { name: /community compute console/i }),
-    ).toBeInTheDocument()
-    // The starter template's signature elements must be gone.
+    expect(await screen.findByRole('heading', { name: /community compute console/i })).toBeInTheDocument()
     expect(screen.queryByText(/Edit .*App\.tsx.* and save to test/i)).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /count is/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('link', { name: /explore vite/i })).not.toBeInTheDocument()
   })
 
-  it('renders every primary navigation destination', async () => {
+  it('renders the flat eight-item information architecture', async () => {
     renderAt('/')
     const nav = await screen.findByRole('navigation', { name: /primary/i })
-    for (const label of ['Playground', 'Mesh Map', 'Models', 'Functions', 'Jobs', 'Storage', 'Contribute', 'Account']) {
+    for (const label of ['Overview', 'Inference', 'Apps', 'Functions', 'Store', 'Mesh', 'Usage', 'Settings']) {
       expect(nav).toHaveTextContent(label)
     }
   })
@@ -63,8 +50,8 @@ describe('console shell', () => {
 
 describe('routes resolve to their real pages', () => {
   const cases: Array<[string, RegExp]> = [
-    ['/jobs', /submit work and watch progress/i],
-    ['/storage', /objects, replicas, shard locations/i],
+    ['/apps', /submit work and watch progress/i],
+    ['/store', /objects, replicas, shard locations/i],
     ['/functions', /run your own code on the pool/i],
   ]
 
