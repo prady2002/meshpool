@@ -73,6 +73,61 @@ class TestRopePermutation:
         with pytest.raises(G.GGUFUnsupported):
             G.unpermute_rope(np.zeros((10, 4), np.float32), 4)
 
+    def test_the_permutation_really_converts_between_the_two_rope_conventions(self):
+        """Independent oracle: prove the permutation *means* what we claim.
+
+        Every other test here checks ``unpermute_rope`` against
+        ``permute_rope_reference``.  Both live in this repo, so if the reference
+        were transcribed wrongly from llama.cpp the pair would agree with each
+        other and every test would still pass, while real checkpoints decoded to
+        fluent garbage.  A round trip proves invertibility, never meaning.
+
+        This test shares no code with either implementation.  It builds the two
+        RoPE conventions straight from their definitions -- HuggingFace pairs
+        dim ``i`` with ``i + hd/2`` (``rotate_half``), llama.cpp pairs adjacent
+        dims ``(2j, 2j+1)`` -- and asserts the permutation is exactly the change
+        of basis between them:
+
+            rotate_half(W x)  ==  unpermute(rotate_interleaved(permute(W) x))
+
+        Equality is exact (both sides are the same sums in the same order), so
+        this asserts bit-equality rather than a tolerance.
+        """
+        rng = np.random.default_rng(7)
+        n_head, head_dim, d_in = 3, 8, 5
+        w_hf = rng.standard_normal((n_head * head_dim, d_in))
+        x = rng.standard_normal(d_in)
+
+        def rotate_half(q, cos, sin):
+            half = q.shape[-1] // 2
+            rot = np.concatenate([-q[..., half:], q[..., :half]], axis=-1)
+            return q * cos + rot * sin
+
+        def rotate_interleaved(q, cos, sin):
+            out = q.copy()
+            even, odd = q[..., 0::2], q[..., 1::2]
+            c, s = cos[..., 0::2], sin[..., 0::2]
+            out[..., 0::2] = even * c - odd * s
+            out[..., 1::2] = even * s + odd * c
+            return out
+
+        angle = rng.standard_normal(head_dim // 2)
+        cos_half = np.concatenate([np.cos(angle), np.cos(angle)])
+        sin_half = np.concatenate([np.sin(angle), np.sin(angle)])
+        cos_inter, sin_inter = np.repeat(np.cos(angle), 2), np.repeat(np.sin(angle), 2)
+
+        q_hf = (w_hf @ x).reshape(n_head, head_dim)
+        expected = rotate_half(q_hf, cos_half, sin_half)
+
+        q_gguf = (permute_rope_reference(w_hf, n_head) @ x).reshape(n_head, head_dim)
+        rotated = rotate_interleaved(q_gguf, cos_inter, sin_inter)
+        actual = G.unpermute_rope(rotated.reshape(n_head * head_dim, 1), n_head)
+
+        assert np.array_equal(expected, actual.reshape(n_head, head_dim))
+        assert not np.allclose(expected, rotate_interleaved(q_hf, cos_inter, sin_inter)), (
+            "control: the two conventions must genuinely disagree without the "
+            "permutation, or the assertion above would hold for the wrong reason")
+
     def test_q_and_k_are_unpermuted_with_their_own_head_counts(self, ckpt):
         """Under GQA, K has fewer rows than Q. Using the query head count for
         both would mis-group K and corrupt every key vector."""
