@@ -103,10 +103,12 @@ class CachedShard:
 
     def __init__(self, cfg: M.ModelConfig, start: int, end: int,
                  is_first: bool, is_last: bool,
-                 params: Optional[dict] = None) -> None:
+                 params: Optional[dict] = None,
+                 cache_page_size: int = 16) -> None:
         self.cfg = cfg
         self.start, self.end = start, end
         self.is_first, self.is_last = is_first, is_last
+        self.cache_page_size = cache_page_size
         full = params if params is not None else M.load_params(cfg)[0]
         self.P = M.slice_params(full, start, end, is_first, is_last)
         self._caches: dict[str, KV.KVCache] = {}
@@ -114,7 +116,7 @@ class CachedShard:
     def cache(self, session: str) -> KV.KVCache:
         c = self._caches.get(session)
         if c is None:
-            c = self._caches[session] = KV.KVCache(self.start, self.end)
+            c = self._caches[session] = KV.KVCache(self.start, self.end, page_size=self.cache_page_size)
         return c
 
     def drop(self, session: str) -> None:
@@ -159,7 +161,8 @@ class CachedShard:
 
 
 def build_stages(cfg: M.ModelConfig, n_stages: int,
-                 params: Optional[dict] = None) -> list[CachedShard]:
+                 params: Optional[dict] = None,
+                 cache_page_size: int = 16) -> list[CachedShard]:
     """Split ``cfg.n_layer`` layers as evenly as possible across ``n_stages``."""
     if n_stages < 1:
         raise ValueError("n_stages must be >= 1")
@@ -171,7 +174,8 @@ def build_stages(cfg: M.ModelConfig, n_stages: int,
     for s in range(n_stages):
         width = base + (1 if s < extra else 0)
         start, end = cursor, cursor + width
-        shards.append(CachedShard(cfg, start, end, s == 0, s == n_stages - 1, full))
+        shards.append(CachedShard(cfg, start, end, s == 0, s == n_stages - 1, full,
+                                  cache_page_size=cache_page_size))
         cursor = end
     return shards
 
@@ -185,6 +189,7 @@ class Pipeline:
         self.stages = stages
         self.link = link or LinkProfile()
         self.stats = PipelineStats()
+        self.activation_cache = KV.ActivationCache()
 
     @property
     def depth(self) -> int:
@@ -196,6 +201,7 @@ class Pipeline:
     def drop_session(self, session: str) -> None:
         for s in self.stages:
             s.drop(session)
+        self.activation_cache.drop(session)
 
     def truncate_session(self, session: str, length: int) -> None:
         """Roll every stage's cache back to ``length`` positions.
@@ -205,9 +211,33 @@ class Pipeline:
         """
         for s in self.stages:
             s.truncate(session, length)
+        self.activation_cache.truncate(session, length)
 
     def cache_bytes(self) -> int:
         return sum(s.cache_bytes() for s in self.stages)
+
+    async def hydrate_stage_from_activations(
+        self,
+        session: str,
+        stage_index: int,
+        upto_pos: int,
+        chunk: int = 0,
+    ) -> None:
+        """Rebuild one stage's KV cache from client-side boundary activations.
+
+        This is the Petals-style recovery primitive. If stage ``j`` loses its
+        server-side KV cache, the client replays the cached activations emitted by
+        stage ``j-1`` through only stage ``j``. That is O(T) for one stage instead of
+        restarting the full multi-stage pipeline from tokens.
+        """
+        if not 0 < stage_index < len(self.stages):
+            raise ValueError("activation hydration needs a non-first stage index")
+        stage = self.stages[stage_index]
+        stage.drop(session)
+        chunk = upto_pos if chunk <= 0 else chunk
+        for pos in range(0, upto_pos, chunk):
+            act = self.activation_cache.get(session, stage_index, pos, min(upto_pos, pos + chunk))
+            stage.forward(act, is_tokens=False, pos_offset=pos, session=session)
 
     async def forward(self, tokens: list[int], pos_offset: int = 0,
                       session: Optional[str] = None) -> np.ndarray:
@@ -237,6 +267,8 @@ class Pipeline:
                 # A remote stage (see meshpool.inference.remote). The algorithms above
                 # are identical either way; only the link underneath changes.
                 data = await data
+            if session is not None and idx < len(self.stages) - 1:
+                self.activation_cache.record(session, idx + 1, pos_offset, np.asarray(data, dtype=np.float32))
             st.compute_seconds += time.perf_counter() - t0
             st.stage_calls += 1
             is_tokens = False

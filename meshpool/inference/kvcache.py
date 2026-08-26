@@ -43,21 +43,72 @@ from . import model as M
 
 @dataclass
 class LayerCache:
-    """Cached keys/values for one decoder layer, shaped ``[n_head, T, head_dim]``."""
+    """Paged cached keys/values for one decoder layer.
 
-    k: Optional[np.ndarray] = None
-    v: Optional[np.ndarray] = None
+    Each page stores ``[n_head, page_size, head_dim]``. Appending new positions
+    fills the current page before allocating another one, so a sequence grows in
+    fixed-size blocks rather than by repeatedly reallocating one contiguous
+    ``[n_head, T, head_dim]`` buffer. The ``k``/``v`` properties materialise the
+    used prefix for the attention kernel; ownership and allocation stay paged.
+    """
+
+    page_size: int = 16
+    _k_pages: list[np.ndarray] = field(default_factory=list)
+    _v_pages: list[np.ndarray] = field(default_factory=list)
+    _length: int = 0
+    _shape: Optional[tuple[int, int]] = None
 
     @property
     def length(self) -> int:
-        return 0 if self.k is None else int(self.k.shape[1])
+        return self._length
+
+    @property
+    def page_count(self) -> int:
+        return len(self._k_pages)
+
+    @property
+    def k(self) -> Optional[np.ndarray]:
+        return self._materialize(self._k_pages)
+
+    @property
+    def v(self) -> Optional[np.ndarray]:
+        return self._materialize(self._v_pages)
+
+    def _materialize(self, pages: list[np.ndarray]) -> Optional[np.ndarray]:
+        if self._length == 0:
+            return None
+        used = []
+        left = self._length
+        for p in pages:
+            n = min(left, self.page_size)
+            if n <= 0:
+                break
+            used.append(p[:, :n, :])
+            left -= n
+        return used[0].copy() if len(used) == 1 else np.concatenate(used, axis=1)
 
     def append(self, k_new: np.ndarray, v_new: np.ndarray) -> None:
-        if self.k is None:
-            self.k, self.v = k_new, v_new
-        else:
-            self.k = np.concatenate([self.k, k_new], axis=1)
-            self.v = np.concatenate([self.v, v_new], axis=1)
+        k_new = np.asarray(k_new, dtype=np.float32)
+        v_new = np.asarray(v_new, dtype=np.float32)
+        if k_new.shape != v_new.shape or k_new.ndim != 3:
+            raise ValueError(f"KV pages need matching [heads, T, dim], got {k_new.shape} and {v_new.shape}")
+        heads, n_new, dim = k_new.shape
+        if self._shape is None:
+            self._shape = (heads, dim)
+        elif self._shape != (heads, dim):
+            raise ValueError(f"KV shape changed from {self._shape} to {(heads, dim)}")
+        copied = 0
+        while copied < n_new:
+            page_idx = self._length // self.page_size
+            page_off = self._length % self.page_size
+            if page_idx == len(self._k_pages):
+                self._k_pages.append(np.zeros((heads, self.page_size, dim), np.float32))
+                self._v_pages.append(np.zeros((heads, self.page_size, dim), np.float32))
+            take = min(n_new - copied, self.page_size - page_off)
+            self._k_pages[page_idx][:, page_off:page_off + take, :] = k_new[:, copied:copied + take, :]
+            self._v_pages[page_idx][:, page_off:page_off + take, :] = v_new[:, copied:copied + take, :]
+            self._length += take
+            copied += take
 
     def truncate(self, length: int) -> None:
         """Drop everything at or beyond absolute position ``length``.
@@ -66,16 +117,18 @@ class LayerCache:
         positions into the cache, and whatever the rejection sampler declines has to
         disappear as if it was never computed.
         """
-        if self.k is None:
+        if self._length == 0:
             return
         if length <= 0:
-            self.k = self.v = None
-        elif length < self.k.shape[1]:
-            self.k = self.k[:, :length, :]
-            self.v = self.v[:, :length, :]
+            self._length = 0
+            self._k_pages.clear()
+            self._v_pages.clear()
+            self._shape = None
+        elif length < self._length:
+            self._length = int(length)
 
     def nbytes(self) -> int:
-        return 0 if self.k is None else int(self.k.nbytes + self.v.nbytes)
+        return sum(int(k.nbytes + v.nbytes) for k, v in zip(self._k_pages, self._v_pages))
 
 
 @dataclass
@@ -88,13 +141,14 @@ class KVCache:
 
     start_layer: int
     end_layer: int
+    page_size: int = 16
     window_start: int = 0
     layers: dict[int, LayerCache] = field(default_factory=dict)
 
     def layer(self, i: int) -> LayerCache:
         lc = self.layers.get(i)
         if lc is None:
-            lc = self.layers[i] = LayerCache()
+            lc = self.layers[i] = LayerCache(page_size=self.page_size)
         return lc
 
     @property
@@ -125,6 +179,95 @@ class KVCache:
         sequence and must rebuild.
         """
         return window_start == self.window_start and pos_offset == self.length
+
+
+@dataclass
+class ActivationCache:
+    """Client-side paged cache of pipeline-boundary activations.
+
+    Boundary ``0`` is raw token input and is intentionally not stored here.
+    Boundary ``j`` stores the hidden states emitted by stage ``j-1`` and therefore
+    the activations needed to hydrate/replay stage ``j`` after churn.
+    """
+
+    page_size: int = 16
+    _pages: dict[tuple[str, int], list[np.ndarray]] = field(default_factory=dict)
+    _lengths: dict[tuple[str, int], int] = field(default_factory=dict)
+    _dims: dict[tuple[str, int], int] = field(default_factory=dict)
+
+    def record(self, session: str, boundary: int, pos_offset: int, x: np.ndarray) -> None:
+        arr = np.asarray(x, dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError(f"activation cache stores [T, D], got {arr.shape}")
+        key = (session, int(boundary))
+        if pos_offset != self._lengths.get(key, 0):
+            if pos_offset == 0:
+                self.drop(session, boundary)
+            else:
+                raise ValueError(
+                    f"activation cache for {key} cannot append at {pos_offset}; "
+                    f"current length is {self._lengths.get(key, 0)}")
+        pages = self._pages.setdefault(key, [])
+        dim = int(arr.shape[1])
+        if key not in self._dims:
+            self._dims[key] = dim
+        elif self._dims[key] != dim:
+            raise ValueError(f"activation dimension changed from {self._dims[key]} to {dim}")
+        length = self._lengths.get(key, 0)
+        copied = 0
+        while copied < arr.shape[0]:
+            page_idx = length // self.page_size
+            page_off = length % self.page_size
+            if page_idx == len(pages):
+                pages.append(np.zeros((self.page_size, dim), np.float32))
+            take = min(arr.shape[0] - copied, self.page_size - page_off)
+            pages[page_idx][page_off:page_off + take, :] = arr[copied:copied + take, :]
+            length += take
+            copied += take
+        self._lengths[key] = length
+
+    def get(self, session: str, boundary: int, start: int = 0,
+            end: Optional[int] = None) -> np.ndarray:
+        key = (session, int(boundary))
+        length = self._lengths.get(key, 0)
+        end = length if end is None else int(end)
+        if start < 0 or end < start or end > length:
+            raise ValueError(f"activation span [{start}, {end}) outside cached length {length}")
+        pages = self._pages.get(key, [])
+        if start == end:
+            dim = self._dims.get(key, 0)
+            return np.zeros((0, dim), np.float32)
+        chunks = []
+        pos = start
+        while pos < end:
+            page_idx = pos // self.page_size
+            page_off = pos % self.page_size
+            take = min(end - pos, self.page_size - page_off)
+            chunks.append(pages[page_idx][page_off:page_off + take, :])
+            pos += take
+        return chunks[0].copy() if len(chunks) == 1 else np.concatenate(chunks, axis=0)
+
+    def length(self, session: str, boundary: int) -> int:
+        return self._lengths.get((session, int(boundary)), 0)
+
+    def page_count(self, session: str, boundary: int) -> int:
+        return len(self._pages.get((session, int(boundary)), []))
+
+    def drop(self, session: str, boundary: Optional[int] = None) -> None:
+        keys = [k for k in self._pages if k[0] == session and (boundary is None or k[1] == boundary)]
+        for key in keys:
+            self._pages.pop(key, None)
+            self._lengths.pop(key, None)
+            self._dims.pop(key, None)
+
+    def truncate(self, session: str, length: int) -> None:
+        for key in [k for k in self._pages if k[0] == session]:
+            if length <= 0:
+                self._pages.pop(key, None)
+                self._lengths.pop(key, None)
+                self._dims.pop(key, None)
+            elif length < self._lengths.get(key, 0):
+                self._lengths[key] = int(length)
 
 
 def block_cached(P: dict, cfg: M.ModelConfig, i: int, x: np.ndarray,
@@ -201,8 +344,12 @@ def llama_block_cached(P: dict, cfg: M.ModelConfig, i: int, x: np.ndarray,
     out = (att @ v_rep).transpose(1, 0, 2).reshape(T_new, D)
     x = x + out @ P[f"h{i}.attn.Wo"]
     b = M._rmsnorm(x, P[f"h{i}.rms2.g"], cfg.rms_norm_eps)
-    h = M._silu(b @ P[f"h{i}.mlp.Wgate"]) * (b @ P[f"h{i}.mlp.Wup"])
-    x = x + h @ P[f"h{i}.mlp.Wdown"]
+    if f"h{i}.mlp.Wgate_exps" in P:
+        h = M._llama_moe(P, cfg, i, b)
+    else:
+        h = M._silu(b @ P[f"h{i}.mlp.Wgate"]) * (b @ P[f"h{i}.mlp.Wup"])
+        h = h @ P[f"h{i}.mlp.Wdown"]
+    x = x + h
     return x.astype(np.float32)
 
 
