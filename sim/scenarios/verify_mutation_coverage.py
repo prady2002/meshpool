@@ -54,6 +54,21 @@ MUTATIONS = [
         ),
     },
     {
+        "id": "gguf-rope-never-applied",
+        "path": "meshpool/inference/gguf_loader.py",
+        "old": b"        permute = _rope_is_permuted(info.architecture)",
+        "new": b"        permute = False",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_gguf_loader.py",
+                "-q", "-m", "slow or not slow"],
+        "why": (
+            "Attacks the wiring rather than the arithmetic. Every rope test can "
+            "pass on unpermute_rope and the architecture table directly while "
+            "nothing checks that load_gguf actually *calls* them, which is the "
+            "shape of bug that survives a green suite. Under this mutation the "
+            "loader is a correct un-permuter that is simply never invoked."
+        ),
+    },
+    {
         "id": "gguf-rope-reshape-order",
         "path": "meshpool/inference/gguf_loader.py",
         "old": b"w.reshape(n_head, rows // n_head // 2, 2, *w.shape[1:])",
