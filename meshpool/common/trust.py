@@ -58,6 +58,16 @@ class TrustEngine:
     def _score(self, node_id: str) -> TrustScore:
         return self.store.get_trust(node_id) or TrustScore(node_id=node_id)
 
+    def snapshot(self, node_id: str) -> TrustScore:
+        """Public read of a node's current reputation signals.
+
+        Returns a default-valued score for a node that has never been observed.
+        Callers must therefore read ``samples`` before trusting any EMA on it:
+        the defaults are all optimistic, so an unseen node looks perfect. See
+        ``controlplane/nodeclass.py``, which is why this accessor exists.
+        """
+        return self._score(node_id)
+
     def _decay_beta(self, s: TrustScore, at_ms: Optional[int] = None) -> TrustScore:
         at = now_ms() if at_ms is None else int(at_ms)
         if s.beta_last_ms <= 0:

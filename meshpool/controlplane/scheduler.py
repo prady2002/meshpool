@@ -22,7 +22,8 @@ import hashlib
 import math
 from typing import Callable, Optional
 
-from ..common.models import LayerAssignment, Node, NodeStatus
+from ..common.models import LayerAssignment, Node, NodeStatus, TrustScore
+from .nodeclass import classify
 
 CONSTELLATION_RTT_THRESHOLD_MS = 25.0
 
@@ -355,6 +356,56 @@ def constellation_nodes_for_model(
     return index.nodes_for(c) if c is not None else []
 
 
+def stable_nodes_for_model(
+    nodes: list[Node],
+    trust_lookup: Optional[Callable[[str], Optional["TrustScore"]]],
+    *,
+    required_memory_mb: int,
+    headroom_fraction: float = 0.8,
+) -> list[Node]:
+    """Drop Drifter-class nodes from a placement pool -- but only if the model
+    still fits without them.
+
+    A pipeline's availability is the *product* of its stages', so one node that
+    unplugs at 6pm degrades every request rather than its own share of them. The
+    scheduler otherwise cannot see this at all: ``_usable_shard_nodes`` filters on
+    advertised service and memory, and a laptop with 64 GB looks strictly better
+    than a mini-PC with 16 GB right up until it closes.
+
+    Preference, never prohibition. The product promise is running models that fit
+    on no single machine, so a rule that turns a working deployment into
+    "insufficient pooled memory" is a regression wearing a safety feature's
+    clothes. When the volatile node is load-bearing, it is used and the volatility
+    is handled where it belongs -- hot spares (§3.4).
+
+    ``trust_lookup`` of ``None``, or one that knows nothing about these nodes,
+    leaves the pool exactly as it was: LAN mode and freshly restarted
+    coordinators have no history, and inventing one would empty the pool.
+    """
+    if trust_lookup is None or not nodes:
+        return list(nodes)
+
+    keep: list[Node] = []
+    dropped: list[Node] = []
+    for n in nodes:
+        try:
+            verdict = classify(n, trust_lookup(n.id))
+        except Exception:  # noqa: BLE001
+            # Classification is an optimisation. It must never be the reason a
+            # model fails to deploy, so an unexpected signal keeps the node.
+            keep.append(n)
+            continue
+        (keep if verdict.suitable_for_pipeline_stage() else dropped).append(n)
+
+    if not dropped or not keep:
+        return list(nodes)
+
+    available_mb = sum(u["cap_mb"] for u in _usable_shard_nodes(keep, headroom_fraction))
+    if available_mb < required_memory_mb:
+        return list(nodes)
+    return keep
+
+
 def explain_layer_bytes_fit(
     nodes: list[Node],
     layer_bytes: list[int] | tuple[int, ...],
@@ -385,6 +436,8 @@ def topology_partition_by_bytes(
     layer_bytes: list[int] | tuple[int, ...],
     headroom_fraction: float = 0.8,
     rtt_predictor: Optional[Callable[[str, str], Optional[float]]] = None,
+    *,
+    trust_lookup: Optional[Callable[[str], Optional[TrustScore]]] = None,
 ) -> list[LayerAssignment]:
     """Assign contiguous, indivisible layer ranges using measured layer bytes.
 
@@ -395,6 +448,10 @@ def topology_partition_by_bytes(
     """
     layer_bytes = tuple(int(b) for b in layer_bytes)
     n_layers = len(layer_bytes)
+    nodes = stable_nodes_for_model(
+        nodes, trust_lookup,
+        required_memory_mb=math.ceil(sum(layer_bytes) / (1024 * 1024)),
+        headroom_fraction=headroom_fraction)
     fit = explain_layer_bytes_fit(nodes, layer_bytes, headroom_fraction)
     if not fit.fits:
         return []
@@ -486,6 +543,8 @@ def topology_partition(
     per_layer_mb: int,
     headroom_fraction: float = 0.8,
     rtt_predictor: Optional[Callable[[str, str], Optional[float]]] = None,
+    *,
+    trust_lookup: Optional[Callable[[str], Optional[TrustScore]]] = None,
 ) -> list[LayerAssignment]:
     """Greedily assign contiguous blocks of layers to nodes (pipeline parallel).
 
@@ -502,6 +561,11 @@ def topology_partition(
     :func:`latency_sort_nodes` so that consecutive pipeline stages land on low-
     latency pairs, reducing the ``(N-1) * RTT`` per-token pipeline overhead.
     """
+    nodes = stable_nodes_for_model(
+        nodes, trust_lookup,
+        required_memory_mb=n_layers * per_layer_mb,
+        headroom_fraction=headroom_fraction)
+
     usable = []
     for u0 in _usable_shard_nodes(nodes, headroom_fraction):
         n = u0["node"]
@@ -512,7 +576,6 @@ def topology_partition(
 
     if not usable:
         return []
-
     total_capacity = sum(u["cap"] for u in usable)
     if total_capacity < n_layers:
         # Not enough pooled memory to host the whole model.

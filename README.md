@@ -441,6 +441,24 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
 
 ## ⚖️ Honest constraints (we report real numbers, never invented ones)
 
+- **Nodes are classified automatically, and the classification only ever expresses a
+  preference.** `meshpool/controlplane/nodeclass.py` derives one of four classes --
+  Anchor, Relay, Constellation, Drifter -- from signals that were actually measured:
+  NAT class and battery state from the hardware probe, uptime and latency consistency
+  from the trust engine. Placement uses it to keep Drifter-class machines out of
+  inference pipeline stages, because a pipeline's availability is the *product* of its
+  stages' and one machine that unplugs at 6pm degrades every request rather than its
+  own share of them. Two limits are deliberate and worth stating. First, it is a
+  preference and never a prohibition: if dropping the volatile node would make the
+  model unhostable, the node is used, because refusing to place at all is a worse
+  outcome than placing on a machine that might leave. Second, promotion requires 50
+  recorded observations, since every reputation EMA *defaults to 1.0* -- a node with
+  no history looks flawless, and reading that as evidence would hand a stranger's
+  first heartbeat an Anchor role. With no trust history at all (LAN mode, or a freshly
+  restarted coordinator) placement is byte-for-byte what it was before. What is **not**
+  claimed: that the classes predict departure well. The thresholds are reasoned, not
+  fitted to observed churn data, because no such data exists on a single-machine
+  test bench.
 - **Real GGUF checkpoints load and shard correctly — but no pretrained weights were ever
   downloaded on this machine.** `meshpool/inference/gguf_loader.py` reads real GGUF
   containers through llama.cpp's own reference reader, loads *only* an assigned layer

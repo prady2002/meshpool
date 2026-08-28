@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import os
 import time
 from typing import Callable, Optional
@@ -58,6 +59,12 @@ class InferenceManager:
         # pre-install on every node has its weights staged in the pooled blob store;
         # this handle hydrates them (cached by content-addressed blob id) at load time.
         self.storage = None
+        # Set post-construction in the control-plane lifespan, alongside ``storage``.
+        # Placement uses it to keep Drifter-class nodes (unreachable, intermittent,
+        # or battery powered) out of pipeline stages when the model still fits
+        # without them -- see controlplane/nodeclass.py. Left None in LAN mode and
+        # in tests, where placement behaves exactly as it did before.
+        self.trust = None
         self._manifest_cache: dict[str, tuple[dict, Optional[dict]]] = {}
         # Placement telemetry: how many weight-group blobs were put on a node by a direct
         # peer-to-peer pull vs. relayed through the control plane (fallback / tunnel) vs.
@@ -82,15 +89,51 @@ class InferenceManager:
     def get(self, model_id: str) -> Optional[ModelDeployment]:
         return self.store.get_model(model_id)
 
+    def _trust_lookup(self):
+        """A ``node_id -> TrustScore`` reader, or None when no history exists.
+
+        Returning None rather than a lookup that answers "no data" for everything
+        matters: ``stable_nodes_for_model`` treats None as "leave the pool alone",
+        which is the behaviour LAN mode and freshly restarted coordinators need.
+        """
+        trust = getattr(self, "trust", None)
+        snapshot = getattr(trust, "snapshot", None)
+        return snapshot if callable(snapshot) else None
+
     def _plan_partition(self, backend, nodes, cfg, rtt_predictor=None):
         """Plan a partition, injecting the Vivaldi RTT predictor for meshshard."""
+        trust_lookup = self._trust_lookup()
         if not backend.native_generate and rtt_predictor is not None:
             from ..controlplane.scheduler import topology_partition
             return topology_partition(
                 nodes, cfg.n_layer, cfg.per_layer_mb,
                 rtt_predictor=rtt_predictor,
+                trust_lookup=trust_lookup,
             )
+        # Every other backend plans through its own adapter, including ones this
+        # repo does not own. Narrowing the pool here rather than threading a new
+        # keyword through `plan_partition` means the guarantee holds for all of
+        # them and no adapter signature has to change to get it.
+        if trust_lookup is not None:
+            from ..controlplane.scheduler import stable_nodes_for_model
+            nodes = stable_nodes_for_model(
+                nodes, trust_lookup,
+                required_memory_mb=self._required_memory_mb(cfg))
         return backend.plan_partition(nodes, cfg)
+
+    @staticmethod
+    def _required_memory_mb(cfg) -> int:
+        """How much pooled memory this model needs, from measured bytes when known.
+
+        Understating this would let a pool that only fits the model *with* its
+        volatile members drop them anyway, turning a working deployment into
+        "insufficient pooled memory". When in doubt the value is overstated, which
+        can only ever make the filter more conservative about dropping nodes.
+        """
+        layer_bytes = getattr(cfg, "layer_bytes", None)
+        if layer_bytes:
+            return math.ceil(sum(layer_bytes) / (1024 * 1024))
+        return int(getattr(cfg, "n_layer", 0) or 0) * int(getattr(cfg, "per_layer_mb", 0) or 0)
 
     def view(self, model_id: str) -> Optional[dict]:
         """Dashboard-shaped summary of a deployment."""

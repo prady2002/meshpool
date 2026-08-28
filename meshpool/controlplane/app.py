@@ -223,6 +223,11 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
         # A model too big to pre-install on every node has its weights staged in the
         # pool and hydrated per-stage on load, so inference needs the same handle.
         CP.inference.storage = CP.storage
+        # Node classification (§3.6) reads reputation, so placement can keep
+        # Drifter-class machines out of pipeline stages when the model still fits
+        # without them. A pipeline's availability is the product of its stages',
+        # so one node that unplugs at 6pm degrades every request.
+        CP.inference.trust = CP.trust
         # User WASM modules are distributed through the pooled object store, so the
         # batch engine needs the same handle.
         CP.batch.storage = CP.storage
