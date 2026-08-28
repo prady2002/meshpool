@@ -937,6 +937,7 @@ def _register_routes(app: FastAPI) -> None:
     _declare_route("GET",    "/api/v1/models",                Scope.MODELS_READ)
     _declare_route("GET",    "/api/v1/models/available",      Scope.MODELS_READ)
     _declare_route("GET",    "/api/v1/models/{model_id}",     Scope.MODELS_READ)
+    _declare_route("GET",    "/api/v1/models/{model_id}/durability", Scope.MODELS_READ)
     _declare_route("DELETE", "/api/v1/models/{model_id}",     Scope.MODELS_WRITE)
     _declare_route("POST",   "/api/v1/inference/chat",        Scope.INFERENCE_INVOKE)
     # OpenAI-compatible surface (/v1/ prefix to match the OpenAI wire protocol)
@@ -2324,6 +2325,27 @@ def _register_routes(app: FastAPI) -> None:
         if not v:
             raise HTTPException(status_code=404, detail="unknown model deployment")
         return v
+
+    @app.get("/api/v1/models/{model_id}/durability")
+    async def model_durability(model_id: str) -> dict:
+        """How many machines hold each of this model's layer groups.
+
+        On borrowed hardware the interesting question is not "is it up" but "what
+        happens when these machines go away". ``survives_machine_losses`` answers it:
+        that many nodes can leave before the model can no longer be rebuilt at all,
+        governed by whichever layer group is held by fewest machines, because a
+        pipeline needs every layer.
+
+        Watching the counts climb as the pool serves the model is the visible form of
+        weight-swarm growth: a node that serves a layer keeps it and becomes a source
+        for the next node that needs it, so a model gets *more* durable the more it is
+        used rather than less.
+        """
+        cp = _cp()
+        d = await cp.inference.durability(model_id)
+        if d is None:
+            raise HTTPException(status_code=404, detail="unknown model deployment")
+        return d
 
     @app.delete("/api/v1/models/{model_id}")
     async def remove_model(model_id: str) -> dict:

@@ -107,8 +107,37 @@ def model_view(cp: str, mid: str) -> dict:
     return CLIENT.get(f"{cp}/api/v1/models/{mid}", timeout=30).json()
 
 
+def durability(cp: str, mid: str) -> dict:
+    r = CLIENT.get(f"{cp}/api/v1/models/{mid}/durability", timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def wait_reform(cp: str, mid: str, gone: str, timeout: float = 180) -> tuple[dict, float]:
+    """Block until the deployment is ready again without ``gone`` in it."""
+    t0 = time.perf_counter()
+    deadline = time.time() + timeout
+    live = model_view(cp, mid)
+    while time.time() < deadline:
+        live = model_view(cp, mid)
+        serving = [st["node_name"] for st in live.get("stages", [])]
+        if live.get("status") == "ready" and gone not in serving:
+            break
+        time.sleep(2.0)
+    return live, time.perf_counter() - t0
+
+
 def agent_url(h: Harness, idx: int) -> str:
     return f"http://{h.host}:{h.agent_ports[idx]}"
+
+
+def live_indices(cp: str) -> list[int]:
+    """Agent indices of the nodes the coordinator currently considers online."""
+    out = []
+    for n in nodes(cp):
+        if n.get("status") == "online" and str(n.get("name", "")).startswith("sim-node-"):
+            out.append(int(n["name"].rsplit("-", 1)[1]) - 1)
+    return sorted(out)
 
 
 def blob_has(h: Harness, idx: int, bid: str) -> bool:
@@ -206,6 +235,11 @@ def main() -> int:  # noqa: C901 - a gate reads best as one linear narrative
         else:
             _ok(f"all {pulls} weight group placements were direct peer pulls")
 
+        dur0 = durability(cp, mid)
+        print(f"  durability at upload: {dur0['groups']} groups, "
+              f"min {dur0['min_holders']} holder(s) each, "
+              f"{dur0['total_placements']} placements total")
+
         # ---- 3: a machine that has never seen this model joins ------------ #
         print("\n== 3: a cold machine joins an already-serving pool ==")
         cold_idx = N_AGENTS
@@ -221,19 +255,10 @@ def main() -> int:  # noqa: C901 - a gate reads best as one linear narrative
         victim = view["stages"][0]["node_name"]
         victim_idx = int(victim.rsplit("-", 1)[1]) - 1
         before = summary(cp)
-        t0 = time.perf_counter()
         h.stop_agent(victim_idx, fast=True)
         print(f"  killed {victim}; waiting for the pool to re-form around the newcomer")
 
-        deadline = time.time() + 180
-        live = model_view(cp, mid)
-        while time.time() < deadline:
-            live = model_view(cp, mid)
-            serving = [st["node_name"] for st in live.get("stages", [])]
-            if live.get("status") == "ready" and victim not in serving:
-                break
-            time.sleep(2.0)
-        heal_s = time.perf_counter() - t0
+        live, heal_s = wait_reform(cp, mid, victim)
         serving = [st["node_name"] for st in live.get("stages", [])]
         after = summary(cp)
         print(f"  {heal_s:.1f}s to re-form; serving={serving}")
@@ -281,8 +306,18 @@ def main() -> int:  # noqa: C901 - a gate reads best as one linear narrative
             _fail(f"probe landed on {len(holder_idx)} node(s); the routed-around check "
                   f"needs one dishonest holder and one honest one")
             raise SystemExit
-        if blob_has(h, cold_idx, want_id):
-            _fail("the cold node already holds the probe; it is not a cold fetch")
+        # The puller has to be a node that does *not* already hold the probe. Which
+        # nodes the pool replicated it to is its own decision, so pick the puller from
+        # what actually happened rather than assuming the newcomer was passed over.
+        spare = [i for i in live_indices(cp) if i not in holder_idx]
+        if not spare:
+            _fail("every online node already holds the probe, so there is nobody left "
+                  "to perform a cold fetch")
+            raise SystemExit
+        puller = spare[0]
+        print(f"  puller: sim-node-{puller + 1} (holds nothing yet)")
+        if blob_has(h, puller, want_id):
+            _fail(f"sim-node-{puller + 1} already holds the probe; not a cold fetch")
 
         liar, honest = holder_idx[0], holder_idx[1]
         h.set_corrupt_blobs(liar, True)
@@ -303,12 +338,12 @@ def main() -> int:  # noqa: C901 - a gate reads best as one linear narrative
 
         plan = {"blob_id": want_id,
                 "sources": [agent_url(h, liar), agent_url(h, honest)]}
-        rr = CLIENT.post(f"{agent_url(h, cold_idx)}/blob_pull", json=plan, timeout=180)
+        rr = CLIENT.post(f"{agent_url(h, puller)}/blob_pull", json=plan, timeout=180)
         if rr.status_code != 200:
             _fail(f"the pull failed ({rr.status_code}) even though an honest source was "
                   f"listed; one bad peer must not deny service: {rr.text[:200]}")
         else:
-            got = blob_get_raw(h, cold_idx, want_id)
+            got = blob_get_raw(h, puller, want_id)
             if hashlib.sha256(got).hexdigest() != want_id:
                 _fail("the node stored bytes that do not match the id it stored them "
                       "under — a poisoned shard on disk")
@@ -317,19 +352,19 @@ def main() -> int:  # noqa: C901 - a gate reads best as one linear narrative
                     "disk verifies against its id")
 
         print("\n== 5: when every holder lies, the pull fails closed ==")
-        CLIENT.post(f"{agent_url(h, cold_idx)}/blob_delete",
+        CLIENT.post(f"{agent_url(h, puller)}/blob_delete",
                     json={"blob_id": want_id}, timeout=30).raise_for_status()
-        if blob_has(h, cold_idx, want_id):
+        if blob_has(h, puller, want_id):
             _fail("could not clear the probe from the cold node; check 5 would be "
                   "testing a cache hit")
             raise SystemExit
         for i in holder_idx:
             h.set_corrupt_blobs(i, True)
-        rr = CLIENT.post(f"{agent_url(h, cold_idx)}/blob_pull",
+        rr = CLIENT.post(f"{agent_url(h, puller)}/blob_pull",
                          json={"blob_id": want_id,
                                "sources": [agent_url(h, i) for i in holder_idx]},
                          timeout=180)
-        stored = blob_has(h, cold_idx, want_id)
+        stored = blob_has(h, puller, want_id)
         print(f"  pull returned {rr.status_code}; node holds it afterwards: {stored}")
         if rr.status_code == 200:
             _fail("the pull reported success with no honest source available — the "
@@ -351,11 +386,11 @@ def main() -> int:  # noqa: C901 - a gate reads best as one linear narrative
             _ok("the live model kept answering byte-identically throughout")
 
         print("\n== 6: re-fetching something already held moves no bytes ==")
-        CLIENT.post(f"{agent_url(h, cold_idx)}/blob_pull",
+        CLIENT.post(f"{agent_url(h, puller)}/blob_pull",
                     json={"blob_id": want_id,
                           "sources": [agent_url(h, i) for i in holder_idx]},
                     timeout=180).raise_for_status()
-        again = CLIENT.post(f"{agent_url(h, cold_idx)}/blob_pull",
+        again = CLIENT.post(f"{agent_url(h, puller)}/blob_pull",
                             json={"blob_id": want_id,
                                   "sources": [agent_url(h, i) for i in holder_idx]},
                             timeout=180)
@@ -369,6 +404,86 @@ def main() -> int:  # noqa: C901 - a gate reads best as one linear narrative
                   f"to remove")
         else:
             _ok("already-resident content is recognised and nothing is transferred")
+
+        # ---- 7: serving a layer makes you a source for it ----------------- #
+        print("\n== 7: the swarm grows — a node that served a layer now seeds it ==")
+        dur1 = durability(cp, mid)
+        newcomer_id = newcomer["id"]
+        seeded = [g["group"] for g in dur1["per_group"] if newcomer_id in g["nodes"]]
+        # Deliberately NOT asserted on the placement total: nodes have left since the
+        # upload, and a departing node is correctly struck from every group it held,
+        # so the total is not monotonic and comparing the two snapshots would measure
+        # churn rather than growth. The churn-proof form of the claim is per-node --
+        # this specific machine held none of these groups and now seeds several.
+        at_upload = {n for g in dur0["per_group"] for n in g["nodes"]}
+        print(f"  placements {dur0['total_placements']} -> {dur1['total_placements']} "
+              f"(net of departures); {newcomer['name']} now seeds {len(seeded)} "
+              f"group(s); survives_machine_losses={dur1['survives_machine_losses']}")
+        if newcomer_id in at_upload:
+            _fail(f"{newcomer['name']} was already a holder at upload time, so it "
+                  f"seeding groups now proves nothing")
+        elif not seeded:
+            _fail(f"{newcomer['name']} pulled and is serving layers it demonstrably "
+                  f"holds, but is offered as a source for none of them. Every future "
+                  f"joiner is therefore routed back to the machines the upload "
+                  f"replicated to, and the swarm never grows past them")
+        else:
+            _ok(f"{newcomer['name']} joined holding nothing and now seeds "
+                f"{len(seeded)} of {dur1['groups']} group(s) — the pool became more "
+                f"durable by being used")
+
+        # ---- 8: outliving every machine it was uploaded to ---------------- #
+        # The strongest form of the claim, and the one a user actually cares about:
+        # the machines that received the upload are borrowed, and they will leave.
+        print("\n== 8: every machine the model was uploaded to leaves ==")
+        # Two more newcomers, not one: the model needs 8 GB of donated RAM to place at
+        # all, and the survivors of three departures cannot supply it otherwise. The
+        # claim under test is about *where the weights come from*, so it must not be
+        # allowed to fail for want of somewhere to put them.
+        late_idx = [N_AGENTS + 1, N_AGENTS + 2]
+        for i in late_idx:
+            h.start_agent(i)
+        h.wait_nodes_online(N_AGENTS + len(late_idx), timeout=120)
+        late_names = {f"sim-node-{cold_idx + 1}"} | {f"sim-node-{i + 1}" for i in late_idx}
+        print(f"  machines that joined after the upload: {sorted(late_names)}")
+        originals = [f"sim-node-{i + 1}" for i in range(N_AGENTS)]
+        push_before = summary(cp).get("weight_group_pushes", 0)
+        for name in originals[1:]:            # sim-node-1 was already killed in 3
+            idx = int(name.rsplit("-", 1)[1]) - 1
+            h.stop_agent(idx, fast=True)
+            live, secs = wait_reform(cp, mid, name)
+            serving = [st["node_name"] for st in live.get("stages", [])]
+            print(f"  {name} gone -> re-formed in {secs:.1f}s on {serving}")
+            if live.get("status") != "ready" or name in serving:
+                _fail(f"the pool could not re-form after {name} left "
+                      f"(status={live.get('status')!r}, serving={serving}); the layers "
+                      f"it held were nowhere else")
+                break
+        else:
+            final = chat(cp, mid)
+            dur2 = durability(cp, mid)
+            push_after = summary(cp).get("weight_group_pushes", 0)
+            late_ids = {n["id"] for n in nodes(cp) if n.get("name") in late_names}
+            stranded = sorted({n for g in dur2["per_group"] for n in g["nodes"]}
+                              - late_ids)
+            print(f"  every original machine is gone; {dur2['groups']} group(s) still "
+                  f"held, min {dur2['min_holders']} holder(s) each")
+            if final != oracle:
+                _fail(f"the answer changed after the original machines left\n"
+                      f"    want={oracle!r}\n    got ={final!r}")
+            elif dur2["min_holders"] < 1:
+                _fail(f"a layer group has no live holder at all: {dur2['per_group']}")
+            elif stranded:
+                _fail(f"the model is still counted as held by machines that are gone: "
+                      f"{stranded}")
+            elif push_after != push_before:
+                _fail(f"the coordinator relayed {push_after - push_before} weight "
+                      f"group(s) to keep the model alive; it should have been able to "
+                      f"source every one of them from a peer")
+            else:
+                _ok(f"all {N_AGENTS} machines the checkpoint was uploaded to have "
+                    f"left, every layer group is now held only by machines that "
+                    f"joined afterwards, and the model still answers byte-identically")
 
     except SystemExit:
         pass

@@ -380,6 +380,77 @@ class InferenceManager:
         self._manifest_cache[bid] = (manifest, meta)
         return manifest, meta
 
+    async def durability(self, model_id: str) -> Optional[dict]:
+        """How many machines hold each of this model's weight groups.
+
+        The question a user actually has about a deployment on borrowed hardware is
+        not "is it up" -- they can see that -- but "what happens when these machines
+        go away". For a pooled model that reduces to one number: the least-held weight
+        group. Lose that many machines and the model cannot be re-formed at all,
+        because the layers to rebuild it with are gone. Every other stage can be
+        replaced from a peer.
+
+        Reporting the *node ids* alongside the counts is deliberate: it is what makes
+        the swarm's growth visible. A group that starts on the two machines the upload
+        replicated to, and is later held by five because five nodes served that layer
+        and kept it, is a model that has quietly become more durable through use. That
+        is the property Weight Swarm exists to create, and it should be something a
+        user can see rather than something a design document asserts.
+        """
+        dep = self.store.get_model(model_id)
+        if dep is None:
+            return None
+        manifest, _ = await self._resolve_manifest(dep)
+        if manifest is None or self.storage is None:
+            # A built-in checkpoint ships with the agent, so every node that can run
+            # the model already has the weights. There is nothing to lose.
+            return {"model_id": model_id, "pooled": False, "groups": 0,
+                    "min_holders": None, "survives_machine_losses": None,
+                    "per_group": [],
+                    "note": "built-in weights: every node already has this checkpoint"}
+        live = {n.id for n in self.registry.online()}
+        per_group: list[dict] = []
+        for gname, bid in sorted((manifest.get("groups") or {}).items()):
+            holders = self._live_holders(bid, live)
+            per_group.append({"group": gname, "blob": bid[:12],
+                              "holders": len(holders), "nodes": sorted(holders)})
+        counts = [g["holders"] for g in per_group]
+        min_h = min(counts) if counts else 0
+        return {
+            "model_id": model_id,
+            "pooled": True,
+            "groups": len(per_group),
+            "min_holders": min_h,
+            "max_holders": max(counts) if counts else 0,
+            "total_placements": sum(counts),
+            # Machines that can leave before the model can no longer be rebuilt. The
+            # weakest group governs, because a pipeline needs every layer.
+            "survives_machine_losses": max(0, min_h - 1),
+            "distinct_holders": len({n for g in per_group for n in g["nodes"]}),
+            "per_group": per_group,
+        }
+
+    def _live_holders(self, blob_id: str, live: set) -> set:
+        """Online nodes that can serve ``blob_id`` in full.
+
+        A chunked object is only as available as its scarcest chunk, so it is counted
+        by the number of nodes that hold *every* chunk -- plus anyone recorded as
+        holding the reassembled whole, which is what a node that pulled the group ends
+        up with.
+        """
+        meta = self.storage.get_meta(blob_id)
+        if meta is None:
+            return set()
+        whole = {n for n in meta.replicas if n in live}
+        if not meta.chunks:
+            return whole
+        per_chunk = []
+        for cid in meta.chunks:
+            cm = self.storage.get_meta(cid)
+            per_chunk.append({n for n in (cm.replicas if cm else []) if n in live})
+        complete = set.intersection(*per_chunk) if per_chunk else set()
+        return whole | complete
+
     async def _place_blobs(self, node_id: str, blob_ids: list[str]) -> None:
         """Ensure each weight-group blob is present on ``node_id``.
 
@@ -396,12 +467,41 @@ class InferenceManager:
                     node_id, "blob_has", {"blob_id": bid}, timeout=10.0)
                 if has.get("has"):
                     self.weight_group_cached += 1
+                    self._note_holder(node_id, bid)
                     continue
             except TransportError:
                 pass   # can't confirm -- fall through and (re)place it
             if may_pull and await self._try_peer_pull(node_id, bid):
+                self._note_holder(node_id, bid)
                 continue
             await self._push_blob(node_id, bid)
+            self._note_holder(node_id, bid)
+
+    def _note_holder(self, node_id: str, bid: str) -> None:
+        """Tell the pool that ``node_id`` now holds group ``bid``, so the *next* node
+        that needs it can pull from this one too.
+
+        Without this the swarm does not swarm. Every node that ever joins is routed to
+        the same handful of nodes the original upload replicated to, so the tenth
+        machine to join queues behind nine others on the same two peers -- which is the
+        exact bottleneck peer-to-peer distribution exists to remove, just relocated from
+        the coordinator onto two unlucky volunteers. It is invisible to every functional
+        test, because every pull still succeeds and every model still loads; it shows up
+        only as the pool getting slower the more it is used.
+
+        This is BitTorrent's central idea: a peer becomes a seed the moment it finishes,
+        so capacity grows with demand instead of being consumed by it.
+        """
+        note = getattr(self.storage, "note_replica", None)
+        if not callable(note):
+            return          # a storage backend without the seam: placement still works
+        try:
+            if note(bid, node_id):
+                log.debug("weight group holder recorded", node=node_id, blob=bid[:12])
+        except Exception as exc:  # noqa: BLE001
+            # Bookkeeping must never fail a placement: the bytes are already there.
+            log.warning("could not record weight group holder",
+                        node=node_id, blob=bid[:12], err=str(exc)[:120])
 
     async def _try_peer_pull(self, node_id: str, bid: str) -> bool:
         """Attempt a direct peer-to-peer pull of one group blob onto ``node_id``. Returns
@@ -441,6 +541,13 @@ class InferenceManager:
         meta = self.storage.get_meta(blob_id)
         if meta is None:
             return None
+        # A node that acquired the whole object can serve it in one piece, which is
+        # both cheaper and simpler than re-assembling it from chunks. This branch only
+        # ever fires *after* someone has already fetched it once, so it is exactly the
+        # "second and subsequent joiners are cheaper than the first" property.
+        whole = self._holder_urls(meta.replicas, exclude_node)
+        if whole:
+            return {"blob_id": blob_id, "sources": whole}
         if meta.chunks:
             chunks: list[dict] = []
             for cid in meta.chunks:
@@ -450,10 +557,7 @@ class InferenceManager:
                     return None
                 chunks.append({"id": cid, "sources": srcs})
             return {"blob_id": blob_id, "chunks": chunks}
-        srcs = self._holder_urls(meta.replicas, exclude_node)
-        if not srcs:
-            return None
-        return {"blob_id": blob_id, "sources": srcs}
+        return None
 
     def _holder_urls(self, node_ids, exclude_node: str) -> list[str]:
         """Advertised URLs of the online nodes that hold a blob, minus the target."""

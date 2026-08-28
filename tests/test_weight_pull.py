@@ -389,3 +389,96 @@ def test_blob_pull_is_idempotent_when_already_cached(tmp_path, monkeypatch):
     out = _run_pull(monkeypatch, state, {},            # no peers needed
                     daemon.BlobPullRequest(blob_id=bid, sources=["http://a"]))
     assert out["stored"] is True and out.get("cached") is True
+
+
+# --------------------------------------------------------------------------- #
+# The swarm must grow: a node that acquires a group becomes a source for the next
+# --------------------------------------------------------------------------- #
+class RecordingStorage(FakeStorage):
+    """FakeStorage that also implements the note_replica seam StorageManager has."""
+
+    def note_replica(self, blob_id, node_id):
+        meta = self._metas.get(blob_id)
+        if meta is None or node_id in meta.replicas:
+            return
+        meta.replicas = [*meta.replicas, node_id]
+
+
+def test_a_node_that_pulled_a_group_becomes_a_source_for_the_next_node():
+    """Otherwise every joiner pulls from the same original holders forever.
+
+    This is the difference between a swarm and a fan-out from a fixed origin. With
+    600 GB of weights and a pool that is growing, sourcing every new node from the
+    same two machines re-creates the exact bottleneck peer-to-peer distribution
+    exists to remove -- it just moves it off the coordinator and onto two unlucky
+    peers. Nothing about it is visible in a functional test: every pull still
+    succeeds, every model still loads. It only shows up as the pool getting slower
+    the more it is used, which is the opposite of what a swarm is supposed to do.
+    """
+    bid = _sha(b"weights")
+    storage = RecordingStorage(
+        metas={bid: types.SimpleNamespace(replicas=["A"], chunks=[])})
+    reg = FakeReg({"A": _node("A", "http://a:9"), "B": _node("B", "http://b:9"),
+                   "C": _node("C", "http://c:9")})
+    tr = FakePlaceTransport(has=(), peer_ok=True)
+    mgr = _mgr(tr, storage, reg)
+
+    asyncio.run(mgr._place_blobs("B", [bid]))       # B pulls from A
+
+    plan = mgr._pull_plan(bid, exclude_node="C")
+    assert plan is not None
+    assert sorted(plan["sources"]) == ["http://a:9", "http://b:9"], (
+        "after B acquired the group it is still not offered as a source, so the "
+        f"next node can only pull from the original holder: {plan}")
+
+
+def test_a_relayed_group_also_makes_the_node_a_source():
+    """The bytes got there either way; where they came from does not change who
+    can serve them next. A node seeded by the coordinator fallback that never
+    becomes a peer source keeps the coordinator on the critical path forever."""
+    bid = _sha(b"weights-relayed")
+    storage = RecordingStorage(
+        metas={bid: types.SimpleNamespace(replicas=["A"], chunks=[])},
+        blobs={bid: b"weights-relayed"})
+    reg = FakeReg({"A": _node("A", "http://a:9", online=False),
+                   "B": _node("B", "http://b:9"), "C": _node("C", "http://c:9")})
+    tr = FakePlaceTransport(has=(), peer_ok=True)
+    mgr = _mgr(tr, storage, reg)
+
+    asyncio.run(mgr._place_blobs("B", [bid]))       # no live peer -> relayed
+    assert "blob_put" in tr.paths()
+
+    plan = mgr._pull_plan(bid, exclude_node="C")
+    assert plan == {"blob_id": bid, "sources": ["http://b:9"]}, (
+        f"a relayed node never becomes a peer source: {plan}")
+
+
+def test_an_already_resident_node_is_recorded_as_a_source_too():
+    """blob_has short-circuits placement, and that early return is the easiest
+    place to forget: the node demonstrably holds the bytes -- it just told us so."""
+    bid = _sha(b"already-there")
+    storage = RecordingStorage(
+        metas={bid: types.SimpleNamespace(replicas=["A"], chunks=[])})
+    reg = FakeReg({"A": _node("A", "http://a:9"), "B": _node("B", "http://b:9"),
+                   "C": _node("C", "http://c:9")})
+    tr = FakePlaceTransport(has=(bid,), peer_ok=True)
+    mgr = _mgr(tr, storage, reg)
+
+    asyncio.run(mgr._place_blobs("B", [bid]))
+    assert "blob_pull" not in tr.paths() and "blob_put" not in tr.paths()
+
+    plan = mgr._pull_plan(bid, exclude_node="C")
+    assert plan is not None
+    assert sorted(plan["sources"]) == ["http://a:9", "http://b:9"], plan
+
+
+def test_placement_survives_storage_without_the_seam():
+    """Older/simpler storage objects have no note_replica; placement must not care."""
+    bid = _sha(b"no-seam")
+    storage = FakeStorage(metas={bid: types.SimpleNamespace(replicas=["A"], chunks=[])})
+    reg = FakeReg({"A": _node("A", "http://a:9"), "B": _node("B", "http://b:9")})
+    tr = FakePlaceTransport(has=(), peer_ok=True)
+    mgr = _mgr(tr, storage, reg)
+
+    asyncio.run(mgr._place_blobs("B", [bid]))       # must not raise
+    assert "blob_pull" in tr.paths()

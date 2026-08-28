@@ -845,6 +845,31 @@ class StorageManager:
     def get_meta(self, blob_id: str) -> Optional[BlobMeta]:
         return self.store.get_blob(blob_id)
 
+    def note_replica(self, blob_id: str, node_id: str) -> bool:
+        """Record that ``node_id`` now holds a full copy of ``blob_id``.
+
+        Distribution engines call this when a node acquires an object outside the
+        normal replication path -- an inference stage pulling the weight groups for
+        its layers, say. Without it the pool's picture of who holds what is frozen at
+        whatever the original ``put`` decided, so every later reader is routed to the
+        same original holders no matter how many nodes already have the bytes sitting
+        on disk. Recording the acquisition turns a fan-out from a fixed origin into a
+        swarm, and it is also what lets the repair loop count copies that already
+        exist instead of manufacturing more.
+
+        Returns True if this was new information.
+        """
+        meta = self.store.get_blob(blob_id)
+        if meta is None or node_id in meta.replicas:
+            return False
+        meta.replicas = [*meta.replicas, node_id]
+        # Only ever *improves* health, and a chunked object's status is derived from
+        # its chunks, so leave that one alone rather than overwriting it here.
+        if not meta.chunks:
+            meta.status = self._status(len(meta.replicas), meta.replication_desired)
+        self.store.put_blob(meta)
+        return True
+
     # --- durability ------------------------------------------------------ #
     def on_node_offline(self, node_id: str) -> None:
         """A node dropped: forget its copies so reads stop targeting it and the repair
