@@ -46,17 +46,17 @@ export function JobTimelinePage() {
   }
 
   if (!timeline) {
-    return <section className="rounded-[28px] border border-slate-800 bg-slate-950/75 p-6 text-slate-400">Loading job timeline…</section>
+    return <section className="rounded-[28px] border border-slate-200 dark:border-slate-800 bg-white/90 dark:bg-slate-950/75 p-6 text-slate-600 dark:text-slate-400">Loading job timeline…</section>
   }
 
   return (
     <section className="space-y-6">
       <div className="flex flex-wrap items-end justify-between gap-4 rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75">
         <div>
-          <Link to="/jobs" className="text-sm font-medium text-indigo-400">← Back to jobs</Link>
-          <p className="mt-3 text-sm uppercase tracking-[0.28em] text-indigo-400">Distributed trace</p>
+          <Link to="/jobs" className="text-sm font-medium text-indigo-600 dark:text-indigo-400">← Back to jobs</Link>
+          <p className="mt-3 text-sm uppercase tracking-[0.28em] text-indigo-600 dark:text-indigo-400">Distributed trace</p>
           <h2 className="mt-2 text-3xl font-semibold">Job timeline</h2>
-          <p className="mt-2 max-w-3xl text-sm text-slate-500 dark:text-slate-400">
+          <p className="mt-2 max-w-3xl text-sm text-slate-600 dark:text-slate-400">
             {timeline.job_id} · trace {timeline.trace_id.slice(0, 12)}… · {timeline.status} · {fmtDuration(timeline.duration_ms)}
           </p>
         </div>
@@ -68,7 +68,7 @@ export function JobTimelinePage() {
       </div>
 
       <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75">
-        <div className="mb-4 flex items-center justify-between text-xs uppercase tracking-[0.2em] text-slate-500">
+        <div className="mb-4 flex items-center justify-between text-xs uppercase tracking-[0.2em] text-slate-600 dark:text-slate-400">
           <span>{fmtTime(timeline.start_ms)}</span>
           <span>{fmtDuration(timeline.duration_ms)}</span>
           <span>{fmtTime(timeline.end_ms)}</span>
@@ -78,7 +78,7 @@ export function JobTimelinePage() {
             <div key={lane.node_id} className="grid gap-3 md:grid-cols-[220px_minmax(0,1fr)]">
               <div className="rounded-2xl border border-slate-200 p-3 dark:border-slate-800">
                 <p className="text-sm font-semibold">{lane.node_name}</p>
-                <p className="mt-1 truncate text-xs text-slate-500 dark:text-slate-400">{lane.node_id}</p>
+                <p className="mt-1 truncate text-xs text-slate-600 dark:text-slate-400">{lane.node_id}</p>
               </div>
               <div className="relative min-h-20 rounded-2xl border border-slate-200 bg-slate-100/70 p-3 dark:border-slate-800 dark:bg-slate-900/70">
                 <div className="absolute left-3 right-3 top-1/2 h-px bg-slate-300 dark:bg-slate-700" />
@@ -111,12 +111,12 @@ export function JobTimelinePage() {
               <div key={`${event.name}-${index}`} className="rounded-2xl border border-slate-200 p-4 text-sm dark:border-slate-800">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <p className="font-semibold">{event.name}{event.unit_id ? ` · ${event.unit_id}` : ''}</p>
-                  <p className="text-slate-500 dark:text-slate-400">{fmtTime(event.start_ms)} · {fmtDuration(event.duration_ms)}</p>
+                  <p className="text-slate-600 dark:text-slate-400">{fmtTime(event.start_ms)} · {fmtDuration(event.duration_ms)}</p>
                 </div>
-                <p className="mt-2 text-slate-500 dark:text-slate-400">
+                <p className="mt-2 text-slate-600 dark:text-slate-400">
                   node {event.node_id ?? 'control-plane'} · attempt {event.attempt ?? '—'} · outcome {event.outcome ?? 'observed'}
                 </p>
-                {event.error ? <p className="mt-2 rounded-xl bg-rose-500/10 p-2 text-rose-300">{event.error}</p> : null}
+                {event.error ? <p className="mt-2 rounded-xl bg-rose-500/10 p-2 text-rose-700 dark:text-rose-300">{event.error}</p> : null}
               </div>
             ))}
           </div>
@@ -127,8 +127,8 @@ export function JobTimelinePage() {
             {timeline.units.map((unit) => (
               <div key={unit.unit_id} className="rounded-2xl bg-slate-100 p-3 text-sm dark:bg-slate-900">
                 <p className="font-semibold">{unit.unit_id}</p>
-                <p className="mt-1 text-slate-500 dark:text-slate-400">{unit.outcome} · attempts {unit.attempts} · {unit.node_id ?? 'unassigned'}</p>
-                {unit.error ? <p className="mt-1 text-rose-300">{unit.error}</p> : null}
+                <p className="mt-1 text-slate-600 dark:text-slate-400">{unit.outcome} · attempts {unit.attempts} · {unit.node_id ?? 'unassigned'}</p>
+                {unit.error ? <p className="mt-1 text-rose-700 dark:text-rose-300">{unit.error}</p> : null}
               </div>
             ))}
           </div>

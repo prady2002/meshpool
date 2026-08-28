@@ -42,14 +42,14 @@ export function Playground() {
       <section className="rounded-[28px] border border-slate-200 bg-white/90 p-5 shadow-xl shadow-slate-200/40 dark:border-slate-800 dark:bg-slate-950/75 dark:shadow-slate-950/40">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <p className="text-sm uppercase tracking-[0.28em] text-indigo-400">Playground</p>
+            <p className="text-sm uppercase tracking-[0.28em] text-indigo-600 dark:text-indigo-400">Playground</p>
             <h2 className="mt-1 text-3xl font-semibold">Distributed LLM chat</h2>
-            <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">Stream tokens live while seeing which nodes serve each stage.</p>
+            <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">Stream tokens live while seeing which nodes serve each stage.</p>
           </div>
         </div>
         <div className="mt-6 grid gap-4 lg:grid-cols-3">
           <label className="rounded-3xl border border-slate-200 p-4 dark:border-slate-800">
-            <span className="text-sm text-slate-500 dark:text-slate-400">Model</span>
+            <span className="text-sm text-slate-600 dark:text-slate-400">Model</span>
             {loading ? <Skeleton className="mt-3 h-11" /> : (
               <select value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)} className="mt-3 w-full rounded-2xl border border-slate-200 bg-transparent px-3 py-3 dark:border-slate-700">
                 {models.map((model) => <option key={model.id} value={model.id}>{model.model} · {model.status}</option>)}
@@ -59,32 +59,32 @@ export function Playground() {
           <div className="rounded-3xl border border-slate-200 p-4 dark:border-slate-800">
             <Metric label="Temperature setting" value={temperature[0].toFixed(1)} tier="measured" density="compact" className="border-0 bg-transparent p-0" />
             <Slider.Root value={temperature} min={0} max={1} step={0.1} onValueChange={setTemperature} className="mt-5 flex h-5 items-center">
-              <Slider.Track className="relative h-2 grow rounded-full bg-slate-800"><Slider.Range className="absolute h-full rounded-full bg-indigo-500" /></Slider.Track><Slider.Thumb className="block h-5 w-5 rounded-full bg-white shadow" />
+              <Slider.Track className="relative h-2 grow rounded-full bg-slate-200 dark:bg-slate-800"><Slider.Range className="absolute h-full rounded-full bg-indigo-500" /></Slider.Track><Slider.Thumb aria-label="Temperature" className="block h-5 w-5 rounded-full bg-white shadow" />
             </Slider.Root>
           </div>
           <div className="rounded-3xl border border-slate-200 p-4 dark:border-slate-800">
             <Metric label="Max tokens setting" value={maxTokens[0]} tier="measured" density="compact" className="border-0 bg-transparent p-0" />
             <Slider.Root value={maxTokens} min={64} max={1024} step={32} onValueChange={setMaxTokens} className="mt-5 flex h-5 items-center">
-              <Slider.Track className="relative h-2 grow rounded-full bg-slate-800"><Slider.Range className="absolute h-full rounded-full bg-violet-500" /></Slider.Track><Slider.Thumb className="block h-5 w-5 rounded-full bg-white shadow" />
+              <Slider.Track className="relative h-2 grow rounded-full bg-slate-200 dark:bg-slate-800"><Slider.Range className="absolute h-full rounded-full bg-violet-500" /></Slider.Track><Slider.Thumb aria-label="Max tokens" className="block h-5 w-5 rounded-full bg-white shadow" />
             </Slider.Root>
           </div>
         </div>
         <div className="mt-6 rounded-3xl border border-slate-200 p-4 dark:border-slate-800">
-          <label className="block text-sm text-slate-500 dark:text-slate-400">Prompt</label>
-          <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={4} className="mt-3 w-full rounded-2xl border border-slate-200 bg-transparent px-4 py-3 dark:border-slate-700" />
+          <label htmlFor="playground-prompt" className="block text-sm text-slate-600 dark:text-slate-400">Prompt</label>
+          <textarea id="playground-prompt" aria-label="Prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={4} className="mt-3 w-full rounded-2xl border border-slate-200 bg-transparent px-4 py-3 dark:border-slate-700" />
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <button type="button" disabled={!selectedModel || streaming} onClick={() => sendMessage(prompt, { modelId: selectedModel, temperature: temperature[0], maxNewTokens: maxTokens[0] })} className="rounded-2xl bg-indigo-500 px-4 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60">
               {streaming ? 'Streaming…' : 'Send to mesh'}
             </button>
-            <span className="text-sm text-slate-500 dark:text-slate-400">Honest live stream. No synthetic latency masking.</span>
+            <span className="text-sm text-slate-600 dark:text-slate-400">Honest live stream. No synthetic latency masking.</span>
           </div>
-          {error ? <p className="mt-3 text-sm text-rose-400">{error}</p> : null}
-          {chatError ? <p className="mt-3 text-sm text-rose-400">{chatError}</p> : null}
+          {error ? <p className="mt-3 text-sm text-rose-600 dark:text-rose-400">{error}</p> : null}
+          {chatError ? <p className="mt-3 text-sm text-rose-600 dark:text-rose-400">{chatError}</p> : null}
           {!loading && models.length === 0 ? (
-            <div className="mt-6 rounded-3xl border border-dashed border-slate-700 px-6 py-10 text-center text-slate-400">
+            <div className="mt-6 rounded-3xl border border-dashed border-slate-300 dark:border-slate-700 px-6 py-10 text-center text-slate-600 dark:text-slate-400">
               <p className="text-4xl">🛰️</p>
-              <p className="mt-3 text-lg font-medium text-slate-200">Deploy a model first</p>
-              <Link to="/models" className="mt-3 inline-flex text-indigo-300 underline">Open Models page</Link>
+              <p className="mt-3 text-lg font-medium text-slate-800 dark:text-slate-200">Deploy a model first</p>
+              <Link to="/models" className="mt-3 inline-flex text-indigo-700 dark:text-indigo-300 underline">Open Models page</Link>
             </div>
           ) : null}
         </div>
@@ -93,20 +93,20 @@ export function Playground() {
         </div>
       </section>
       <aside className="rounded-[28px] border border-slate-200 bg-white/90 p-5 shadow-xl shadow-slate-200/40 dark:border-slate-800 dark:bg-slate-950/75 dark:shadow-slate-950/40">
-        <p className="text-sm uppercase tracking-[0.28em] text-indigo-400">Computing on</p>
+        <p className="text-sm uppercase tracking-[0.28em] text-indigo-600 dark:text-indigo-400">Computing on</p>
         <h3 className="mt-2 text-2xl font-semibold">Pipeline stages</h3>
-        <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">Node assignments per layer slice. Estimates are labeled when the backend does not publish exact metrics.</p>
+        <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">Node assignments per layer slice. Estimates are labeled when the backend does not publish exact metrics.</p>
         <div className="mt-5 space-y-4">
           {selectedDeployment?.partition.map((slice, index) => (
             <div key={`${slice.node_id}-${index}`} className="rounded-3xl border border-slate-200 p-4 dark:border-slate-800">
               <div className="flex items-center justify-between gap-3">
                 <div>
-                  <p className="text-sm text-slate-500 dark:text-slate-400">Stage {index + 1}</p>
-                  <h4 className="font-semibold text-slate-100">{slice.node_id}</h4>
+                  <p className="text-sm text-slate-600 dark:text-slate-400">Stage {index + 1}</p>
+                  <h4 className="font-semibold text-slate-900 dark:text-slate-100">{slice.node_id}</h4>
                 </div>
-                <span className="rounded-full bg-indigo-500/15 px-2 py-1 text-xs text-indigo-300">Layers {slice.start_layer}–{slice.end_layer}</span>
+                <span className="rounded-full bg-indigo-500/15 px-2 py-1 text-xs text-indigo-700 dark:text-indigo-300">Layers {slice.start_layer}–{slice.end_layer}</span>
               </div>
-              <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-800"><div className="h-full w-full animate-pulse rounded-full bg-gradient-to-r from-indigo-500 to-violet-500 motion-reduce:animate-none" /></div>
+              <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"><div className="h-full w-full animate-pulse rounded-full bg-gradient-to-r from-indigo-500 to-violet-500 motion-reduce:animate-none" /></div>
             </div>
           ))}
           {assignedNodes.map((node) => <NodeCard key={node.id} node={node} active={streaming} />)}

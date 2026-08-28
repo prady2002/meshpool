@@ -634,7 +634,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
     <div className="space-y-4">
       {/* ── canvas + detail panel ────────────────────────────────────────── */}
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_300px]">
-        <div className="relative overflow-hidden rounded-3xl border border-slate-800 bg-slate-950/70">
+        <div className="dark relative overflow-hidden rounded-3xl border border-slate-800 bg-slate-950">
           <canvas
             ref={canvasRef}
             width={W}
@@ -654,7 +654,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
           <div className="pointer-events-none absolute bottom-3 left-3 space-y-1.5">
             <div className="flex gap-2">
               {(['online', 'draining', 'offline'] as const).map((s) => (
-                <span key={s} className="flex items-center gap-1.5 rounded-full bg-slate-950/80 px-2.5 py-1 text-xs text-slate-300">
+                <span key={s} className="flex items-center gap-1.5 rounded-full bg-slate-950 px-2.5 py-1 text-xs text-slate-300">
                   <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: STATUS_COLOR[s] }} aria-hidden="true" />
                   {s}
                 </span>
@@ -666,7 +666,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
                 { cls: 'relay', icon: '▶', color: '#38bdf8' },
                 { cls: 'drifter', icon: '⊙', color: '#9ca3af' },
               ] as const).map(({ cls, icon, color }) => (
-                <span key={cls} className="flex items-center gap-1 rounded-full bg-slate-950/80 px-2.5 py-1 text-xs text-slate-300">
+                <span key={cls} className="flex items-center gap-1 rounded-full bg-slate-950 px-2.5 py-1 text-xs text-slate-300">
                   <span style={{ color }} aria-hidden="true">{icon}</span>
                   {cls}
                 </span>
@@ -679,18 +679,18 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
         </div>
 
         {/* Detail panel */}
-        <aside className="rounded-3xl border border-slate-800 bg-slate-950/70 p-4">
+        <aside className="dark rounded-3xl border border-slate-800 bg-slate-950 p-4">
           {selectedSNode && selectedNode ? (
             <div className="space-y-3">
               <div className="flex items-start justify-between gap-2">
                 <div>
-                  <p className="text-xs uppercase tracking-widest text-slate-500">
+                  <p className="text-xs uppercase tracking-widest text-slate-400">
                     {selectedSNode.raw.length > 1 ? 'Group detail' : 'Node detail'}
                   </p>
                   <h3 className="mt-1 font-semibold text-slate-100">
                     {selectedSNode.raw.length > 1 ? selectedSNode.label : selectedNode.name}
                   </h3>
-                  <p className="mt-0.5 text-xs text-slate-500">{selectedNode.owner}</p>
+                  <p className="mt-0.5 text-xs text-slate-400">{selectedNode.owner}</p>
                   {selectedSNode.raw.length > 1 ? (
                     <p className="mt-1 text-xs text-amber-400/80">
                       This marker represents {selectedSNode.raw.length} nodes. The figures
@@ -715,7 +715,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
               </div>
               {nodeModels.length > 0 && (
                 <div>
-                  <p className="text-xs uppercase tracking-widest text-slate-500">Model layers</p>
+                  <p className="text-xs uppercase tracking-widest text-slate-400">Model layers</p>
                   <ul className="mt-2 space-y-1.5">
                     {nodeModels.map((m) => {
                       const slice = m.partition.find((p) => p.node_id === selectedNode.id)
@@ -723,7 +723,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
                         <li key={m.id} className="rounded-2xl border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-xs">
                           <span className="font-medium text-indigo-300">{m.model}</span>
                           <span className="ml-2 text-slate-400">layers {slice.start_layer}–{slice.end_layer}</span>
-                          <span className="ml-2 text-slate-500">{slice.is_first ? '· Ingress' : slice.is_last ? '· Egress' : '· Relay'}</span>
+                          <span className="ml-2 text-slate-400">{slice.is_first ? '· Ingress' : slice.is_last ? '· Egress' : '· Relay'}</span>
                         </li>
                       ) : null
                     })}
@@ -737,20 +737,20 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
             </div>
           ) : (
             <div className="flex h-full flex-col items-center justify-center gap-3 py-8 text-center">
-              <p className="text-xs uppercase tracking-widest text-slate-500">Topology</p>
+              <p className="text-xs uppercase tracking-widest text-slate-400">Topology</p>
               <p className="text-sm text-slate-400">
                 {nodes.length === 0
                   ? 'No nodes in the mesh yet'
                   : `${aggregate.mode} view · ${aggregate.items.length} item${aggregate.items.length !== 1 ? 's' : ''}`}
               </p>
               {nodes.length > 0 && (
-                <p className="text-xs text-slate-500">
+                <p className="text-xs text-slate-400">
                   Click a node or use ↑↓←→ keys to inspect
                 </p>
               )}
               {nodes.length > 0 && (
                 <div className="mt-1 w-full text-left">
-                  <p className="text-xs uppercase tracking-widest text-slate-500">Node classes</p>
+                  <p className="text-xs uppercase tracking-widest text-slate-400">Node classes</p>
                   <div className="mt-2 space-y-1.5">
                     {([
                       { cls: 'anchor', icon: '★', color: '#fbbf24', desc: 'High-trust · stable' },
@@ -764,7 +764,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
                       </div>
                     ))}
                   </div>
-                  <p className="mt-2 text-xs text-slate-500/70">
+                  <p className="mt-2 text-xs text-slate-400">
                     Classes are calibrated projections from latency, uptime, and bandwidth.
                     Latency is node→control-plane only — inter-node RTT is not measured.
                   </p>
@@ -778,9 +778,9 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
       {/* ── model shard pipeline view ─────────────────────────────────────── */}
       {models.length > 0 && (
         <section aria-label="Deployed model pipelines"
-          className="rounded-3xl border border-slate-800 bg-slate-950/70 p-4">
-          <p className="text-xs uppercase tracking-widest text-slate-500">Model shard pipelines</p>
-          <p className="mt-1 text-xs text-slate-500">
+          className="dark rounded-3xl border border-slate-800 bg-slate-950 p-4">
+          <p className="text-xs uppercase tracking-widest text-slate-400">Model shard pipelines</p>
+          <p className="mt-1 text-xs text-slate-400">
             Token path for each deployed model — each segment shows the layer range on one node.
           </p>
           <div className="mt-4 space-y-4">
@@ -814,8 +814,8 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
                               setSelectedId(sn?.id ?? null)
                             }}>
                             <span className="font-medium">{nodeName}</span>
-                            <span className="ml-1.5 text-slate-500">{slice.start_layer}–{slice.end_layer}</span>
-                            <span className="ml-1 text-slate-500">{slice.is_first ? '· in' : slice.is_last ? '· out' : '· relay'}</span>
+                            <span className="ml-1.5 text-slate-400">{slice.start_layer}–{slice.end_layer}</span>
+                            <span className="ml-1 text-slate-400">{slice.is_first ? '· in' : slice.is_last ? '· out' : '· relay'}</span>
                           </button>
                           {idx < sorted.length - 1 && <span className="text-slate-600" aria-hidden="true">→</span>}
                         </div>
@@ -832,7 +832,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
       {/* ── accessible table controls ─────────────────────────────────────── */}
       <div className="flex items-center justify-between">
         <button type="button" onClick={() => setShowTable((t) => !t)}
-          className="rounded-2xl border border-slate-700 px-3 py-2 text-xs text-slate-400 hover:bg-slate-800">
+          className="rounded-2xl border border-slate-300 px-3 py-2 text-xs text-slate-600 hover:bg-slate-200 dark:border-slate-700 dark:text-slate-400 dark:hover:bg-slate-800">
           {showTable ? 'Hide accessible table' : 'Show as accessible table'}
         </button>
         <div className="flex gap-2">
@@ -849,16 +849,16 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
             No nodes registered in this mesh. Use the Contribute page to add your machine.
           </p>
         ) : (
-          <div className="overflow-x-auto rounded-3xl border border-slate-800">
+          <div tabIndex={0} role="region" aria-label="Mesh node table" className="dark overflow-x-auto rounded-3xl border border-slate-800 bg-slate-950">
             <table className="min-w-full text-sm">
-              <caption className="py-3 text-xs text-slate-500">
+              <caption className="py-3 text-xs text-slate-400">
                 Mesh nodes — {nodes.length} total, {nodes.filter((n) => n.status === 'online').length} online.
                 {sortedNodes.length > TABLE_ROW_LIMIT
                   ? ` Showing the first ${TABLE_ROW_LIMIT} rows; ${sortedNodes.length - TABLE_ROW_LIMIT} more are not listed.`
                   : ''}
                 {' '}Positions in the canvas above are synthesised from mesh topology, not geography.
               </caption>
-              <thead className="border-b border-slate-800 bg-slate-950/70">
+              <thead className="border-b border-slate-800 bg-slate-950">
                 <tr>
                   {['Node', 'Status', 'Arch', 'CPU cores', 'CPU load', 'RAM MB', 'GPU', 'Trust', 'Running units'].map((h) => (
                     <th key={h} scope="col" className="px-4 py-3 text-left font-medium text-slate-400">{h}</th>

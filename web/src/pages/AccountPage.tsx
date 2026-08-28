@@ -26,7 +26,7 @@ export function AccountPage() {
   return (
     <section className="space-y-6">
       <div>
-        <p className="text-sm uppercase tracking-[0.28em] text-indigo-400">Account & Billing</p>
+        <p className="text-sm uppercase tracking-[0.28em] text-indigo-600 dark:text-indigo-400">Account & Billing</p>
         <h2 className="mt-2 text-3xl font-semibold">Usage, spend caps, and API keys (capability tokens)</h2>
       </div>
       <div className="grid gap-4 md:grid-cols-3">
@@ -35,13 +35,13 @@ export function AccountPage() {
         <div className="rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75">
           <Metric label="Hard spend cap" value={cap?.enforced && typeof cap.cap === 'number' ? cap.cap.toFixed(1) : '—'} unit={cap?.enforced ? 'credits' : undefined} tier="measured" className="border-0 bg-transparent p-0 shadow-none" />
           {cap?.enforced ? (
-            <p className={`mt-1 text-xs ${cap.exceeded ? 'text-rose-500' : 'text-slate-500 dark:text-slate-400'}`}>
+            <p className={`mt-1 text-xs ${cap.exceeded ? 'text-rose-600 dark:text-rose-400' : 'text-slate-600 dark:text-slate-400'}`}>
               {cap.exceeded
                 ? 'Cap reached — work is stopped, not just flagged.'
                 : 'Stops work when reached.'}
             </p>
           ) : (
-            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">No cap set — spending is unlimited.</p>
+            <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">No cap set — spending is unlimited.</p>
           )}
           {cap?.enforced && !cap.exceeded ? (
             <Metric label="Remaining cap" value={(cap.remaining ?? 0).toFixed(1)} unit="remaining credits" tier="measured" density="compact" className="mt-3" />
@@ -76,13 +76,13 @@ export function AccountPage() {
           </div>
           <ul className="mt-5 space-y-3">
             {secrets.map((name) => (
-              <li key={name} className="flex items-center justify-between rounded-2xl border border-slate-800 px-4 py-3 text-sm text-slate-200">
+              <li key={name} className="flex items-center justify-between rounded-2xl border border-slate-200 dark:border-slate-800 px-4 py-3 text-sm text-slate-800 dark:text-slate-200">
                 <span>{name}</span>
-                <button type="button" onClick={() => apiClient.deleteSecret(name).then(load)} className="text-rose-300">Delete</button>
+                <button type="button" onClick={() => apiClient.deleteSecret(name).then(load)} className="text-rose-700 dark:text-rose-300">Delete</button>
               </li>
             ))}
             {secrets.length === 0 && (
-              <li className="rounded-2xl border border-dashed border-slate-300 px-4 py-6 text-center text-sm text-slate-500 dark:border-slate-700 dark:text-slate-400">
+              <li className="rounded-2xl border border-dashed border-slate-300 px-4 py-6 text-center text-sm text-slate-600 dark:text-slate-400 dark:border-slate-700 dark:text-slate-400">
                 No secrets yet. Add one above to make it available to your jobs — values are
                 never returned by the API, only names.
               </li>
@@ -91,7 +91,7 @@ export function AccountPage() {
         </div>
         <aside className="rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75">
           <h3 className="text-xl font-semibold">Usage notes</h3>
-          <ul className="mt-4 space-y-3 text-sm text-slate-400">
+          <ul className="mt-4 space-y-3 text-sm text-slate-600 dark:text-slate-400">
             <li>• Billing uses exact wallet balances from the control plane.</li>
             <li>• Caps are client-visible and should be enforced server-side for real charging.</li>
             <li>• Keys are currently mapped to the secrets API surface; dedicated API-key endpoints are still needed.</li>

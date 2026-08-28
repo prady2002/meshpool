@@ -63,7 +63,7 @@ export class ErrorBoundary extends Component<Props, State> {
           data are unaffected — this is a bug in the console, not in the cluster.
           Use the navigation on the left to continue, or retry this page.
         </p>
-        <pre className="mt-4 max-w-full overflow-x-auto rounded-2xl bg-slate-900/90 p-4 text-xs text-rose-200">
+        <pre tabIndex={0} className="mt-4 max-w-full overflow-x-auto rounded-2xl bg-slate-900/90 p-4 text-xs text-rose-200">
           {error.message}
         </pre>
         <button

@@ -23,9 +23,9 @@ export function MeshMapPage() {
   return (
     <section className="space-y-6">
       <div>
-        <p className="text-sm uppercase tracking-[0.28em] text-indigo-400">Live Mesh Map</p>
+        <p className="text-sm uppercase tracking-[0.28em] text-indigo-600 dark:text-indigo-400">Live Mesh Map</p>
         <h2 className="mt-2 text-3xl font-semibold">Topology, health, and cluster scale</h2>
-        <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
+        <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">
           Topology view — node positions are derived from mesh relationships, not geographic
           coordinates. Aggregates automatically once the mesh grows beyond 100 nodes.
         </p>

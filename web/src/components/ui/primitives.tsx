@@ -55,7 +55,7 @@ export function Tooltip({ label, children }: { label: string; children: ReactNod
 }
 
 export function Toast({ children, tone = 'neutral' }: { children: ReactNode; tone?: 'neutral' | 'success' | 'danger' }) {
-  const toneClass = tone === 'success' ? 'border-emerald-500/40 text-emerald-200' : tone === 'danger' ? 'border-rose-500/40 text-rose-200' : 'border-[var(--color-border)] text-[var(--color-text)]'
+  const toneClass = tone === 'success' ? 'border-emerald-500/40 text-emerald-700 dark:text-emerald-200' : tone === 'danger' ? 'border-rose-500/40 text-rose-700 dark:text-rose-200' : 'border-[var(--color-border)] text-[var(--color-text)]'
   return <div role="status" className={cn('rounded-2xl border bg-[var(--color-panel)] px-4 py-3 text-sm shadow-[var(--shadow-soft)]', toneClass)}>{children}</div>
 }
 
@@ -85,7 +85,7 @@ export function EmptyState({ title, body, action }: { title: string; body: strin
 }
 
 export function CodeBlock({ code, className }: { code: string; className?: string }) {
-  return <pre className={cn('overflow-x-auto rounded-2xl border border-[var(--color-border)] bg-slate-950 p-4 text-xs text-slate-100', className)}><code>{code}</code></pre>
+  return <pre tabIndex={0} className={cn('overflow-x-auto rounded-2xl border border-[var(--color-border)] bg-slate-950 p-4 text-xs text-slate-100', className)}><code>{code}</code></pre>
 }
 
 export function Toolbar({ className, ...props }: PrimitiveProps<'div'>) {

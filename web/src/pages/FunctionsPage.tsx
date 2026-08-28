@@ -107,9 +107,9 @@ export function FunctionsPage() {
     <section className="space-y-6">
       <div className="flex flex-wrap items-end justify-between gap-4 rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75">
         <div>
-          <p className="text-sm uppercase tracking-[0.28em] text-indigo-400">Functions</p>
+          <p className="text-sm uppercase tracking-[0.28em] text-indigo-600 dark:text-indigo-400">Functions</p>
           <h2 className="mt-2 text-3xl font-semibold">Run your own code on the pool</h2>
-          <p className="mt-2 max-w-2xl text-sm text-slate-500 dark:text-slate-400">
+          <p className="mt-2 max-w-2xl text-sm text-slate-600 dark:text-slate-400">
             Compile anything that targets <code>wasm32-wasip1</code> — Rust, Go, Zig, C.
             Your module reads its JSON payload on stdin and writes JSON to stdout. It runs
             sandboxed on donated machines: no filesystem, no sockets, no host calls, with
@@ -136,20 +136,20 @@ export function FunctionsPage() {
       </div>
 
       {error ? (
-        <div role="alert" className="rounded-[28px] border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-300">
+        <div role="alert" className="rounded-[28px] border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-700 dark:text-rose-300">
           {error}
         </div>
       ) : null}
 
       {notice ? (
         <div className="rounded-[28px] border border-emerald-500/40 bg-emerald-500/10 p-5 text-sm">
-          <p className="font-semibold text-emerald-300">Module accepted</p>
-          <p className="mt-2 break-all font-mono text-xs text-slate-300">{notice.function}</p>
-          <dl className="mt-3 grid grid-cols-2 gap-3 text-slate-400 sm:grid-cols-4">
-            <div><dt className="text-slate-500">Size</dt><dd>{formatBytes(notice.size_bytes)}</dd></div>
-            <div><dt className="text-slate-500">ABI</dt><dd>{notice.abi}</dd></div>
-            <div><dt className="text-slate-500">Exports</dt><dd>{notice.exports.join(', ') || '—'}</dd></div>
-            <div><dt className="text-slate-500">Imports</dt><dd>{notice.imports.length}</dd></div>
+          <p className="font-semibold text-emerald-700 dark:text-emerald-300">Module accepted</p>
+          <p className="mt-2 break-all font-mono text-xs text-slate-700 dark:text-slate-300">{notice.function}</p>
+          <dl className="mt-3 grid grid-cols-2 gap-3 text-slate-600 dark:text-slate-400 sm:grid-cols-4">
+            <div><dt className="text-slate-600 dark:text-slate-400">Size</dt><dd>{formatBytes(notice.size_bytes)}</dd></div>
+            <div><dt className="text-slate-600 dark:text-slate-400">ABI</dt><dd>{notice.abi}</dd></div>
+            <div><dt className="text-slate-600 dark:text-slate-400">Exports</dt><dd>{notice.exports.join(', ') || '—'}</dd></div>
+            <div><dt className="text-slate-600 dark:text-slate-400">Imports</dt><dd>{notice.imports.length}</dd></div>
           </dl>
         </div>
       ) : null}
@@ -158,7 +158,7 @@ export function FunctionsPage() {
         <div className="space-y-4 rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75">
           <h3 className="text-lg font-semibold">Your functions</h3>
           {fns.length === 0 ? (
-            <p className="text-sm text-slate-500 dark:text-slate-400">
+            <p className="text-sm text-slate-600 dark:text-slate-400">
               Nothing uploaded yet. A module is identified by the SHA-256 of its bytes, so
               the same file always yields the same name and every node re-verifies it
               before running.
@@ -173,8 +173,8 @@ export function FunctionsPage() {
                     className={`w-full rounded-2xl border px-4 py-3 text-left text-sm transition ${selected === f.id ? 'border-indigo-400 bg-indigo-500/10' : 'border-slate-200 dark:border-slate-800'}`}
                   >
                     <span className="block font-medium">{f.label}</span>
-                    <span className="block truncate font-mono text-xs text-slate-500">{f.id}</span>
-                    <span className="block text-xs text-slate-500">{formatBytes(f.size)}</span>
+                    <span className="block truncate font-mono text-xs text-slate-600 dark:text-slate-400">{f.id}</span>
+                    <span className="block text-xs text-slate-600 dark:text-slate-400">{formatBytes(f.size)}</span>
                   </button>
                 </li>
               ))}
@@ -185,7 +185,7 @@ export function FunctionsPage() {
         <div className="space-y-4 rounded-[28px] border border-slate-200 bg-white/90 p-5 dark:border-slate-800 dark:bg-slate-950/75">
           <h3 className="text-lg font-semibold">Run</h3>
           <label className="block text-sm">
-            <span className="text-slate-500">Payload (JSON)</span>
+            <span className="text-slate-600 dark:text-slate-400">Payload (JSON)</span>
             <textarea
               value={payload}
               onChange={(e) => setPayload(e.target.value)}
@@ -195,7 +195,7 @@ export function FunctionsPage() {
             />
           </label>
           <label className="block text-sm">
-            <span className="text-slate-500">Work units (each gets a distinct <code>index</code>)</span>
+            <span className="text-slate-600 dark:text-slate-400">Work units (each gets a distinct <code>index</code>)</span>
             <input
               type="number"
               min={1}
@@ -216,13 +216,13 @@ export function FunctionsPage() {
 
           {job ? (
             <div className="space-y-3">
-              <p className="text-sm text-slate-400">
+              <p className="text-sm text-slate-600 dark:text-slate-400">
                 {job.status} · {job.progress?.done ?? 0} done · {job.progress?.failed ?? 0} failed
                 {nodesUsed > 0 ? ` · spread over ${nodesUsed} machine${nodesUsed === 1 ? '' : 's'}` : ''}
               </p>
               <div className="max-h-80 overflow-auto rounded-2xl border border-slate-200 dark:border-slate-800">
                 <table className="w-full text-left text-sm">
-                  <thead className="sticky top-0 bg-slate-100 text-xs uppercase tracking-wide text-slate-500 dark:bg-slate-900">
+                  <thead className="sticky top-0 bg-slate-100 text-xs uppercase tracking-wide text-slate-600 dark:text-slate-400 dark:bg-slate-900">
                     <tr><th className="px-3 py-2">Unit</th><th className="px-3 py-2">Node</th><th className="px-3 py-2">Result</th></tr>
                   </thead>
                   <tbody>
@@ -231,7 +231,7 @@ export function FunctionsPage() {
                         <td className="px-3 py-2 font-mono text-xs">{u.id}</td>
                         <td className="px-3 py-2 font-mono text-xs">{u.assigned_node ?? '—'}</td>
                         <td className="px-3 py-2 font-mono text-xs">
-                          {u.result != null ? JSON.stringify(u.result) : <span className="text-rose-400">{u.error ?? u.status}</span>}
+                          {u.result != null ? JSON.stringify(u.result) : <span className="text-rose-600 dark:text-rose-400">{u.error ?? u.status}</span>}
                         </td>
                       </tr>
                     ))}

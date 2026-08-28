@@ -29,7 +29,7 @@ export function ModelsPage() {
     <section className="space-y-6">
       <div className="flex flex-wrap items-end justify-between gap-4 rounded-[28px] border border-[var(--color-border)] bg-[var(--color-panel)] p-5">
         <div>
-          <p className="text-sm uppercase tracking-[0.28em] text-indigo-400">Models & Deployments</p>
+          <p className="text-sm uppercase tracking-[0.28em] text-indigo-600 dark:text-indigo-400">Models & Deployments</p>
           <h2 className="mt-2 text-3xl font-semibold">Shard-aware deployments</h2>
           <p className="mt-2 max-w-2xl text-sm text-[var(--color-muted)]">Only deployments returned by the control plane are shown. Performance numbers are labeled by tier.</p>
         </div>
@@ -62,7 +62,7 @@ export function ModelsPage() {
             </div>
             <div className="mt-5 flex gap-3">
               <Button type="button" className="bg-transparent text-[var(--color-text)] ring-1 ring-[var(--color-border)] hover:bg-[var(--color-surface)]" onClick={() => apiClient.deployModel({ model: model.model, owner: model.owner }).then(load)}>Redeploy</Button>
-              <Button type="button" className="bg-transparent text-rose-300 ring-1 ring-rose-500/30 hover:bg-rose-500/10" onClick={() => apiClient.deleteModel(model.id).then(load)}>Remove</Button>
+              <Button type="button" className="bg-transparent text-rose-700 dark:text-rose-300 ring-1 ring-rose-500/30 hover:bg-rose-500/10" onClick={() => apiClient.deleteModel(model.id).then(load)}>Remove</Button>
             </div>
           </Card>
         ))}
