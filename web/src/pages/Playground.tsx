@@ -71,7 +71,7 @@ export function Playground() {
         </div>
         <div className="mt-6 rounded-3xl border border-slate-200 p-4 dark:border-slate-800">
           <label htmlFor="playground-prompt" className="block text-sm text-slate-600 dark:text-slate-400">Prompt</label>
-          <textarea id="playground-prompt" aria-label="Prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={4} className="mt-3 w-full rounded-2xl border border-slate-200 bg-transparent px-4 py-3 dark:border-slate-700" />
+          <textarea id="playground-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={4} className="mt-3 w-full rounded-2xl border border-slate-200 bg-transparent px-4 py-3 dark:border-slate-700" />
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <button type="button" disabled={!selectedModel || streaming} onClick={() => sendMessage(prompt, { modelId: selectedModel, temperature: temperature[0], maxNewTokens: maxTokens[0] })} className="rounded-2xl bg-indigo-500 px-4 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60">
               {streaming ? 'Streaming…' : 'Send to mesh'}

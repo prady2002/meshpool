@@ -459,10 +459,28 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   is the sharpest case: 26 tests assert on that screen and every one passes
   without a single pixel ever being drawn, because `getContext()` is a stub in
   jsdom. `web/e2e/` now drives Microsoft Edge against the real FastAPI app, and
-  `sim/scenarios/verify_console_mutation_coverage.py` proves those six tests can
-  actually fail — including a canvas check with a positive control that wipes
+  `sim/scenarios/verify_console_mutation_coverage.py` proves those fifteen tests
+  can actually fail — including a canvas check with a positive control that wipes
   the surface and re-measures, so a measurement that cannot distinguish painted
   from unpainted fails loudly instead of passing quietly.
+
+- **The same blindness hid a broken light theme from everyone who does not use
+  dark mode.** The console follows the OS colour scheme, but many components used
+  dark-palette utilities unconditionally. On a light desktop the invite token
+  rendered `slate-100` on white and the join command `slate-200` on white — both
+  effectively invisible. That is step one of contributor onboarding, so what was
+  filed as a styling nit was actually a broken funnel. A long owner id also failed
+  to truncate, pushing the status badge out of its card and onto the page.
+  **Measured with `@axe-core/playwright` in a real browser across all eight
+  console screens: 56 serious/critical WCAG violations before, 0 after** — 51
+  colour-contrast, 2 unnamed sliders, 2 keyboard-unreachable scroll regions, and
+  one critical unlabelled form control, which was the Playground prompt box, the
+  most important input in the product. **All 119 jsdom tests passed before and
+  after, unchanged**, because jsdom applies no CSS cascade and computes no layout,
+  so a contrast ratio cannot be evaluated there at all — the failure was not that
+  the tests were weak, but that the environment made the property unobservable.
+  Three mutations in `verify_console_mutation_coverage.py` now restore these
+  defects, so the accessibility gate is itself held to proof that it can fail.
 
 - **Auto-update is fully implemented and completely inert, on purpose.**
   `agent-go/internal/update` verifies Ed25519-signed release manifests, refuses

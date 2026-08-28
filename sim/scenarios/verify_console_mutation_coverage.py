@@ -88,6 +88,49 @@ MUTATIONS = [
             "real navigation to a deep link can observe it."
         ),
     },
+    {
+        "id": "console-muted-text-fails-contrast",
+        "path": "web/src/index.css",
+        "old": b"  --color-muted: #475569;",
+        "new": b"  --color-muted: #64748b;",
+        "test": "e2e/a11y.spec.ts",
+        "why": (
+            "Restores the original muted colour: slate-500 on the slate-100 "
+            "surface is 4.47:1, just under the 4.5 AA floor, across 9 elements "
+            "including the command-palette hint on every screen. jsdom "
+            "implements no CSS cascade and no layout, so not one of the 119 "
+            "component tests can compute a contrast ratio -- they all stayed "
+            "green through the far worse version of this bug, where the invite "
+            "token rendered slate-100 on white. Only a real browser can see it."
+        ),
+    },
+    {
+        "id": "console-slider-loses-its-accessible-name",
+        "path": "web/src/pages/Playground.tsx",
+        "old": b'<Slider.Thumb aria-label="Temperature"',
+        "new": b"<Slider.Thumb",
+        "test": "e2e/a11y.spec.ts",
+        "why": (
+            "Radix renders the thumb as role='slider'; without a name a screen "
+            "reader announces only a number, so the control is unusable. The "
+            "slider still works with a mouse and still fires onValueChange, so "
+            "every behavioural test passes either way."
+        ),
+    },
+    {
+        "id": "console-prompt-box-loses-its-label",
+        "path": "web/src/pages/Playground.tsx",
+        "old": b'<label htmlFor="playground-prompt"',
+        "new": b"<label",
+        "test": "e2e/a11y.spec.ts",
+        "why": (
+            "Detaches the label from the flagship's prompt box, leaving it an "
+            "unnamed form control -- a WCAG critical. The visible text still "
+            "reads 'Prompt', so the screen looks correct and typing still "
+            "works; only the programmatic association is gone, which is exactly "
+            "what a rendering-only assertion cannot distinguish."
+        ),
+    },
 ]
 
 
