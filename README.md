@@ -441,6 +441,29 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
 
 ## ⚖️ Honest constraints (we report real numbers, never invented ones)
 
+- **The console's 119 component tests could not see the console.** They run in
+  jsdom, which implements neither canvas painting, nor `EventSource` retry, nor
+  real HTTP, nor layout. Driving a real browser against a real control plane for
+  the first time found a defect in minutes: `useSSE` took its handlers object in
+  the effect dependency array, and callers pass a fresh object literal on every
+  render. The effect therefore reopened the `EventSource` on every render — and
+  since `onMessage` sets state, every delivered message caused a render, which
+  caused a reconnect, which delivered a message. **Measured: 729 connections in
+  10 seconds from a single browser tab (~73/s); 1 after the fix.** That load
+  multiplies by the number of open browsers, so it would have first appeared as
+  an unexplained control-plane collapse under real traffic, far from its cause.
+  The exponential backoff already in the hook never engaged, because this was
+  never the error path. **All 119 jsdom tests passed before the fix and after
+  it, unchanged** — which is the whole point: a test that cannot observe a
+  property cannot defend it, no matter how many of them there are. The Mesh Map
+  is the sharpest case: 26 tests assert on that screen and every one passes
+  without a single pixel ever being drawn, because `getContext()` is a stub in
+  jsdom. `web/e2e/` now drives Microsoft Edge against the real FastAPI app, and
+  `sim/scenarios/verify_console_mutation_coverage.py` proves those six tests can
+  actually fail — including a canvas check with a positive control that wipes
+  the surface and re-measures, so a measurement that cannot distinguish painted
+  from unpainted fails loudly instead of passing quietly.
+
 - **Auto-update is fully implemented and completely inert, on purpose.**
   `agent-go/internal/update` verifies Ed25519-signed release manifests, refuses
   downgrades, and swaps the binary through a rename dance that restores the previous
