@@ -530,8 +530,107 @@ class StorageManager:
             return None
 
     async def _repair_ec_locked(self, meta: BlobMeta) -> None:
-        """Regenerate missing EC shards onto new nodes."""
+        """Regenerate missing EC shards onto new nodes.
+
+        Tries to delegate reconstruction to a node first. Pulling k shards into the
+        coordinator to rebuild one is the same centralisation defect that replication
+        repair had, multiplied by k: at RS(29,80) a single departure would drag 29
+        shards through one uplink and hold the whole object in coordinator RAM. Since
+        repair is the steady-state cost of a churning pool, that is a bottleneck
+        exactly where the product is supposed to scale.
+
+        The relay path below survives as the fallback, because peer reconstruction is
+        an optimisation of the *route* and must never become a reason to leave an
+        object a shard short.
+        """
         k, m = self._ec_params.get(meta.id) or _unpack_ec_params(meta.replication_desired)
+        live_by_id = {n.id: n for n in self.registry.online()}
+        if await self._repair_ec_delegated(meta, k, m, live_by_id):
+            return
+        await self._repair_ec_relayed(meta, k, m)
+
+    def _ec_repair_plan(self, meta: BlobMeta, k: int, m: int, target: str,
+                        live_by_id: dict) -> Optional[dict]:
+        """A byte-free instruction telling ``target`` how to rebuild the lost shards.
+
+        Carries shard ids, their index in the RS codeword, and peer URLs -- never a
+        payload. Returns None when fewer than k shards are reachable by URL, in which
+        case delegation cannot succeed and the caller must relay.
+        """
+        shards, want = [], []
+        reachable = 0
+        for idx, sid in enumerate(meta.chunks):
+            sm = self.store.get_blob(sid)
+            holders = [r for r in (sm.replicas if sm else []) if r in live_by_id]
+            urls = []
+            for nid in holders:
+                if nid == target:
+                    continue
+                url = getattr(live_by_id.get(nid), "url", None)
+                if url:
+                    urls.append(url)
+            if urls:
+                reachable += 1
+            shards.append({"index": idx, "id": sid, "sources": urls})
+            if not holders:
+                want.append({"index": idx, "id": sid})
+        if reachable < k or not want:
+            return None
+        return {"blob_id": meta.id, "k": k, "m": m, "shards": shards, "want": want}
+
+    async def _repair_ec_delegated(self, meta: BlobMeta, k: int, m: int,
+                                   live_by_id: dict) -> bool:
+        """Ask one node to fetch k shards peer-to-peer, reconstruct, and keep the
+        missing ones. Returns False if no node could be given a workable plan."""
+        holders = set()
+        for sid in meta.chunks:
+            sm = self.store.get_blob(sid)
+            if sm and sm.replicas:
+                holders.update(r for r in sm.replicas if r in live_by_id)
+
+        candidates = self._pick_nodes(1, exclude=holders)
+        if not candidates:
+            return False
+        target = candidates[0]
+        plan = self._ec_repair_plan(meta, k, m, target.id, live_by_id)
+        if plan is None:
+            return False
+        try:
+            await self.transport.call(target.id, "blob_ec_repair", plan, timeout=300.0)
+        except TransportError as exc:
+            log.warning("delegated EC repair failed, relaying via control plane",
+                        node=target.id, blob=meta.id[:12], err=str(exc)[:120])
+            return False
+
+        self.repair_peer_pulls += 1
+        for entry in plan["want"]:
+            sid = entry["id"]
+            sm = self.store.get_blob(sid)
+            size = sm.size if sm else 0
+            self.store.put_blob(BlobMeta(
+                id=sid, owner=meta.owner, size=size, name="",
+                replicas=[target.id], replication_desired=1,
+                status="stored", internal=True))
+        self._publish_ec_health(meta, k, m)
+        return True
+
+    def _publish_ec_health(self, meta: BlobMeta, k: int, m: int) -> None:
+        total = k + m
+        placed = sum(1 for sid in meta.chunks
+                     if (self.store.get_blob(sid) or BlobMeta(
+                         id=sid, owner="", size=0, name="")).replicas)
+        status = "stored" if placed == total else ("degraded" if placed >= k else "lost")
+        meta.replicas = []
+        meta.status = status
+        self.store.put_blob(meta)
+        self.events.publish("blob_health",
+                            {"id": meta.id, "ec_k": k, "ec_m": m,
+                             "shards_placed": placed, "shards_total": total,
+                             "status": status})
+
+    async def _repair_ec_relayed(self, meta: BlobMeta, k: int, m: int) -> None:
+        """Fallback: reconstruct in the coordinator. Correct but centralising, so it
+        runs only when no node can be given a workable delegated plan."""
         codec = RSCodec(k, m)
         total = k + m
         shard_ids = list(meta.chunks)

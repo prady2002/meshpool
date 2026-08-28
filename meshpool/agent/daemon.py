@@ -38,6 +38,7 @@ from .runtime import ProcessRuntime, free_port, start_app_process, LogBuffer
 from ..inference import model as M
 from ..inference.pipeline import CachedShard
 from ..storage.blobstore import BlobStore, StorageFull
+from ..storage.erasure import RSCodec
 from ..batch.functions import is_wasm_function, wasm_module_id
 
 log = get_logger("agent")
@@ -237,6 +238,27 @@ class BlobPullRequest(BaseModel):
     # For a chunked object: its ordered chunks, each with its own peer sources. The node
     # pulls every chunk, verifies each against its id, and concatenates them.
     chunks: Optional[list[BlobChunkRef]] = None
+
+
+class ECShardRef(BaseModel):
+    """One position in an RS codeword: where it sits, what it hashes to, who has it."""
+    index: int
+    id: str
+    sources: list[str] = []
+
+
+class ECRepairRequest(BaseModel):
+    """Rebuild missing shards locally instead of via the coordinator.
+
+    The plan carries ids and peer URLs only. This node fetches k surviving shards
+    straight from its peers, reconstructs, and keeps the ones named in ``want`` --
+    so the control plane never holds the object in memory.
+    """
+    blob_id: str
+    k: int
+    m: int
+    shards: list[ECShardRef]
+    want: list[ECShardRef]
 
 
 class OllamaGenerateRequest(BaseModel):
@@ -846,6 +868,77 @@ async def blob_pull(req: BlobPullRequest) -> dict:
     except StorageFull as exc:
         raise HTTPException(status_code=507, detail=str(exc))
     return {"blob_id": req.blob_id, "stored": True, "bytes": len(whole)}
+
+
+@app.post("/blob_ec_repair")
+async def blob_ec_repair(req: ECRepairRequest) -> dict:
+    """Rebuild missing erasure shards on this node, fetching peer-to-peer.
+
+    The coordinator sends ids and peer URLs, never bytes. Pulling k shards up into
+    the control plane to rebuild one is the replication-repair centralisation defect
+    multiplied by k -- at RS(29,80) a single departure would drag 29 shards through
+    one uplink. Doing it here keeps repair traffic between the machines that hold
+    the data.
+
+    Every fetched shard is verified against its SHA-256 id before it is trusted, and
+    every reconstructed shard is verified before it is stored, so a lying peer cannot
+    poison the codeword.
+    """
+    if state.donation.reclaimed:
+        raise HTTPException(status_code=503, detail="node draining (reclaimed by owner)")
+    if req.k < 1 or req.m < 1 or req.k + req.m > 255:
+        raise HTTPException(status_code=400, detail="invalid erasure parameters")
+    if len(req.shards) != req.k + req.m:
+        raise HTTPException(
+            status_code=400,
+            detail=f"expected {req.k + req.m} shard slots, got {len(req.shards)}")
+    for ref in list(req.shards) + list(req.want):
+        if not _HEX64.match(ref.id):
+            raise HTTPException(status_code=400,
+                                detail="shard id must be a sha256 hex digest")
+        if not 0 <= ref.index < req.k + req.m:
+            raise HTTPException(status_code=400, detail="shard index out of range")
+
+    shards: list[Optional[bytes]] = [None] * (req.k + req.m)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as c:
+        for ref in req.shards:
+            if shards[ref.index] is not None or not ref.sources:
+                continue
+            local = state.blobs.get(ref.id) if state.blobs.has(ref.id) else None
+            if local is not None:
+                shards[ref.index] = local
+                continue
+            try:
+                shards[ref.index] = await _pull_verified(c, ref.id, ref.sources)
+            except _PullError:
+                continue          # a shard we could not reach is simply missing
+    have = sum(1 for s in shards if s is not None)
+    if have < req.k:
+        raise HTTPException(
+            status_code=502,
+            detail=f"reached {have} shards, need {req.k} to reconstruct")
+
+    try:
+        codec = RSCodec(req.k, req.m)
+        rebuilt = codec.encode(codec.decode(shards))
+    except Exception as exc:  # noqa: BLE001 -- decode/encode failure is a 502, not a crash
+        raise HTTPException(status_code=502,
+                            detail=f"reconstruction failed: {str(exc)[:120]}") from exc
+
+    stored, total = [], 0
+    for ref in req.want:
+        raw = rebuilt[ref.index]
+        if hashlib.sha256(raw).hexdigest() != ref.id:
+            raise HTTPException(status_code=502,
+                                detail="reconstructed shard failed integrity check")
+        try:
+            state.blobs.put(ref.id, raw)
+        except StorageFull as exc:
+            raise HTTPException(status_code=507, detail=str(exc)) from exc
+        stored.append(ref.id)
+        total += len(raw)
+    return {"blob_id": req.blob_id, "stored": stored, "bytes": total,
+            "shards_used": have}
 
 
 # --- inference: host a contiguous block of model layers (spec §9.6) --------- #
