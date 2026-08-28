@@ -397,41 +397,42 @@ MUTATIONS = [
         ),
     },
     {
-        "id": "weights-are-only-as-durable-as-placement-made-them",
-        "path": "meshpool/inference/engine.py",
-        "old": b"        if not backend.native_generate:\n            await self.ensure_group_redundancy(dep)\n        log.info(\"model deployed\"",
-        "new": b"        if False:\n            await self.ensure_group_redundancy(dep)\n        log.info(\"model deployed\"",
+        "id": "under-replicated-objects-are-never-repaired",
+        "path": "meshpool/storage/engine.py",
+        "old": b"            if 0 < len(placed) < meta.replication_desired:",
+        "new": b"            if False:",
         "cmd": [sys.executable, "sim/scenarios/verify_weight_swarm_coldstart.py"],
         "why": (
-            "Ships a model that is one departure away from being permanently "
-            "unservable. Placement puts a layer group on the machine serving it, so "
-            "a 3-stage pipeline leaves every group single-homed. Nothing about that "
-            "is observable while the pool is healthy: the model deploys, reports "
-            "ready, and answers correctly forever. It only shows up the first time a "
-            "volunteer closes their laptop, and by then the layer is gone -- weights "
-            "cannot be reconstructed from the other layers the way an erasure shard "
-            "can be reconstructed from its siblings. A gate can only catch it by "
-            "asserting the redundancy exists *before* the loss it is insurance "
-            "against, which is why the check runs at deploy time against a pool "
-            "where nothing has failed yet."
+            "Lets the pool bleed replicas. Nothing observable happens for a long "
+            "time: every object still has a live copy, every read succeeds, every "
+            "model still answers. The pool simply stops replacing what churn takes, "
+            "walking monotonically down to one holder per object and staying there. "
+            "The first user-visible symptom is permanent data loss, by which point "
+            "the bytes are gone -- a weight group cannot be rebuilt from the other "
+            "weight groups the way an erasure shard can be rebuilt from its "
+            "siblings. This is why the gate asserts redundancy exists *before* the "
+            "loss it insures against, at deploy time and again after churn, rather "
+            "than inferring health from the fact that requests are still working."
         ),
     },
     {
-        "id": "redundancy-is-not-restored-after-churn",
-        "path": "meshpool/inference/engine.py",
-        "old": b"                if not backend.native_generate:\n                    await self.ensure_group_redundancy(dep)",
-        "new": b"                if False:\n                    await self.ensure_group_redundancy(dep)",
-        "cmd": [sys.executable, "sim/scenarios/verify_weight_swarm_coldstart.py"],
+        "id": "repair-relays-every-byte-through-the-coordinator",
+        "path": "meshpool/storage/engine.py",
+        "old": b"        plan = self._peer_pull_plan(blob_id, holders, target, live_by_id)\n        if plan is not None:",
+        "new": b"        plan = self._peer_pull_plan(blob_id, holders, target, live_by_id)\n        if False:",
+        "cmd": [sys.executable, "-m", "pytest",
+                "tests/test_storage_repair_locality.py",
+                "-m", "slow or not slow", "-p", "no:cacheprovider"],
         "why": (
-            "Insures the model once and never again. Deploy-time redundancy is spent "
-            "by the first departure: re-forming onto the survivors consumes the "
-            "spare copy of every layer the dead machine held, and without a second "
-            "pass the pool walks monotonically down to one holder per group and "
-            "stays there. The model keeps answering correctly the entire time, which "
-            "is what makes it dangerous -- a pool that has survived three departures "
-            "looks more proven than one that has survived none, while actually being "
-            "more fragile. The check therefore has to re-assert the property after "
-            "the churn rather than accepting survival as evidence of durability."
+            "Restores the original behaviour, which was correct and fatal. Repair "
+            "still works, data is still durable, every storage test passes -- the "
+            "bytes just travel through the control plane's memory instead of "
+            "between the two machines that care. At 6 MB that is a rounding error. "
+            "At 600 GB the coordinator must hold each layer group in RAM, base64 it "
+            "(+33%), and push it back out, so every node departure in the pool "
+            "serialises behind one uplink and the decentralised system acquires a "
+            "centralised bottleneck exactly where it hurts most. Nothing about "
+            "correctness can detect this; only counting who carried the bytes can."
         ),
     },
 ]

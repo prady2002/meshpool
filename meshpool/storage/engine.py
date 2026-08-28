@@ -123,6 +123,12 @@ class StorageManager:
         # verification material is recorded at shard placement time and the audit
         # loop can challenge nodes on demand.  None disables auditing (backward compat).
         self.audit = audit
+        # Repair traffic accounting. The peer/relay split is the difference between a
+        # background task and a coordinator-shaped bottleneck at model scale, and it is
+        # invisible in every functional test, so it has to be counted to be gateable.
+        self.repair_peer_pulls = 0
+        self.repair_relays = 0
+        self.repair_relayed_bytes = 0
         self._lock = asyncio.Lock()   # serialize put/delete/reconcile metadata mutations
         # Maps blob_id -> (k, m) for objects stored via erasure coding.
         # Persisted in-band via replication_desired (k*256+m) and chunks presence;
@@ -884,7 +890,8 @@ class StorageManager:
                                      "replicas": len(meta.replicas)})
 
     async def _reconcile(self) -> None:
-        live = {n.id for n in self.registry.online()}
+        live_by_id = {n.id: n for n in self.registry.online()}
+        live = set(live_by_id)
         for meta in self.store.list_blobs():
             if meta.chunks:
                 if self._is_ec(meta):
@@ -927,19 +934,11 @@ class StorageManager:
             changed = len(placed) != len(meta.replicas)
             # re-replicate an under-replicated object (as long as a live copy survives)
             if 0 < len(placed) < meta.replication_desired:
-                data = await self._fetch(placed, meta.id)
-                if data is not None:
-                    payload = base64.b64encode(data).decode("ascii")
-                    for node in self._pick_nodes(
-                            meta.replication_desired - len(placed), exclude=set(placed)):
-                        try:
-                            await self.transport.call(
-                                node.id, "blob_put",
-                                {"blob_id": meta.id, "data": payload}, timeout=30.0)
-                            placed.append(node.id)
-                            changed = True
-                        except TransportError:
-                            continue
+                for node in self._pick_nodes(
+                        meta.replication_desired - len(placed), exclude=set(placed)):
+                    if await self._replicate_to(node.id, meta.id, placed, live_by_id):
+                        placed.append(node.id)
+                        changed = True
             if changed:
                 meta.replicas = placed
                 meta.status = self._status(len(placed), meta.replication_desired)
@@ -958,6 +957,63 @@ class StorageManager:
             await asyncio.sleep(interval)
 
     # --- helpers --------------------------------------------------------- #
+    def _peer_pull_plan(self, blob_id: str, holders, exclude: str,
+                        live_by_id: dict) -> Optional[dict]:
+        """A byte-free instruction telling the new holder where to fetch from.
+
+        The plan carries node URLs and an id, never a payload, so the transfer happens
+        directly between the two machines. Returns None when no live holder advertises
+        a URL, in which case the caller has no choice but to relay.
+
+        ``live_by_id`` is passed in rather than looked up per blob: the reconcile pass
+        already walks every object in the pool, and a registry lookup per object per
+        pass is the kind of O(n·m) that only shows up once the pool is large enough for
+        it to matter.
+        """
+        urls = []
+        for nid in holders:
+            if nid == exclude:
+                continue
+            n = live_by_id.get(nid)
+            url = getattr(n, "url", None) if n is not None else None
+            if url:
+                urls.append(url)
+        return {"blob_id": blob_id, "sources": urls} if urls else None
+
+    async def _replicate_to(self, target: str, blob_id: str, holders,
+                            live_by_id: dict) -> bool:
+        """Place one more copy of ``blob_id`` on ``target``, peer-to-peer if possible.
+
+        Repair is the steady-state cost of a churning pool: every departure triggers
+        one of these for every object the departed machine held. Routing them through
+        the control plane makes the coordinator a hard bandwidth bottleneck that every
+        departure in the pool queues behind, and for weight groups it also means
+        holding a whole layer in coordinator RAM. So the peer path is tried first and
+        the relay exists only for objects whose holders cannot be reached directly.
+        """
+        plan = self._peer_pull_plan(blob_id, holders, target, live_by_id)
+        if plan is not None:
+            try:
+                await self.transport.call(target, "blob_pull", plan, timeout=120.0)
+                self.repair_peer_pulls += 1
+                return True
+            except TransportError as exc:
+                log.warning("repair peer pull failed, relaying via control plane",
+                            node=target, blob=blob_id[:12], err=str(exc)[:120])
+        raw = await self._fetch([h for h in holders if h != target], blob_id)
+        if raw is None:
+            return False
+        try:
+            await self.transport.call(
+                target, "blob_put",
+                {"blob_id": blob_id,
+                 "data": base64.b64encode(raw).decode("ascii")}, timeout=60.0)
+        except TransportError:
+            return False
+        self.repair_relays += 1
+        self.repair_relayed_bytes += len(raw)
+        return True
+
     async def _fetch(self, node_ids, blob_id: str) -> Optional[bytes]:
         """Pull a blob from the first replica that returns bytes matching its id. The
         digest check means a faulty or dishonest node can never hand back wrong data."""
