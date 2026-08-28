@@ -38,7 +38,17 @@ def _wait_job(cp: str, job_id: str, timeout: float = 90) -> dict:
         if j["status"].startswith("completed"):
             return j
         time.sleep(0.4)
-    raise TimeoutError(f"job {job_id} did not finish in {timeout}s")
+    # Report what the job was actually doing. Polling only for a "completed"
+    # prefix means a job stalled with units outstanding, a job whose units all
+    # failed, and a job that was never dispatched at all all produce the SAME
+    # message -- so the detail that would identify the cause is precisely the
+    # one this helper throws away. Fetch it once more on the way out.
+    try:
+        _last = httpx.get(f"{cp}/api/v1/jobs/{job_id}", timeout=10).json()
+        _detail = f" (last seen: {_last})"[:600]
+    except Exception as _exc:  # noqa: BLE001 - diagnostics must not mask the timeout
+        _detail = f" (control plane unreachable while diagnosing: {_exc})"
+    raise TimeoutError(f"job {job_id} did not finish in {timeout}s{_detail}")
 
 
 def _wait_unit_in_flight(cp: str, job_id: str, node_id: str,
