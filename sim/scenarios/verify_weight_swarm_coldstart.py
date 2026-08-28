@@ -240,6 +240,26 @@ def main() -> int:  # noqa: C901 - a gate reads best as one linear narrative
               f"min {dur0['min_holders']} holder(s) each, "
               f"{dur0['total_placements']} placements total")
 
+        # Placement alone puts a group on the node that *serves* it, which for a
+        # 3-stage pipeline is exactly one machine per group. That model reads as
+        # healthy and answers correctly while being one departure away from losing a
+        # layer permanently -- and a layer cannot be recovered from the other layers.
+        # Warm residency exists to close that window at deploy time rather than
+        # waiting for the pool to happen to get used.
+        live_at_deploy = len(live_indices(cp))
+        if live_at_deploy < 2:
+            _fail(f"only {live_at_deploy} machine(s) online, so a second holder was "
+                  f"never possible and this check proves nothing")
+        elif dur0["min_holders"] < 2:
+            thin = [g["blob"][:12] for g in dur0["per_group"] if len(g["nodes"]) < 2]
+            _fail(f"freshly deployed and {len(thin)} layer group(s) sit on a single "
+                  f"machine ({thin[:4]}); the model is one departure away from being "
+                  f"permanently unservable and nothing is trying to fix that")
+        else:
+            _ok(f"every one of {dur0['groups']} layer group(s) is already on >=2 of "
+                f"the {live_at_deploy} machines at deploy time, before any node has "
+                f"left — the model can survive a departure it has not suffered yet")
+
         # ---- 3: a machine that has never seen this model joins ------------ #
         print("\n== 3: a cold machine joins an already-serving pool ==")
         cold_idx = N_AGENTS
@@ -484,6 +504,38 @@ def main() -> int:  # noqa: C901 - a gate reads best as one linear narrative
                 _ok(f"all {N_AGENTS} machines the checkpoint was uploaded to have "
                     f"left, every layer group is now held only by machines that "
                     f"joined afterwards, and the model still answers byte-identically")
+
+        # ---- 9: redundancy is restored after churn, not just at deploy ---- #
+        # Surviving the departures in 8 proves the weights were somewhere else at the
+        # moment they were needed. It does not prove the pool is ready for the *next*
+        # departure -- re-forming onto survivors can quietly consume the last spare
+        # copy of a layer and leave the model as fragile as it was before check 2
+        # fixed it. The property has to hold again after the dust settles, which is
+        # why the re-partition path re-runs residency rather than trusting deploy.
+        print("\n== 9: after all that churn, the model is still not one machine away "
+              "from being lost ==")
+        dur3 = durability(cp, mid)
+        survivors = len(live_indices(cp))
+        thin = [(g["blob"][:12], len(g["nodes"])) for g in dur3["per_group"]
+                if len(g["nodes"]) < 2]
+        print(f"  {survivors} machine(s) left standing; {dur3['groups']} group(s), "
+              f"min {dur3['min_holders']} holder(s), "
+              f"survives_machine_losses={dur3['survives_machine_losses']}")
+        if survivors < 2:
+            _fail(f"only {survivors} machine(s) survived, so a second holder was never "
+                  f"possible and this check proves nothing")
+        elif thin:
+            _fail(f"the pool re-formed but {len(thin)} layer group(s) came out of it on "
+                  f"a single machine ({thin[:4]}); it survived the departures it has "
+                  f"had and would not survive the next one")
+        elif dur3["survives_machine_losses"] < 1:
+            _fail(f"durability reports the model cannot survive any further loss "
+                  f"despite every group having >=2 holders — the metric and the "
+                  f"placement disagree: {dur3['per_group']}")
+        else:
+            _ok(f"every layer group is back on >=2 of the {survivors} surviving "
+                f"machines after {N_AGENTS} departures and 3 arrivals; redundancy is "
+                f"maintained continuously, not just at deploy")
 
     except SystemExit:
         pass

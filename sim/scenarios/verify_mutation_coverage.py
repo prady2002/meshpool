@@ -396,6 +396,44 @@ MUTATIONS = [
             "requiring zero."
         ),
     },
+    {
+        "id": "weights-are-only-as-durable-as-placement-made-them",
+        "path": "meshpool/inference/engine.py",
+        "old": b"        if not backend.native_generate:\n            await self.ensure_group_redundancy(dep)\n        log.info(\"model deployed\"",
+        "new": b"        if False:\n            await self.ensure_group_redundancy(dep)\n        log.info(\"model deployed\"",
+        "cmd": [sys.executable, "sim/scenarios/verify_weight_swarm_coldstart.py"],
+        "why": (
+            "Ships a model that is one departure away from being permanently "
+            "unservable. Placement puts a layer group on the machine serving it, so "
+            "a 3-stage pipeline leaves every group single-homed. Nothing about that "
+            "is observable while the pool is healthy: the model deploys, reports "
+            "ready, and answers correctly forever. It only shows up the first time a "
+            "volunteer closes their laptop, and by then the layer is gone -- weights "
+            "cannot be reconstructed from the other layers the way an erasure shard "
+            "can be reconstructed from its siblings. A gate can only catch it by "
+            "asserting the redundancy exists *before* the loss it is insurance "
+            "against, which is why the check runs at deploy time against a pool "
+            "where nothing has failed yet."
+        ),
+    },
+    {
+        "id": "redundancy-is-not-restored-after-churn",
+        "path": "meshpool/inference/engine.py",
+        "old": b"                if not backend.native_generate:\n                    await self.ensure_group_redundancy(dep)",
+        "new": b"                if False:\n                    await self.ensure_group_redundancy(dep)",
+        "cmd": [sys.executable, "sim/scenarios/verify_weight_swarm_coldstart.py"],
+        "why": (
+            "Insures the model once and never again. Deploy-time redundancy is spent "
+            "by the first departure: re-forming onto the survivors consumes the "
+            "spare copy of every layer the dead machine held, and without a second "
+            "pass the pool walks monotonically down to one holder per group and "
+            "stays there. The model keeps answering correctly the entire time, which "
+            "is what makes it dangerous -- a pool that has survived three departures "
+            "looks more proven than one that has survived none, while actually being "
+            "more fragile. The check therefore has to re-assert the property after "
+            "the churn rather than accepting survival as evidence of durability."
+        ),
+    },
 ]
 
 
