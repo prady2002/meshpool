@@ -435,6 +435,84 @@ MUTATIONS = [
             "correctness can detect this; only counting who carried the bytes can."
         ),
     },
+    {
+        "id": "capability-token-can-grant-scopes-it-does-not-hold",
+        "path": "meshpool/controlplane/app.py",
+        "old": b'            if excess:\n                raise HTTPException(status_code=403, detail=(',
+        "new": b'            if False:\n                raise HTTPException(status_code=403, detail=(',
+        "cmd": [sys.executable, "-m", "pytest",
+                "tests/test_capability_token_api.py",
+                "-m", "slow or not slow", "-p", "no:cacheprovider"],
+        "why": (
+            "Turns every token into a root key with extra steps. A CI token minted "
+            "with jobs:read could mint itself a second token holding cluster:admin, "
+            "and nothing in the system would look wrong: the mint succeeds, the "
+            "audit log shows a normal mint by a legitimate owner, and the escalated "
+            "token is indistinguishable from one the account holder created "
+            "deliberately. Containment is the entire reason to hand out a narrow "
+            "token instead of a session, so a delegation path that can widen its "
+            "own authority makes the feature strictly worse than sharing the "
+            "session it replaces."
+        ),
+    },
+    {
+        "id": "revoking-a-leaked-token-does-not-take-effect",
+        "path": "meshpool/controlplane/app.py",
+        "old": b'    if row["revoked_ms"] is not None or int(row["expires_at_ms"]) < now:',
+        "new": b'    if int(row["expires_at_ms"]) < now:',
+        "cmd": [sys.executable, "-m", "pytest",
+                "tests/test_capability_token_api.py",
+                "-m", "slow or not slow", "-p", "no:cacheprovider"],
+        "why": (
+            "Revocation is the one control a user reaches for during an active "
+            "incident, and it is the one whose failure they cannot see. The DELETE "
+            "returns 200, the token disappears from the listing, and the dashboard "
+            "shows it gone -- while the leaked secret keeps working until its "
+            "natural expiry, possibly thirty days later. Every surface reports "
+            "success; only the attacker knows otherwise. This is why revocation is "
+            "checked against the database on every single request rather than "
+            "cached, and why the test re-uses the secret on the immediately "
+            "following call instead of trusting the 200."
+        ),
+    },
+    {
+        "id": "rejected-tokens-are-recorded-as-successfully-used",
+        "path": "meshpool/controlplane/app.py",
+        "old": b'    if row["revoked_ms"] is not None or int(row["expires_at_ms"]) < now:\n        return None',
+        "new": b'    if row["revoked_ms"] is not None:\n        return None',
+        "cmd": [sys.executable, "-m", "pytest",
+                "tests/test_capability_token_api.py",
+                "-m", "slow or not slow", "-p", "no:cacheprovider"],
+        "why": (
+            "Access control still holds -- Authorizer.check_scope independently "
+            "rejects the expired principal, so no request is ever served. What "
+            "breaks is the evidence. last_used_ms means 'last successful use', and "
+            "here a refused probe advances it, so an operator who has just revoked "
+            "a leaked key watches the timestamp keep moving and concludes the "
+            "revocation did not work. Defence in depth means no single mutation "
+            "can grant access, which is exactly why this layer has to be pinned by "
+            "the audit trail it uniquely owns rather than by a 401 that the other "
+            "layer would produce anyway."
+        ),
+    },
+    {
+        "id": "a-new-route-ships-with-no-declared-scope",
+        "path": "meshpool/controlplane/app.py",
+        "old": b'    _declare_route("DELETE", "/api/v1/tokens/{token_id}",     Scope.TOKENS_WRITE)\n',
+        "new": b"",
+        "cmd": [sys.executable, "-m", "pytest",
+                "tests/test_capability_token_api.py",
+                "-m", "slow or not slow", "-p", "no:cacheprovider"],
+        "why": (
+            "Models the most likely real-world mistake in this codebase: someone "
+            "adds an endpoint and forgets the scope table. The failure is silent "
+            "and open-by-default -- the route works, the feature ships, and nobody "
+            "notices that it is reachable without the authority it should require. "
+            "The guard is a test that enumerates app.routes and fails on any "
+            "undeclared method+path, so forgetting is caught mechanically instead "
+            "of depending on a reviewer remembering a second file."
+        ),
+    },
 ]
 
 
