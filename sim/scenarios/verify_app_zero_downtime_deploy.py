@@ -25,7 +25,8 @@ import httpx
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from sim.harness import Harness  # noqa: E402
+from sim.harness import Harness
+from sim import mutation_guard  # noqa: E402
 
 CP_PORT = 8567
 DATA_ROOT = Path(__file__).resolve().parent / "_data_app_zero_downtime"
@@ -164,6 +165,7 @@ def run_nonvacuity_check() -> None:
     mutated = original.replace(anchor, replacement, 1)
     if mutated == original:
         _fail("mutation anchor not found in hosting engine")
+    _mg = mutation_guard.journal(target, original)
     target.write_bytes(mutated)
     try:
         env = dict(os.environ)
@@ -178,6 +180,7 @@ def run_nonvacuity_check() -> None:
         )
     finally:
         target.write_bytes(original)
+        mutation_guard.clear(_mg)
     after = hashlib.sha256(target.read_bytes()).hexdigest()
     if after != before:
         _fail(f"hosting engine was not restored byte-identically: {before} != {after}")

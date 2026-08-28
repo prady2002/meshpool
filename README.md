@@ -482,6 +482,55 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   Three mutations in `verify_console_mutation_coverage.py` now restore these
   defects, so the accessibility gate is itself held to proof that it can fail.
 
+- **One client pressing Escape at the wrong moment could take a node off the
+  network permanently, and it happened four times in a single sweep.** CPython's
+  Windows event loop closes a listening socket on *any* `OSError` from
+  `accept()` (`proactor_events.py:863-870`) with no retry and no reopen; the
+  Unix selector loop, by contrast, absorbs `ConnectionAbortedError` and re-arms.
+  `[WinError 64] ERROR_NETNAME_DELETED` is what a pending `AcceptEx` reports when
+  a peer vanishes between SYN and accept -- an aborted request, a health check
+  timing out, a port scanner, flaky residential Wi-Fi. **Measured: four of the
+  first 47 acceptance gates (~8%) died this way**, on agents and on the control
+  plane, and the symptom is the worst kind: the process stays alive, logs one
+  line, and accepts nothing ever again. A watchdog cannot cover it, because the
+  listener died about a second after boot and the first probe is at five --
+  detection was structurally too late, so `meshpool/common/proactor_fix.py`
+  prevents it instead, retrying inside the returned future so the stdlib only
+  ever sees a real connection or a genuinely fatal error. Switching to the
+  selector loop is not an option: `select()` on Windows caps at 512 sockets and
+  the control plane holds a long-lived tunnel per node.
+
+- **A gate that times out used to corrupt the repository and silently invalidate
+  every gate after it.** Eleven acceptance gates prove they are not vacuous by
+  breaking a real source file, re-running themselves, and requiring the re-run to
+  fail. Every one restored the file in a `finally` -- which is correct for
+  exceptions and useless for the case that actually occurred: the sweep runner
+  killed a hung gate process tree, `finally` never ran, and
+  `meshpool/controlplane/openai_api.py` stayed mutated with `_sse_chunk`
+  returning `data: {not-json}`. **Roughly a third of a 78-gate sweep ran against
+  a corrupted checkout and its green results meant nothing.** `finally` cannot
+  survive `TerminateProcess`, so the recovery information now lives on disk
+  before the mutation: `sim/mutation_guard.py` journals the original bytes, and
+  both the runner and the meta-gate restore anything a killed process left
+  behind. The runner additionally diffs `git status` around every gate and fails
+  any gate that leaves the tree dirty even if it exited zero -- a pass produced
+  by a run that corrupted the checkout is not a pass. The tests for this do not
+  inspect journal files; they start a real child, let it really mutate, and
+  `SIGKILL`/`TerminateProcess` it, because a cleanup path that only works when
+  cleanup runs is the bug.
+
+- **The sweep runner could destroy its own multi-hour run.** `subprocess.run(timeout=)`
+  *raises*, so one hung gate aborted all 78 and discarded every result collected
+  so far; and killing only the direct child left control planes and agents holding
+  **fixed** ports, turning one hang into a page of unrelated-looking failures. It
+  now records a timeout as an ordinary failure, kills the whole process tree,
+  waits for the well-known ports to free, journals results so `--resume` skips
+  what already passed, and was verified against a gate written to hang *and*
+  spawn a grandchild on port 8080 -- with a sentinel file proving the grandchild
+  really ran, so the check cannot pass vacuously. Its auto-repair copies every
+  file into `_gatelogs/repaired/` before reverting it, because "modified while
+  the sweep ran" is a time window rather than proof of authorship, and this
+  reverted 46 lines of hand-written documentation the first time it fired.
 - **Auto-update is fully implemented and completely inert, on purpose.**
   `agent-go/internal/update` verifies Ed25519-signed release manifests, refuses
   downgrades, and swaps the binary through a rename dance that restores the previous

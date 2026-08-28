@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import httpx  # noqa: E402
 
 from sim.harness import Harness  # noqa: E402
+from sim import mutation_guard  # noqa: E402
 
 CP_PORT = 8600
 
@@ -462,6 +463,7 @@ def check_non_vacuity() -> bool:
     )
 
     # Step 3: write the mutation
+    _mg = mutation_guard.journal(vpath, original_bytes)
     vpath.write_bytes(mutated_bytes)
 
     # Step 4: run a quick convergence check inline (import the mutated module)
@@ -494,6 +496,7 @@ def check_non_vacuity() -> bool:
     finally:
         # Step 5: restore the original file byte-identically
         vpath.write_bytes(original_bytes)
+        mutation_guard.clear(_mg)
         # Reload the real implementation
         try:
             import meshpool.common.vivaldi as vmod2

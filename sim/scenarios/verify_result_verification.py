@@ -42,6 +42,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sim.harness import Harness  # noqa: E402
+from sim import mutation_guard  # noqa: E402
 
 CP_PORT = 8620
 _DATA = Path(__file__).resolve().parent / "_data_verify_result"
@@ -250,6 +251,7 @@ def verify_non_vacuity() -> int:
         print("  (searched for 'return rng.random() < self.redundant_rate' with CRLF/LF)")
         return 1
 
+    _mg = mutation_guard.journal(_VERIFICATION_PY, original_bytes)
     _VERIFICATION_PY.write_bytes(mutated_bytes)
     print("  mutation applied: should_trigger_redundant always returns False")
 
@@ -271,6 +273,7 @@ def verify_non_vacuity() -> int:
     finally:
         # ALWAYS restore original bytes.
         _VERIFICATION_PY.write_bytes(original_bytes)
+        mutation_guard.clear(_mg)
         importlib.reload(_vm)
 
     # Part C: verify byte-identical restore.

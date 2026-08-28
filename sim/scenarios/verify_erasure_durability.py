@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from sim import mutation_guard
 
 from meshpool.storage.engine import StorageManager, EC_PROFILES, StorageError
 from meshpool.storage.erasure import RSCodec
@@ -504,6 +505,7 @@ def non_vacuity_mutation_parity() -> bool:
         return False
 
     print(f"  mutating engine.py (sha256 before: {sha_before[:16]}...)")
+    _mg = mutation_guard.journal(engine_path, original_bytes)
     engine_path.write_bytes(mutated)
 
     try:
@@ -562,6 +564,7 @@ def non_vacuity_mutation_parity() -> bool:
         print(f"  FAIL: exception during mutation test: {type(exc).__name__}: {exc}")
     finally:
         engine_path.write_bytes(original_bytes)
+        mutation_guard.clear(_mg)
         restored = engine_path.read_bytes()
         sha_after = hashlib.sha256(restored).hexdigest()
         if sha_after != sha_before:
@@ -695,6 +698,7 @@ def non_vacuity_mutation_diversity() -> bool:
         return False
 
     print(f"  mutating topology.py (sha256 before: {sha_before[:16]}...)")
+    _mg = mutation_guard.journal(topo_path, original_bytes)
     topo_path.write_bytes(mutated)
 
     try:
@@ -756,6 +760,7 @@ def non_vacuity_mutation_diversity() -> bool:
         traceback.print_exc()
     finally:
         topo_path.write_bytes(original_bytes)
+        mutation_guard.clear(_mg)
         restored = topo_path.read_bytes()
         sha_after = hashlib.sha256(restored).hexdigest()
         if sha_after != sha_before:

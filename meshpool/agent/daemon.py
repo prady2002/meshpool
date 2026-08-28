@@ -1202,13 +1202,19 @@ async def ollama_generate(req: OllamaGenerateRequest) -> dict:
 def main() -> None:
     import uvicorn
 
+    from meshpool.common import proactor_fix
     from meshpool.common.serve_guard import ListenerWatchdog
 
     st = get_state()
-    # A node whose listener has died still looks healthy from outside: the
-    # process is up, so no supervisor restarts it, and it silently accepts no
-    # work forever. See meshpool/common/serve_guard.py for how that happens on
-    # Windows, which is where most contributor machines are.
+    # Order matters. First stop the listener from dying: on Windows a single
+    # client that hangs up mid-handshake makes CPython close our listening
+    # socket for good (see meshpool/common/proactor_fix.py). That is not a rare
+    # event on residential Wi-Fi, and it was observed killing agents here.
+    proactor_fix.install()
+    # Then watch for the failure modes hardening cannot prevent -- a wedged
+    # event loop, an exhausted executor, a handler that never returns. A node
+    # in that state still looks healthy from outside: the process is up, so no
+    # supervisor restarts it, and it silently accepts no work forever.
     ListenerWatchdog(st.bind_host, st.port).start()
     uvicorn.run(app, host=st.bind_host, port=st.port, log_level="warning")
 

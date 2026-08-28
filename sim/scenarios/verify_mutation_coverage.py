@@ -20,6 +20,12 @@ Safety: mutations are applied inside a throwaway ``git worktree`` checked out at
 HEAD, never in the working tree. Concurrent edits cannot corrupt it and a crash
 cannot leave a mutated file behind. The working tree is verified untouched at
 the end regardless.
+
+A crash *can* leave the worktree itself behind -- ``git worktree remove`` lives
+in a ``finally`` that a ``taskkill`` does not run -- so startup sweeps any
+abandoned ``meshpool-mut-*`` worktree before adding a new one. Without that,
+every killed run permanently accumulates a registered worktree and a few
+hundred megabytes of temp files.
 """
 from __future__ import annotations
 
@@ -32,6 +38,42 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from sim import mutation_guard  # noqa: E402
+
+
+def _sweep_abandoned_worktrees() -> None:
+    """Remove worktrees a previous killed run could not clean up.
+
+    ``git worktree prune`` is not enough: it only forgets worktrees whose
+    directory has already vanished, and a killed run leaves the directory very
+    much present. So list them, match our own prefix, and remove them
+    explicitly. Also drop any journal left by an in-place mutation gate that
+    was killed, since this gate refuses to run against a dirty checkout.
+    """
+    for rel in mutation_guard.restore_stale():
+        print(f"   [recovered] restored {rel} from a killed mutation gate")
+    try:
+        out = subprocess.run(["git", "worktree", "list", "--porcelain"],
+                             cwd=str(ROOT), capture_output=True, text=True,
+                             timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return
+    for line in (out.stdout or "").splitlines():
+        if not line.startswith("worktree "):
+            continue
+        wt = line.split(" ", 1)[1].strip()
+        if "meshpool-mut-" not in wt:
+            continue
+        subprocess.run(["git", "worktree", "remove", "--force", wt],
+                       cwd=str(ROOT), stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+        shutil.rmtree(Path(wt).parent, ignore_errors=True)
+        print(f"   [recovered] removed abandoned worktree {wt}")
+    subprocess.run(["git", "worktree", "prune"], cwd=str(ROOT),
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 
 # Each mutation must break a *semantic* property, not merely a syntactic one.
 # Deleting a line or renaming a symbol proves nothing: a crash is caught by any
@@ -785,6 +827,7 @@ def _apply(worktree: Path, mut: dict) -> bytes:
 
 def main() -> int:
     print("== mutation coverage: do our strongest gates actually detect breakage? ==\n")
+    _sweep_abandoned_worktrees()
 
     # Optional id filter keeps the edit/run loop cheap while writing a new entry.
     wanted = set(sys.argv[1:])

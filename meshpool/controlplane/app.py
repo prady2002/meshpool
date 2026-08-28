@@ -2861,9 +2861,13 @@ app = build_app()
 def main() -> None:
     import uvicorn
 
+    from meshpool.common import proactor_fix
     from meshpool.common.serve_guard import ListenerWatchdog
 
     settings = Settings.load()
+    # Keep the listening socket alive through the transient accept failures
+    # CPython treats as fatal on Windows (meshpool/common/proactor_fix.py).
+    proactor_fix.install()
     # The control plane losing its listener is worse than a crash: every
     # agent keeps its tunnel open and reports healthy while no new work can
     # arrive. Fail loudly instead of silently.

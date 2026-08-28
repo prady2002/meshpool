@@ -52,6 +52,18 @@ pytest_*.txt
 *_out.txt
 *_out[0-9].txt
 _gatelogs/
+*.log
 
 # scratch file used to pass multi-line commit messages to git commit -F
 .commitmsg
+
+# The raw session prompt that drove this work. Useful locally, but it is a
+# personal note rather than product documentation and should not greet anyone
+# who clones the repo.
+prompt.md
+
+# Crash-recovery journals written by the in-place mutation gates. Present only
+# while a non-vacuity check is mid-mutation, or after one was killed -- in
+# which case `python -m sim.mutation_guard` restores the file and clears them.
+.mutation-journal/
+.mutation-journal-test/

@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from sim import mutation_guard  # noqa: E402
 
 import httpx
 
@@ -615,6 +616,7 @@ def non_vacuity_guard() -> bool:
         return False
 
     print(f"  mutating topology.py (sha256 before: {sha_before[:16]}...)")
+    _mg = mutation_guard.journal(topo_path, original_bytes)
     topo_path.write_bytes(mutated_bytes)
 
     try:
@@ -644,6 +646,7 @@ def non_vacuity_guard() -> bool:
     finally:
         # Restore BYTE-IDENTICALLY (sha256 must match original)
         topo_path.write_bytes(original_bytes)
+        mutation_guard.clear(_mg)
         restored = topo_path.read_bytes()
         sha_after = hashlib.sha256(restored).hexdigest()
         if sha_after != sha_before:

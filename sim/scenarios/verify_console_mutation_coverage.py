@@ -23,6 +23,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 WEB = ROOT / "web"
+sys.path.insert(0, str(ROOT))
+from sim import mutation_guard
 
 MUTATIONS = [
     {
@@ -194,6 +196,7 @@ def main() -> int:
     for mut in selected:
         target = ROOT / mut["path"]
         original = _apply(target, mut["old"], mut["new"])
+        _mg = mutation_guard.journal(target, original)
         if original is None:
             n = target.read_bytes().count(mut["old"])
             unrunnable.append(f"{mut['id']}: ANCHOR MISS ({n} matches) in {mut['path']}")
@@ -222,6 +225,7 @@ def main() -> int:
                 print(f"SURVIVED     {mut['id']}  <-- the test cannot see this defect")
         finally:
             target.write_bytes(original)
+            mutation_guard.clear(_mg)
 
     # Restore the built bundle so the tree is left exactly as found.
     _run([NPM, "run", "build"], WEB)

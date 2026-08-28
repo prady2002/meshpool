@@ -1304,6 +1304,8 @@ def serve(
 
     console.print(f"[green]serving[/] OpenAI-compatible endpoint at http://{host}:{port}/v1")
     console.print(f"[dim]upstream {upstream}; default model {model}[/]")
+    from meshpool.common import proactor_fix
+    proactor_fix.install()
     uvicorn.run(proxy, host=host, port=port, log_level="warning")
 
 

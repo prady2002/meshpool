@@ -36,7 +36,8 @@ import httpx  # noqa: E402
 from meshpool.common.identity import DeviceIdentity, enrollment_challenge  # noqa: E402
 from meshpool.common.models import now_ms  # noqa: E402
 from meshpool.functions import wasm as _wasm  # noqa: E402
-from sim.harness import Harness  # noqa: E402
+from sim.harness import Harness
+from sim import mutation_guard  # noqa: E402
 
 CP_PORT = 8720
 DATA_DIR = Path(__file__).resolve().parent / "_data_egress"
@@ -80,11 +81,13 @@ def _byte_mutation(path: Path, old_variants: tuple[bytes, ...], replacement_text
         raise AssertionError(f"mutation target not found in {path}")
     newline = "\r\n" if matched.endswith(b"\r\n") else "\n"
     mutated = original.replace(matched, replacement_text.replace("\n", newline).encode("utf-8"), 1)
+    _mg = mutation_guard.journal(path, original)
     path.write_bytes(mutated)
     try:
         yield _sha256(path)
     finally:
         path.write_bytes(original)
+        mutation_guard.clear(_mg)
         restored = _sha256(path)
         original_sha = hashlib.sha256(original).hexdigest()
         if restored != original_sha:
