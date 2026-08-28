@@ -2860,7 +2860,14 @@ app = build_app()
 
 def main() -> None:
     import uvicorn
+
+    from meshpool.common.serve_guard import ListenerWatchdog
+
     settings = Settings.load()
+    # The control plane losing its listener is worse than a crash: every
+    # agent keeps its tunnel open and reports healthy while no new work can
+    # arrive. Fail loudly instead of silently.
+    ListenerWatchdog(settings.host, settings.port).start()
     uvicorn.run("meshpool.controlplane.app:app", host=settings.host,
                 port=settings.port, log_level="warning")
 

@@ -1201,7 +1201,15 @@ async def ollama_generate(req: OllamaGenerateRequest) -> dict:
 
 def main() -> None:
     import uvicorn
+
+    from meshpool.common.serve_guard import ListenerWatchdog
+
     st = get_state()
+    # A node whose listener has died still looks healthy from outside: the
+    # process is up, so no supervisor restarts it, and it silently accepts no
+    # work forever. See meshpool/common/serve_guard.py for how that happens on
+    # Windows, which is where most contributor machines are.
+    ListenerWatchdog(st.bind_host, st.port).start()
     uvicorn.run(app, host=st.bind_host, port=st.port, log_level="warning")
 
 

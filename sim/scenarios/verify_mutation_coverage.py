@@ -710,6 +710,40 @@ MUTATIONS = [
             "outcome was reported can catch it."
         ),
     },
+    {
+        "id": "serve-guard-kills-a-server-that-is-still-booting",
+        "path": "meshpool/common/serve_guard.py",
+        "old": b"        if not self._ready:  # never answered yet: still booting, nothing to kill",
+        "new": b"        if False:  # mutated: kill even a server that never came up",
+        "cmd": [sys.executable, "-m", "pytest", "-q", "tests/test_serve_guard.py",
+                "-m", "slow or not slow"],
+        "why": (
+            "The guard exists to catch a listener that died, not one that has not "
+            "opened yet. Without the readiness gate a server that takes longer than "
+            "threshold*interval to bind -- a cold start, a slow disk, a machine "
+            "swapping -- is shot on sight, turning a slow boot into a restart loop "
+            "that never converges. Every failure-detection test still passes, "
+            "because they all begin from a healthy probe; only a test that starts "
+            "from a server which has never answered can see it."
+        ),
+    },
+    {
+        "id": "serve-guard-never-forgives-a-transient-blip",
+        "path": "meshpool/common/serve_guard.py",
+        "old": b"            self._consecutive_failures = 0",
+        "new": b"            pass  # mutated: never forgive a transient blip",
+        "cmd": [sys.executable, "-m", "pytest", "-q", "tests/test_serve_guard.py",
+                "-m", "slow or not slow"],
+        "why": (
+            "The counter is meant to measure *consecutive* failures. Leaving it "
+            "unreset turns the guard into a cumulative one: a node that drops one "
+            "probe a day is executed after `threshold` days of otherwise perfect "
+            "uptime, and the kill looks completely unrelated to anything happening "
+            "at the time. Every straightforward test still passes -- it fires when "
+            "it should and stays quiet when healthy -- because only an "
+            "interleaving of failures and recoveries distinguishes the two."
+        ),
+    },
 ]
 
 
