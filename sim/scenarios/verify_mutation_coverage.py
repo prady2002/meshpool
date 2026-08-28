@@ -554,6 +554,48 @@ MUTATIONS = [
             "it."
         ),
     },
+    {
+        "id": "submit-signature-shifts-secret-names",
+        "path": "meshpool/batch/engine.py",
+        "old": (b"               secret_names: Optional[list[str]] = None,\n"
+                b"               *,\n"
+                b"               capability_token_id: Optional[str] = None) -> BatchJob:"),
+        "new": (b"               capability_token_id: Optional[str] = None,\n"
+                b"               secret_names: Optional[list[str]] = None) -> BatchJob:"),
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_cli_tokens.py",
+                "-m", "slow or not slow", "-p", "no:cacheprovider"],
+        "why": (
+            "This is how the defect actually shipped: a new parameter was added in "
+            "the middle of a public signature, and every existing positional caller "
+            "silently started passing its argument to the wrong field. It broke API "
+            "job submission and every DAG stage launch, and neither "
+            "test_batch_engine.py nor test_secrets.py noticed, because both call "
+            "submit() with keywords. Fixing the call sites would leave the landmine "
+            "armed for whoever adds the next parameter, so the guarantee under test "
+            "is the signature itself: capability_token_id must stay keyword-only, "
+            "where no positional call can reach it, and secret_names must stay in "
+            "position 7, where existing callers already aim."
+        ),
+    },
+    {
+        "id": "fuel-budget-ignored",
+        "path": "meshpool/functions/wasm.py",
+        "old": b"store.set_fuel(limits.fuel)",
+        "new": b"store.set_fuel(10_000_000_000)",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_wasm_runtime.py",
+                "-m", "slow or not slow", "-p", "no:cacheprovider"],
+        "why": (
+            "Fuel is the compute meter and the only bound on a guest that never "
+            "yields, so ignoring the caller's budget means untrusted code runs "
+            "unmetered and unbilled until the wall clock happens to save us. The "
+            "gate that used to guard this compared the wall-clock duration of two "
+            "runs, which is a race it lost under load while passing in isolation -- "
+            "and a timing comparison cannot distinguish 'fuel is ignored' from 'the "
+            "machine was busy' even when it wins. It now asserts on fuel directly: "
+            "a budget too small to finish must trap with kind == 'fuel', and a "
+            "generous budget must complete having burned more than that budget."
+        ),
+    },
 ]
 
 
