@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 import json
+import time
 import atexit
 import hashlib
 from pathlib import Path
@@ -1420,6 +1421,88 @@ def secrets_rm(name: str = typer.Argument(..., help="secret name to delete")) ->
         _fail(exc)
     msg = "deleted" if d.get("deleted") else "not found"
     console.print(f"[yellow]{msg}[/] {name}")
+
+
+tokens_app = typer.Typer(help="Mint scoped, expiring tokens for CI and agents.")
+app.add_typer(tokens_app, name="tokens")
+
+
+@tokens_app.command("mint")
+def tokens_mint(
+    label: str = typer.Argument(..., help="what this token is for, e.g. 'ci runner'"),
+    scope: list[str] = typer.Option(..., "--scope", "-s",
+                                    help="repeatable, e.g. -s jobs:read -s jobs:write"),
+    expires_in: float = typer.Option(30 * 24 * 3600, "--expires-in",
+                                     help="lifetime in seconds (default 30 days)"),
+    spend_cap: Optional[float] = typer.Option(None, "--spend-cap",
+                                              help="stop this token after N credits"),
+) -> None:
+    """Mint a token that can do less than you can.
+
+    The secret is shown once, here, and never again: only its hash is stored. You can
+    only grant scopes you already hold, so a token can never widen its own authority.
+    """
+    body = {"label": label, "scopes": list(scope), "expires_in_seconds": expires_in}
+    if spend_cap is not None:
+        body["spend_cap"] = spend_cap
+    try:
+        d = _post("/api/v1/tokens", body)
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
+    console.print(f"[green]minted[/] [bold]{d['label']}[/]  id={d['id']}")
+    console.print(f"[bold yellow]{d['token']}[/]")
+    console.print("[dim]copy it now — only a hash is stored, so it cannot be shown "
+                  "again. revoke with: meshpool tokens revoke " + d["id"] + "[/]")
+
+
+@tokens_app.command("list")
+def tokens_list() -> None:
+    """List your tokens. Secrets are never shown because they are never stored."""
+    try:
+        d = _get("/api/v1/tokens")
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
+    t = Table(title="Capability tokens (secrets are not stored)")
+    for col in ("id", "label", "scopes", "expires", "last used", "spent"):
+        t.add_column(col)
+    now = int(time.time() * 1000)
+    for row in d["tokens"]:
+        left = (row["expires_at_ms"] - now) / 1000.0
+        expires = f"in {_short_duration(left)}" if left > 0 else "[red]expired[/]"
+        cap = row.get("spend_cap")
+        spent = f"{row['spent']:.2f}" + (f" / {cap:.2f}" if cap is not None else "")
+        t.add_row(row["id"], row["label"], ", ".join(row["scopes"]), expires,
+                  _ms_ago(row["last_used_ms"]), spent)
+    console.print(t)
+    if not d["tokens"]:
+        console.print("[dim]no tokens yet — meshpool tokens mint 'ci' -s jobs:read[/]")
+
+
+@tokens_app.command("revoke")
+def tokens_revoke(token_id: str = typer.Argument(..., help="token id, e.g. tok-ab12…")) -> None:
+    """Revoke a token. Takes effect on the very next request, not eventually."""
+    try:
+        _delete(f"/api/v1/tokens/{token_id}")
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
+    console.print(f"[yellow]revoked[/] {token_id} — it stops working immediately")
+
+
+def _short_duration(seconds: float) -> str:
+    if seconds >= 86400:
+        return f"{seconds / 86400:.0f}d"
+    if seconds >= 3600:
+        return f"{seconds / 3600:.0f}h"
+    if seconds >= 60:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds:.0f}s"
+
+
+def _ms_ago(ts_ms: Optional[int]) -> str:
+    """Never used is a meaningful state and must not render as a fake timestamp."""
+    if not ts_ms:
+        return "[dim]never[/]"
+    return _short_duration(max(0.0, time.time() - ts_ms / 1000.0)) + " ago"
 
 
 # ---- node control -------------------------------------------------------- #

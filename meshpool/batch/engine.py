@@ -208,8 +208,9 @@ class BatchManager:
     # --- submission ------------------------------------------------------ #
     def submit(self, name: str, func: str, payloads: list[dict], cpu_pct: int,
                ram_mb: int, owner: str = "default",
-               capability_token_id: Optional[str] = None,
-               secret_names: Optional[list[str]] = None) -> BatchJob:
+               secret_names: Optional[list[str]] = None,
+               *,
+               capability_token_id: Optional[str] = None) -> BatchJob:
         units = [WorkUnit(id=new_id("u"), payload=p) for p in payloads]
         job = BatchJob(id=new_id("job"), name=name, func=func, units=units,
                        cpu_pct_per_unit=cpu_pct, ram_mb_per_unit=ram_mb, owner=owner,

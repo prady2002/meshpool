@@ -288,25 +288,34 @@ def test_infinite_loop_is_killed_by_fuel():
 
 
 def test_fuel_limit_is_actually_enforced_not_just_reported():
-    """Non-vacuity for the test above: a *smaller* fuel budget must stop the same
-    module sooner. If fuel were ignored, both runs would behave identically."""
-    import time
-    slow = W.Limits(fuel=200_000_000, wall_timeout_s=60.0)
-    fast = W.Limits(fuel=1_000_000, wall_timeout_s=60.0)
+    """Non-vacuity for the test above: fuel must decide whether the *same* module
+    finishes.
 
-    t0 = time.perf_counter()
-    with pytest.raises(W.FunctionError):
-        W.run(_spin_module(), None, limits=fast)
-    t_fast = time.perf_counter() - t0
+    This used to compare wall-clock durations of two runs, which made it a race that
+    lost under parallel load -- it failed in a full-suite run and passed in isolation.
+    A timing comparison cannot distinguish "fuel is ignored" from "the machine was
+    busy", so it was measuring the wrong thing even when it passed.
 
-    t0 = time.perf_counter()
-    with pytest.raises(W.FunctionError):
-        W.run(_spin_module(), None, limits=slow)
-    t_slow = time.perf_counter() - t0
+    Fuel is a deterministic instruction counter, so assert on it directly: one budget
+    too small to finish must trap, a generous budget must complete, and the fuel
+    actually consumed must exceed the small budget. If fuel were ignored, both runs
+    would complete and the first assertion would fail.
+    """
+    module = _busy_module(200_000)
 
-    assert t_slow > t_fast, (
-        f"200x the fuel did not take longer ({t_slow:.4f}s vs {t_fast:.4f}s) "
-        f"— fuel metering is not actually bounding execution")
+    tight = W.Limits(fuel=50_000, wall_timeout_s=60.0)
+    with pytest.raises(W.FunctionError) as ei:
+        W.run(module, None, limits=tight)
+    assert ei.value.kind == "fuel", (
+        f"expected fuel exhaustion, got {ei.value.kind}: {ei.value}")
+
+    ample = W.Limits(fuel=500_000_000, wall_timeout_s=60.0)
+    result = W.run(module, None, limits=ample)
+
+    assert result.value == {"ok": True}, "the generous run did not actually complete"
+    assert result.fuel_used > tight.fuel, (
+        f"the module completed using only {result.fuel_used} fuel, which is under the "
+        f"{tight.fuel} budget that supposedly ran out — fuel is not being metered")
 
 
 def test_wall_clock_timeout_stops_a_module_fuel_alone_would_not():

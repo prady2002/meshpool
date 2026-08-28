@@ -582,6 +582,45 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   the new one is health-checked. Routing uses only healthy replicas, and autoscale
   decisions come from observed proxy traffic. What is not implemented here: managed
   TLS certificates, DNS automation, global edge POPs, or custom-domain provisioning.
+- **Repair is peer-to-peer, and the coordinator relay survives as a deliberate
+  fallback.** Repair is the *steady-state* cost of a churning pool — one per object per
+  departure — so routing it through the control plane makes the coordinator a hard
+  bandwidth and memory bottleneck that every departure queues behind. Both repair paths
+  now send a **byte-free plan** naming peer URLs: replication repair tells the new
+  holder where to fetch, and erasure repair tells one node to pull `k` shards directly
+  from its peers, reconstruct locally, and keep the missing ones. Measured before the
+  fix at RS(3,2): four `blob_get` calls dragged through the coordinator to replace a
+  single shard; at the cold profile RS(29,80) that is 29+ shards through one uplink with
+  the whole reconstructed object held in coordinator RAM. The relay path is still there
+  and still runs — for holders that are not directly addressable (**the CGNAT case,
+  budgeted at 25–40% of the pool**) and for nodes that refuse the delegated repair —
+  because peer-to-peer is an optimisation of the *route* and must never become a reason
+  to leave an object under-replicated. Note what this does **not** claim: nothing about
+  correctness can distinguish the two paths, since the relay reconstructs perfectly and
+  every durability check passes either way. The guarantee is enforced by tests that
+  count *who carried the bytes*, plus mutations that restore the relay and must fail.
+
+- **Delegated repair moved verification along with the work.** Reconstruction now
+  happens on a machine the coordinator does not control, from shards served by machines
+  it also does not control. Every fetched shard is checked against its content address,
+  and every reconstructed shard against the id that was actually requested. That second
+  check is not redundant: a content address proves a shard is the bytes it claims to be,
+  but proves **nothing** about which encoding it came from, so shards from two
+  generations of an object (stale manifest, interrupted re-encode, a peer that never
+  deleted an old version) each verify individually and decode to garbage.
+
+- **Capability tokens are scoped, expiring and revocable — and cannot escalate.**
+  An account can mint narrow bearer tokens for CI and agents instead of sharing its
+  session. Requested scopes must be a subset of what the calling principal already
+  holds, so a token minted by a token can only ever narrow. Only a SHA-256 hash of the
+  secret is stored, so listing cannot leak it. Revocation is a database read on every
+  request rather than a cached decision, so it takes effect on the immediately following
+  call. Usage is attributed to the **grantor**, not the bearer: a forged owner in a
+  request body is overridden, and the token id lands on the job, the receipt and the
+  ledger line. What this is *not*: these are opaque bearer secrets, not signed
+  macaroons, so a token cannot be attenuated offline and revocation depends on the
+  control plane being reachable.
+
 - **Proof-of-storage audits are per-chunk hashes, not a Merkle tree or PoRep.** Nodes are
   challenged on a random chunk offset and must return its SHA-256. A node that deleted the
   bytes fails. A determined cheater *can* defeat this by caching the chunk hash table

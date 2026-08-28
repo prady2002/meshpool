@@ -189,7 +189,8 @@ class DagManager:
                     payloads = self._payloads_for(dag, stage)
                     job = self.batch.submit(
                         f"{dag.name}:{stage.id}", stage.func, payloads,
-                        stage.cpu_pct, stage.ram_mb, dag.owner, stage.secret_names,
+                        stage.cpu_pct, stage.ram_mb, dag.owner,
+                        secret_names=stage.secret_names,
                     )
                     stage.job_id = job.id
                     stage.status = "running"
