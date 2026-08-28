@@ -786,6 +786,58 @@ MUTATIONS = [
             "interleaving of failures and recoveries distinguishes the two."
         ),
     },
+    {
+        "id": "proactor-fix-treats-a-lost-client-as-a-lost-listener",
+        "path": "meshpool/common/proactor_fix.py",
+        "old": b'        return getattr(exc, "winerror", None) in TRANSIENT_WINERRORS',
+        "new": b"        return False  # mutated: no OSError is ever transient",
+        "cmd": [sys.executable, "-m", "pytest", "-q", "tests/test_proactor_fix.py",
+                "-m", "slow or not slow"],
+        "why": (
+            "WinError 64 arrives as a plain OSError, not a ConnectionAbortedError, "
+            "so this single line is the entire difference between absorbing a "
+            "vanished client and letting CPython close the listening socket "
+            "forever. With it gone the wrapper still installs, still returns a "
+            "future, still handles real connections, and still passes every test "
+            "that only checks a server accepts traffic -- the node simply goes "
+            "deaf the first time a peer disappears between SYN and accept, which "
+            "on residential links is routine. Only a test that injects the error "
+            "against a live listener and then reconnects can tell the difference."
+        ),
+    },
+    {
+        "id": "mutation-guard-stomps-a-live-gate-mid-mutation",
+        "path": "sim/mutation_guard.py",
+        "old": b"        if not force and pid != os.getpid() and _pid_alive(pid):",
+        "new": b"        if False:  # mutated: restore regardless of who owns it",
+        "cmd": [sys.executable, "-m", "pytest", "-q", "tests/test_mutation_guard.py",
+                "-m", "slow or not slow"],
+        "why": (
+            "Crash recovery that cannot tell a dead process from a running one is "
+            "worse than none: it restores a file another gate is deliberately "
+            "holding mutated, so that gate concludes its non-vacuity check passed "
+            "against unbroken code. Every straightforward test still passes, "
+            "because they all recover from a process that really is dead. Only a "
+            "test that keeps a mutation in flight while calling restore_stale can "
+            "see it."
+        ),
+    },
+    {
+        "id": "mutation-guard-cannot-tell-a-dead-process-from-a-live-one",
+        "path": "sim/mutation_guard.py",
+        "old": b'        return str(pid) in (out.stdout or "")',
+        "new": b"        return True  # mutated: every pid looks alive",
+        "cmd": [sys.executable, "-m", "pytest", "-q", "tests/test_mutation_guard.py",
+                "-m", "slow or not slow"],
+        "why": (
+            "If every pid looks alive then nothing is ever recovered, and the "
+            "journal becomes a directory of evidence about a corruption nobody "
+            "fixes. This is the failure mode the module exists to prevent, and it "
+            "is invisible to any test that does not actually kill a process: the "
+            "journal is written correctly, the manifest parses, pending() reports "
+            "the entry -- restore_stale simply declines to act on it forever."
+        ),
+    },
 ]
 
 
