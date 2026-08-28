@@ -42,6 +42,13 @@ from .spd import SelfDraft, speculative_generate
 
 log = get_logger("inference")
 
+# How many live machines should hold each weight group, whether or not they are
+# currently serving it. Two is the minimum that means anything: at one, the model
+# is always exactly one departure from unrecoverable. Raising it costs real
+# bandwidth on volunteers' home connections, so it is deliberately not scaled with
+# pool size -- the marginal copy buys much less than the second one did.
+WEIGHT_REDUNDANCY = int(os.environ.get("MESHPOOL_WEIGHT_REDUNDANCY", "2"))
+
 
 class InferenceManager:
     def __init__(self, registry, store, ledger, events, transport: AgentTransport) -> None:
@@ -236,6 +243,12 @@ class InferenceManager:
                 dep.spares = await self._warm_spares(dep, cfg, nodes, manifest)
             dep.status = "ready"
             self.store.put_model(dep)
+        # After the deployment is ready, not before: redundancy is a durability
+        # improvement, not a precondition for serving, and making a user wait for
+        # extra copies before their first token would trade the thing they asked for
+        # against a risk that has not materialised yet.
+        if not backend.native_generate:
+            await self.ensure_group_redundancy(dep)
         log.info("model deployed", id=dep.id, model=model_name, backend=backend.name,
                  stages=len(partition),
                  layout=[[a.start_layer, a.end_layer] for a in partition])
@@ -450,6 +463,90 @@ class InferenceManager:
             per_chunk.append({n for n in (cm.replicas if cm else []) if n in live})
         complete = set.intersection(*per_chunk) if per_chunk else set()
         return whole | complete
+
+    async def ensure_group_redundancy(self, dep: ModelDeployment,
+                                      target: Optional[int] = None) -> int:
+        """Keep every weight group of ``dep`` on at least ``target`` live machines.
+
+        Placement puts a group on the nodes that are *serving* it. That answers
+        requests and does not survive: when the last holder of a layer leaves, the
+        model re-partitions onto survivors, finds nobody to pull that layer from, and
+        becomes permanently unrecoverable. Measured on the sim mesh, after the three
+        machines a checkpoint was uploaded to had all left, every group was down to a
+        single holder -- serving perfectly, one departure from gone, with nothing
+        reporting a problem.
+
+        So this is warm residency in its honest form: some machines hold layers they
+        are not currently serving, purely so the model outlives the machines it
+        happens to be running on. It also makes the next re-partition cheaper, because
+        a node that already holds the group skips the transfer entirely.
+
+        Deliberately peer-to-peer. A durability mechanism that relayed bytes through
+        the coordinator would put the one workload that never stops -- every group,
+        every departure, forever -- on the single machine that must not become a
+        bottleneck. When no peer can serve a group, this does nothing rather than
+        falling back to a relay: there is no honest way to conjure bytes nobody holds,
+        and recording a phantom holder would make the next repair skip a group that is
+        actually in danger.
+
+        Returns the number of new copies placed. Never raises: it runs after deploy
+        and after every re-partition, and a model that is serving correctly must not
+        be failed by a background durability improvement.
+        """
+        if target is None:
+            target = WEIGHT_REDUNDANCY
+        if target < 2:
+            return 0
+        try:
+            manifest, _ = await self._resolve_manifest(dep)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("redundancy: could not resolve manifest",
+                        id=dep.id, err=str(exc)[:120])
+            return 0
+        if not manifest or self.storage is None:
+            return 0        # built-in weights: every capable node already has them
+        placed = 0
+        try:
+            online = {n.id: n for n in self.registry.online()}
+            for bid in sorted(set((manifest.get("groups") or {}).values())):
+                holders = self._live_holders(bid, set(online))
+                if not holders:
+                    # Nobody has it. Nothing to copy from, and claiming otherwise
+                    # would hide a group that is already lost.
+                    log.error("weight group has no live holder", id=dep.id,
+                              blob=bid[:12])
+                    continue
+                # Never ask for more copies than there are machines to put them on.
+                want = min(target, len(online)) - len(holders)
+                for node_id in sorted(set(online) - holders)[:max(0, want)]:
+                    if await self._replicate_group(node_id, bid):
+                        placed += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("redundancy pass failed", id=dep.id, err=str(exc)[:160])
+        if placed:
+            log.info("weight redundancy improved", id=dep.id, copies=placed,
+                     target=target)
+        return placed
+
+    async def _replicate_group(self, node_id: str, bid: str) -> bool:
+        """Put one more copy of group ``bid`` on ``node_id`` by peer pull only."""
+        try:
+            has = await self.transport.call(
+                node_id, "blob_has", {"blob_id": bid}, timeout=10.0)
+            if has.get("has"):
+                # It served this layer under an older partition and kept the bytes.
+                # Re-downloading them would be pure waste on somebody's home link.
+                self._note_holder(node_id, bid)
+                return True
+        except TransportError:
+            return False
+        gate = getattr(self.transport, "peer_pull_ok", None)
+        if not (callable(gate) and gate(node_id)):
+            return False
+        if not await self._try_peer_pull(node_id, bid):
+            return False
+        self._note_holder(node_id, bid)
+        return True
 
     async def _place_blobs(self, node_id: str, blob_ids: list[str]) -> None:
         """Ensure each weight-group blob is present on ``node_id``.
@@ -1050,6 +1147,13 @@ class InferenceManager:
                 self.events.publish("model_ready",
                                     {"id": dep.id, "model": dep.model,
                                      "stages": len(partition), "repartitioned": True})
+                # The departure that triggered this re-partition also removed a copy
+                # of every group that node held, so this is exactly when redundancy is
+                # most likely to be below target -- and the moment a user is least
+                # likely to be watching. Restoring it here is what stops repeated
+                # churn from walking a model down to one copy per layer.
+                if not backend.native_generate:
+                    await self.ensure_group_redundancy(dep)
             except Exception as exc:  # noqa: BLE001
                 dep.status = "degraded"
                 self.store.put_model(dep)
