@@ -513,6 +513,47 @@ MUTATIONS = [
             "of depending on a reviewer remembering a second file."
         ),
     },
+    {
+        "id": "erasure-repair-drags-k-shards-through-the-coordinator",
+        "path": "meshpool/storage/engine.py",
+        "old": b"        if await self._repair_ec_delegated(meta, k, m, live_by_id):\n            return",
+        "new": b"        if False:\n            return",
+        "cmd": [sys.executable, "-m", "pytest",
+                "tests/test_storage_ec_repair_locality.py",
+                "-m", "slow or not slow", "-p", "no:cacheprovider"],
+        "why": (
+            "Restores the relay path, which is correct and does not scale. Every "
+            "shard is still rebuilt, every object still reads back, every durability "
+            "check still passes -- the coordinator just pulls k shards into its own "
+            "memory to rebuild one. That is the replication-repair bottleneck "
+            "multiplied by k: at RS(29,80) a single departure drags 29 shards "
+            "through one uplink and holds the whole reconstructed object in RAM. "
+            "Because repair is the steady-state cost of a churning pool rather than "
+            "an exceptional event, the cost is paid continuously and grows with the "
+            "pool. No correctness assertion can see it; only counting who carried "
+            "the bytes can."
+        ),
+    },
+    {
+        "id": "erasure-repair-trusts-a-shard-that-fails-its-content-address",
+        "path": "meshpool/agent/daemon.py",
+        "old": b"        if hashlib.sha256(raw).hexdigest() != ref.id:\n            raise HTTPException(status_code=502,\n                                detail=\"reconstructed shard failed integrity check\")",
+        "new": b"        if False:\n            raise HTTPException(status_code=502,\n                                detail=\"reconstructed shard failed integrity check\")",
+        "cmd": [sys.executable, "-m", "pytest",
+                "tests/test_agent_ec_repair.py",
+                "-m", "slow or not slow", "-p", "no:cacheprovider"],
+        "why": (
+            "Delegating repair to a node means the bytes are now assembled by a "
+            "machine the coordinator does not control, from shards served by other "
+            "machines it does not control. The content address is the only thing "
+            "standing between that and a poisoned codeword. Skipping the check on "
+            "the reconstructed shard writes whatever came out of the decoder to "
+            "disk under a hash it does not have, so the corruption becomes the "
+            "stored truth and every later read reproduces it faithfully. Moving "
+            "work off the coordinator is only safe because verification moved with "
+            "it."
+        ),
+    },
 ]
 
 
