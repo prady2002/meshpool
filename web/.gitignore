@@ -22,3 +22,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Playwright: browser-run artifacts (traces, screenshots, videos, HTML report).
+# Regenerated on every run and large; never useful in history.
+test-results
+playwright-report
+blob-report
+.playwright

@@ -20,5 +20,10 @@ export default defineConfig({
     globals: true,
     environment: 'jsdom',
     setupFiles: ['./tests/setup.ts'],
+    // e2e/ is Playwright (real browser, real control plane). Vitest's default
+    // glob would otherwise collect those specs into jsdom, where they cannot
+    // run -- and a suite that silently skips its own browser tests is exactly
+    // the false green these tests exist to eliminate.
+    exclude: ['node_modules/**', 'dist/**', 'e2e/**'],
   },
 } as UserConfig)
