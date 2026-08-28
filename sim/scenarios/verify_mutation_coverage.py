@@ -675,6 +675,41 @@ MUTATIONS = [
             "pulled from the source can observe it."
         ),
     },
+    {
+        "id": "update-manifest-fetch-unbounded",
+        "path": "agent-go/internal/update/check.go",
+        "old": b"raw, err := io.ReadAll(io.LimitReader(resp.Body, max+1))",
+        "new": b"raw, err := io.ReadAll(resp.Body)",
+        "cmd": ["go", "test", "-C", "agent-go", "./internal/update/...", "-count=1"],
+        "why": (
+            "The manifest is read before a single thing about it is trusted, so the "
+            "opening move of every update check is a read from an unauthenticated "
+            "host -- and without a ceiling it is an unbounded one, on a machine "
+            "somebody lent us. This is the second entry for the same blind spot, "
+            "which is the reason it is recorded rather than merely fixed: asserting "
+            "that an oversized body is REJECTED survives deleting the limit, because "
+            "the length check still fires, just after the bytes have arrived. Only "
+            "counting what the client pulled can tell the difference, and server-side "
+            "write counts cannot -- a small body vanishes into the socket buffer "
+            "whether the client reads one byte or all of them."
+        ),
+    },
+    {
+        "id": "update-no-op-check-reported-as-failure",
+        "path": "agent-go/internal/update/check.go",
+        "old": b'\t\t\treturn "", ErrNoUpdate',
+        "new": b'\t\t\treturn "", err',
+        "cmd": ["go", "test", "-C", "agent-go", "./internal/update/...", "-count=1"],
+        "why": (
+            "Being up to date is what almost every check finds, and it is not a "
+            "fault. Returning the raw ErrDowngrade instead makes the fleet's routine "
+            "no-op checks indistinguishable from an attacker replaying an old "
+            "release -- so either the operator learns to ignore the alarm, or a real "
+            "broken release channel is invisible among thousands of them. Nothing "
+            "about the update itself misbehaves, so only an assertion on which "
+            "outcome was reported can catch it."
+        ),
+    },
 ]
 
 
