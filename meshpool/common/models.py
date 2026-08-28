@@ -304,6 +304,7 @@ class BatchJob(BaseModel):
     cpu_pct_per_unit: int = 15
     ram_mb_per_unit: int = 128
     owner: str = "default"
+    capability_token_id: Optional[str] = None
     secret_names: list[str] = Field(default_factory=list)
     status: str = "pending"
     created_ms: int = Field(default_factory=now_ms)

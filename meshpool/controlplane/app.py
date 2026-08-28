@@ -20,7 +20,7 @@ from ..common.config import Settings
 from ..common.db import Store
 from ..common.identity import DeviceIdentity
 from ..common.logging import get_logger
-from ..common.models import DagStageSpec, DonationPolicy, Heartbeat, NodeStatus, RegisterRequest, now_ms
+from ..common.models import DagStageSpec, DonationPolicy, Heartbeat, NodeStatus, RegisterRequest, new_id, now_ms
 from ..common.netutil import TUNNEL_SENTINEL_URL
 from ..common.secrets import SecretBroker, SecretError
 from ..common.transport import HttpTransport, TransportError
@@ -334,6 +334,14 @@ class SpendCapBody(BaseModel):
     cap: Optional[float] = None
 
 
+class CapabilityTokenCreate(BaseModel):
+    label: str
+    scopes: list[str]
+    expires_in_seconds: Optional[float] = None
+    expires_at_ms: Optional[int] = None
+    spend_cap: Optional[float] = None
+
+
 class RttReport(BaseModel):
     """Vivaldi RTT observation reported by an agent.
 
@@ -447,6 +455,42 @@ def _token_verifier(cp: "ControlPlane") -> Optional[TokenVerifier]:
     return cp._token_verifier  # type: ignore[attr-defined]
 
 
+def _current_scopes_for_owner(owner: str) -> frozenset[Scope]:
+    """Return the account's current scopes; capability tokens intersect with it."""
+    return mint_session_principal(owner).scopes
+
+
+def _principal_from_stored_capability(cp: "ControlPlane", secret: str) -> Optional[Principal]:
+    row = cp.store.capability_token_by_secret(secret)
+    if not row:
+        return None
+    now = now_ms()
+    if row["revoked_ms"] is not None or int(row["expires_at_ms"]) < now:
+        return None
+    spend_cap = row.get("spend_cap")
+    if spend_cap is not None and float(row.get("spent") or 0.0) >= float(spend_cap):
+        return None
+    stored = frozenset(
+        Scope(s) for s in row["scopes"]
+        if s in Scope._value2member_map_  # type: ignore[attr-defined]
+    )
+    effective = frozenset(s for s in stored if s in _current_scopes_for_owner(row["owner"]))
+    cp.store.mark_capability_token_used(row["id"], now)
+    return Principal(
+        kind="user",
+        subject=row["owner"],
+        scopes=effective,
+        via="token",
+        expires_at_ms=row["expires_at_ms"],
+        token_id=row["id"],
+    )
+
+
+def _request_token_id(request: Request) -> Optional[str]:
+    principal = getattr(request.state, "principal", None)
+    return getattr(principal, "token_id", None)
+
+
 def _get_request_principal(request: Request, cp: "ControlPlane") -> Principal:
     """Extract and validate a Principal from the request headers.
 
@@ -460,6 +504,9 @@ def _get_request_principal(request: Request, cp: "ControlPlane") -> Principal:
     # 1. Capability token
     cap = request.headers.get(HDR_CAPABILITY_TOKEN, "")
     if cap:
+        stored = _principal_from_stored_capability(cp, cap)
+        if stored is not None:
+            return stored
         verifier = _token_verifier(cp)
         if verifier:
             p = verifier.verify(cap)
@@ -890,6 +937,11 @@ def _register_routes(app: FastAPI) -> None:
     _declare_route("GET",    "/api/v1/account/spend-cap",       Scope.WALLET_READ)
     _declare_route("PUT",    "/api/v1/account/spend-cap",       Scope.WALLET_WRITE)
     _declare_route("POST",   "/api/v1/account/spend-cap/reset", Scope.WALLET_WRITE)
+    # Managing your own capability tokens. tokens:write can mint only scopes the
+    # caller already holds, so this can never be an escalation path.
+    _declare_route("GET",    "/api/v1/tokens",                Scope.TOKENS_READ)
+    _declare_route("POST",   "/api/v1/tokens",                Scope.TOKENS_WRITE)
+    _declare_route("DELETE", "/api/v1/tokens/{token_id}",     Scope.TOKENS_WRITE)
     _declare_route("GET",    "/api/v1/ledger",                Scope.LEDGER_READ)
     _declare_route("GET",    "/api/v1/cluster",               Scope.NODES_READ)
     _declare_route("GET",    "/api/v1/nodes",                 Scope.NODES_READ)
@@ -1240,6 +1292,118 @@ def _register_routes(app: FastAPI) -> None:
         cp = _cp()
         return cp.spend_caps.reset_spend(_cap_owner(cp, request, owner))
 
+    # ---- user-minted capability tokens ------------------------------------ #
+    def _token_owner(cp: "ControlPlane", request: Request) -> str:
+        """Owner whose token collection is being managed.
+
+        Always derived from the authenticated principal: a capability token may
+        manage only its own account's tokens, never another owner's.
+        """
+        principal = getattr(request.state, "principal", None)
+        if principal is not None and principal.kind != "anonymous":
+            return principal.subject
+        session = request.headers.get("X-MeshPool-Session", "")
+        resolved = cp.accounts.owner_for_session(session)
+        if not resolved:
+            raise HTTPException(status_code=401,
+                                detail="authenticate the device first")
+        return resolved
+
+    def _public_token(row: dict) -> dict:
+        """Listing shape. The bearer secret is *never* included — only its hash is
+        stored, so disclosure is impossible rather than merely omitted."""
+        return {
+            "id": row["id"],
+            "label": row["label"],
+            "scopes": row["scopes"],
+            "expires_at_ms": row["expires_at_ms"],
+            "created_ms": row["created_ms"],
+            "last_used_ms": row["last_used_ms"],
+            "spend_cap": row["spend_cap"],
+            "spent": row["spent"],
+        }
+
+    @app.post("/api/v1/tokens")
+    async def mint_capability_token(body: CapabilityTokenCreate,
+                                    request: Request) -> dict:
+        """Mint a scoped, expiring capability token for the caller's own account.
+
+        The secret is returned exactly once, here. Only its SHA-256 hash is
+        persisted, so a later list can never leak it.
+
+        Privilege escalation is impossible by construction: the requested scopes
+        must be a subset of the scopes the *calling principal* already holds. A
+        token minted by a token can therefore only ever narrow, never widen.
+        """
+        cp = _cp()
+        owner = _token_owner(cp, request)
+        principal = getattr(request.state, "principal", None)
+        holder = principal.scopes if principal is not None else frozenset()
+
+        unknown = [s for s in body.scopes if s not in Scope._value2member_map_]
+        if unknown:
+            raise HTTPException(status_code=400,
+                                detail=f"unknown scopes: {sorted(unknown)}")
+        requested = frozenset(Scope(s) for s in body.scopes)
+        if not requested:
+            raise HTTPException(status_code=400,
+                                detail="a token must carry at least one scope")
+        if principal is not None and not principal.has_scope(Scope.CLUSTER_ADMIN):
+            excess = sorted(s.value for s in requested if s not in holder)
+            if excess:
+                raise HTTPException(status_code=403, detail=(
+                    f"cannot grant scopes you do not hold: {excess}"))
+
+        now = now_ms()
+        if body.expires_at_ms is not None:
+            expires_at = int(body.expires_at_ms)
+        elif body.expires_in_seconds is not None:
+            expires_at = now + int(float(body.expires_in_seconds) * 1000)
+        else:
+            expires_at = now + 30 * 24 * 3600 * 1000
+        if expires_at <= now:
+            raise HTTPException(status_code=400,
+                                detail="expiry must be in the future")
+        if body.spend_cap is not None and float(body.spend_cap) < 0.0:
+            raise HTTPException(status_code=400,
+                                detail="spend_cap must not be negative")
+
+        secret = f"mpt_{secrets.token_urlsafe(32)}"
+        row = {
+            "id": new_id("tok"),
+            "owner": owner,
+            "token_hash": cp.store.capability_token_hash(secret),
+            "label": body.label,
+            "scopes": sorted(s.value for s in requested),
+            "expires_at_ms": expires_at,
+            "created_ms": now,
+            "last_used_ms": None,
+            "revoked_ms": None,
+            "spend_cap": body.spend_cap,
+            "spent": 0.0,
+        }
+        cp.store.put_capability_token(row)
+        return {**_public_token(row), "owner": owner, "token": secret}
+
+    @app.get("/api/v1/tokens")
+    async def list_capability_tokens(request: Request) -> dict:
+        """List the caller's live tokens. Never returns bearer secrets."""
+        cp = _cp()
+        owner = _token_owner(cp, request)
+        return {"tokens": [_public_token(r)
+                           for r in cp.store.list_capability_tokens(owner)]}
+
+    @app.delete("/api/v1/tokens/{token_id}")
+    async def revoke_capability_token(token_id: str, request: Request) -> dict:
+        """Revoke a token. Revocation is a database write consulted on *every*
+        request, so it takes effect on the immediately following call — there is
+        no cached-validity window to wait out."""
+        cp = _cp()
+        owner = _token_owner(cp, request)
+        if not cp.store.revoke_capability_token(token_id, owner, now_ms()):
+            raise HTTPException(status_code=404, detail="unknown token")
+        return {"revoked": True, "id": token_id}
+
     # ---- nodes ----------------------------------------------------------- #
     @app.get("/api/v1/ledger")
     async def ledger() -> dict:
@@ -1425,7 +1589,9 @@ def _register_routes(app: FastAPI) -> None:
         with start_span("controlplane.submit_job", context=incoming_trace,
                         attributes={"job_name": req.name, "func": req.func}):
             job = cp.batch.submit(req.name, req.func, req.payloads, req.cpu_pct,
-                                  req.ram_mb, owner, req.secret_names)
+                                  req.ram_mb, owner,
+                                  capability_token_id=_request_token_id(request),
+                                  secret_names=req.secret_names)
         trace_id = cp.timeline.trace_id_for_job(job.id)
         return {"job_id": job.id, "units": len(job.units), "owner": owner,
                 "trace_id": trace_id}

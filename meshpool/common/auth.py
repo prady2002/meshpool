@@ -57,6 +57,8 @@ class Scope(StrEnum):
     WALLET_READ = "wallet:read"
     WALLET_WRITE = "wallet:write"
     LEDGER_READ = "ledger:read"
+    TOKENS_READ = "tokens:read"
+    TOKENS_WRITE = "tokens:write"
     EVENTS_SUBSCRIBE = "events:subscribe"
     CLUSTER_ADMIN = "cluster:admin"
 
@@ -87,6 +89,8 @@ _SCOPE_DESCRIPTIONS: dict[str, str] = {
     "wallet:read": "View credit balance, ledger history, and reputation.",
     "wallet:write": "Set the hard spend cap and reset the spend window.",
     "ledger:read": "View the global credit ledger across all owners.",
+    "tokens:read": "List scoped capability tokens for your account.",
+    "tokens:write": "Create and revoke scoped capability tokens for your account.",
     "events:subscribe": "Subscribe to the real-time SSE event stream.",
     "cluster:admin": "Full cluster administration (super-user scope).",
 }
@@ -121,6 +125,7 @@ class Principal:
     scopes: FrozenSet[Scope]
     via: str
     expires_at_ms: Optional[int] = None
+    token_id: Optional[str] = None
 
     def has_scope(self, scope: Scope) -> bool:
         """True if this principal holds ``scope`` or the omnipotent cluster:admin."""

@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS billing_receipts (
     service           TEXT NOT NULL,
     job_id            TEXT NOT NULL,
     consumer_owner    TEXT NOT NULL,
+    capability_token_id TEXT,
     unit              TEXT NOT NULL,
     pricing_dimensions INTEGER NOT NULL,
     platform_fee_rate REAL NOT NULL,
@@ -58,6 +59,7 @@ CREATE TABLE IF NOT EXISTS billing_receipt_lines (
     platform_fee       REAL NOT NULL,
     total_charged      REAL NOT NULL,
     claim_tier         TEXT NOT NULL,
+    consumer_token_id  TEXT,
     created_ms         INTEGER NOT NULL,
     UNIQUE(receipt_id, idempotency_key)
 );
@@ -126,6 +128,24 @@ class BillingManager:
     def _ensure_table(self) -> None:
         with self.store._lock:
             self.store._conn.executescript(_DDL)
+            cols = {
+                r["name"] for r in self.store._conn.execute(
+                    "PRAGMA table_info(billing_receipts)"
+                ).fetchall()
+            }
+            if "capability_token_id" not in cols:
+                self.store._conn.execute(
+                    "ALTER TABLE billing_receipts ADD COLUMN capability_token_id TEXT"
+                )
+            line_cols = {
+                r["name"] for r in self.store._conn.execute(
+                    "PRAGMA table_info(billing_receipt_lines)"
+                ).fetchall()
+            }
+            if "consumer_token_id" not in line_cols:
+                self.store._conn.execute(
+                    "ALTER TABLE billing_receipt_lines ADD COLUMN consumer_token_id TEXT"
+                )
             self.store._conn.commit()
 
     @staticmethod
@@ -133,17 +153,24 @@ class BillingManager:
         return f"{service}:{job_id}"
 
     def _ensure_receipt(self, service: str, job_id: str,
-                        consumer_owner: str) -> str:
+                        consumer_owner: str,
+                        capability_token_id: Optional[str] = None) -> str:
         rid = self.receipt_id(service, job_id)
         with self.store._lock:
             self.store._conn.execute(
                 "INSERT OR IGNORE INTO billing_receipts("
-                "receipt_id,service,job_id,consumer_owner,unit,"
+                "receipt_id,service,job_id,consumer_owner,capability_token_id,unit,"
                 "pricing_dimensions,platform_fee_rate,created_ms"
-                ") VALUES(?,?,?,?,?,?,?,?)",
-                (rid, service, job_id, consumer_owner, MESH_SECOND, 1,
+                ") VALUES(?,?,?,?,?,?,?,?,?)",
+                (rid, service, job_id, consumer_owner, capability_token_id, MESH_SECOND, 1,
                  self.platform_fee_rate, now_ms()),
             )
+            if capability_token_id:
+                self.store._conn.execute(
+                    "UPDATE billing_receipts SET capability_token_id=? "
+                    "WHERE receipt_id=? AND capability_token_id IS NULL",
+                    (capability_token_id, rid),
+                )
             self.store._conn.commit()
         return rid
 
@@ -160,6 +187,7 @@ class BillingManager:
         resource_class: str = "standard",
         resource_units: float = 1.0,
         detail: str = "",
+        consumer_token_id: Optional[str] = None,
         earning_recorder: Optional[Callable[[str, str, float, str], object]] = None,
     ) -> dict:
         """Record one accepted unit/request exactly once and return its line.
@@ -171,11 +199,12 @@ class BillingManager:
         idem = (idempotency_key or "").strip()
         if not idem:
             raise ValueError("billing idempotency_key is required")
-        rid = self._ensure_receipt(service, job_id, consumer_owner)
+        rid = self._ensure_receipt(service, job_id, consumer_owner, consumer_token_id)
         line_id = f"{rid}:{idem}"
         mesh_seconds = self.meter.measure(measured_seconds, resource_class, resource_units)
         fee = mesh_seconds * self.platform_fee_rate
         total = mesh_seconds + fee
+        ledger_detail = f"{detail} token:{consumer_token_id}" if consumer_token_id else detail
         inserted = False
         with self.store._lock:
             cur = self.store._conn.execute(
@@ -183,10 +212,10 @@ class BillingManager:
                 "line_id,receipt_id,service,job_id,idempotency_key,node_id,"
                 "provider_owner,measured_seconds,resource_class,resource_units,"
                 "mesh_seconds,gross_earnings,platform_fee,total_charged,"
-                "claim_tier,created_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "claim_tier,consumer_token_id,created_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (line_id, rid, service, job_id, idem, node_id, provider_owner,
                  max(0.0, measured_seconds), resource_class, max(0.0, resource_units),
-                 mesh_seconds, mesh_seconds, fee, total, "measured", now_ms()),
+                 mesh_seconds, mesh_seconds, fee, total, "measured", consumer_token_id, now_ms()),
             )
             inserted = cur.rowcount == 1
             self.store._conn.commit()
@@ -194,23 +223,25 @@ class BillingManager:
             # Gross donor earning is explicit.  Public-tier held-back escrow can
             # wrap this via ``earning_recorder``; either way the amount is gross.
             if earning_recorder is not None:
-                earning_recorder(node_id, provider_owner, mesh_seconds, detail)
+                earning_recorder(node_id, provider_owner, mesh_seconds, ledger_detail)
             else:
                 self.ledger.record_donation(node_id, provider_owner, mesh_seconds,
-                                            detail=detail)
+                                            detail=ledger_detail)
             self.ledger.store.add_ledger_idempotent(LedgerEntry(
                 id=f"{line_id}:consumer:gross", node_id=node_id,
                 owner=consumer_owner, kind="consumed", compute_units=mesh_seconds,
-                ts_ms=now_ms(), detail=detail))
+                ts_ms=now_ms(), detail=ledger_detail))
             if fee > 0.0:
                 self.ledger.store.add_ledger_idempotent(LedgerEntry(
                     id=f"{line_id}:platform:credit", node_id=node_id,
                     owner=self.platform_owner, kind="donated", compute_units=fee,
-                    ts_ms=now_ms(), detail=f"platform-fee:{detail}"))
+                    ts_ms=now_ms(), detail=f"platform-fee:{ledger_detail}"))
                 self.ledger.store.add_ledger_idempotent(LedgerEntry(
                     id=f"{line_id}:platform:debit", node_id=node_id,
                     owner=consumer_owner, kind="consumed", compute_units=fee,
-                    ts_ms=now_ms(), detail=f"platform-fee:{detail}"))
+                    ts_ms=now_ms(), detail=f"platform-fee:{ledger_detail}"))
+            if consumer_token_id:
+                self.store.add_capability_token_spend(consumer_token_id, total)
         return self._line_to_dict(self._get_line(line_id))
 
     def _get_line(self, line_id: str):
@@ -233,6 +264,7 @@ class BillingManager:
             "platform_fee": row["platform_fee"],
             "total_charged": row["total_charged"],
             "claim_tier": row["claim_tier"],
+            "consumer_token_id": row["consumer_token_id"],
         }
 
     def receipt(self, service: str, job_id: str) -> Optional[dict]:
@@ -256,6 +288,7 @@ class BillingManager:
             "service": head["service"],
             "job_id": head["job_id"],
             "owner": head["consumer_owner"],
+            "capability_token_id": head["capability_token_id"],
             "unit": head["unit"],
             "pricing_dimensions": head["pricing_dimensions"],
             "claim_tier": "measured",

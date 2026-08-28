@@ -39,6 +39,7 @@ Call them periodically (e.g. from a background task).
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import sqlite3
 import threading
@@ -48,7 +49,7 @@ from .models import (
     BatchJob, BlobMeta, Deployment, LedgerEntry, ModelDeployment, Node, TrustScore,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _MIGRATIONS: list[str] = [
     # v1 — initial schema
@@ -152,6 +153,25 @@ _MIGRATIONS: list[str] = [
     );
     CREATE INDEX IF NOT EXISTS idx_blobs_owner ON blobs(owner);
     """,
+    # v5 — user-minted capability tokens. Only a SHA-256 hash of the bearer secret
+    # is stored; listing tokens can never disclose material usable for auth.
+    """
+    CREATE TABLE IF NOT EXISTS capability_tokens (
+        id             TEXT PRIMARY KEY,
+        owner          TEXT NOT NULL,
+        token_hash     TEXT NOT NULL UNIQUE,
+        label          TEXT NOT NULL,
+        scopes_json    TEXT NOT NULL,
+        expires_at_ms  INTEGER NOT NULL,
+        created_ms     INTEGER NOT NULL,
+        last_used_ms   INTEGER,
+        revoked_ms     INTEGER,
+        spend_cap      REAL,
+        spent          REAL NOT NULL DEFAULT 0.0
+    );
+    CREATE INDEX IF NOT EXISTS idx_capability_tokens_owner ON capability_tokens(owner);
+    CREATE INDEX IF NOT EXISTS idx_capability_tokens_hash ON capability_tokens(token_hash);
+    """,
 ]
 
 
@@ -253,6 +273,93 @@ class Store:
     def delete_node_token(self, node_id: str) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM node_tokens WHERE node_id=?", (node_id,))
+            self._conn.commit()
+
+    # --- user capability tokens ------------------------------------------ #
+    @staticmethod
+    def capability_token_hash(secret: str) -> str:
+        return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _capability_token_row_to_dict(row) -> dict:
+        return {
+            "id": row["id"],
+            "owner": row["owner"],
+            "token_hash": row["token_hash"],
+            "label": row["label"],
+            "scopes": json.loads(row["scopes_json"]),
+            "expires_at_ms": row["expires_at_ms"],
+            "created_ms": row["created_ms"],
+            "last_used_ms": row["last_used_ms"],
+            "revoked_ms": row["revoked_ms"],
+            "spend_cap": row["spend_cap"],
+            "spent": row["spent"],
+        }
+
+    def put_capability_token(self, token: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO capability_tokens("
+                "id,owner,token_hash,label,scopes_json,expires_at_ms,created_ms,"
+                "last_used_ms,revoked_ms,spend_cap,spent"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    token["id"], token["owner"], token["token_hash"], token["label"],
+                    json.dumps(sorted(token["scopes"]), separators=(",", ":")),
+                    int(token["expires_at_ms"]), int(token["created_ms"]),
+                    token.get("last_used_ms"), token.get("revoked_ms"),
+                    token.get("spend_cap"), float(token.get("spent", 0.0)),
+                ),
+            )
+            self._conn.commit()
+
+    def capability_token_by_secret(self, secret: str) -> Optional[dict]:
+        token_hash = self.capability_token_hash(secret)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM capability_tokens WHERE token_hash=?", (token_hash,)
+            ).fetchone()
+        return self._capability_token_row_to_dict(row) if row else None
+
+    def list_capability_tokens(self, owner: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM capability_tokens WHERE owner=? "
+                "ORDER BY created_ms DESC,id DESC", (owner,)
+            ).fetchall()
+        return [self._capability_token_row_to_dict(r) for r in rows]
+
+    def get_capability_token(self, token_id: str) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM capability_tokens WHERE id=?", (token_id,)
+            ).fetchone()
+        return self._capability_token_row_to_dict(row) if row else None
+
+    def mark_capability_token_used(self, token_id: str, ts_ms: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE capability_tokens SET last_used_ms=? "
+                "WHERE id=? AND revoked_ms IS NULL", (ts_ms, token_id),
+            )
+            self._conn.commit()
+
+    def revoke_capability_token(self, token_id: str, owner: str, ts_ms: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE capability_tokens SET revoked_ms=? "
+                "WHERE id=? AND owner=? AND revoked_ms IS NULL",
+                (ts_ms, token_id, owner),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def add_capability_token_spend(self, token_id: str, amount: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE capability_tokens SET spent=spent+? "
+                "WHERE id=? AND revoked_ms IS NULL", (max(0.0, amount), token_id),
+            )
             self._conn.commit()
 
     # --- generic doc tables (jobs/deployments/models) -------------------- #
