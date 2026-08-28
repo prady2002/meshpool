@@ -641,6 +641,40 @@ MUTATIONS = [
             "breaks key rotation, so it costs availability even with no attacker."
         ),
     },
+    {
+        "id": "update-rollback-removed",
+        "path": "agent-go/internal/update/install.go",
+        "old": b"if rbErr := in.doRename(prev, in.Target); rbErr != nil {",
+        "new": b"if rbErr := error(nil); rbErr != nil {",
+        "cmd": ["go", "test", "-C", "agent-go", "./internal/update/...", "-count=1"],
+        "why": (
+            "Between renaming the current binary aside and renaming the new one in, "
+            "the install directory holds no runnable binary. If the second rename "
+            "fails and nothing puts the old one back, the contributor's machine is "
+            "left permanently dead -- and unreachably so, because the process that "
+            "would report the fault is the one that no longer exists. Recovery code "
+            "is deleted precisely because it looks like it never runs: every happy "
+            "path, every crypto assertion and every fresh-install test stays green "
+            "without it. Only a test that forces the second rename to fail can tell."
+        ),
+    },
+    {
+        "id": "update-download-unbounded",
+        "path": "agent-go/internal/update/install.go",
+        "old": b"limited := io.LimitReader(r, in.Artifact.Size+1)",
+        "new": b"limited := io.LimitReader(r, 1<<40)",
+        "cmd": ["go", "test", "-C", "agent-go", "./internal/update/...", "-count=1"],
+        "why": (
+            "The signed size is what stops a hostile or merely broken release host "
+            "from streaming until a contributor's disk is full, which is an outage "
+            "we inflicted on someone who volunteered their machine. This entry "
+            "exists because the original test SURVIVED this exact mutation: an "
+            "unbounded read still ends in a length mismatch, so asserting on the "
+            "rejection proved nothing -- it just happened after the damage. The "
+            "property is that we stop reading, and only counting the bytes actually "
+            "pulled from the source can observe it."
+        ),
+    },
 ]
 
 
