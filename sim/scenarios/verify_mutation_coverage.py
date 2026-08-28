@@ -596,6 +596,51 @@ MUTATIONS = [
             "generous budget must complete having burned more than that budget."
         ),
     },
+    {
+        "id": "update-downgrade-check-disabled",
+        "path": "agent-go/internal/update/update.go",
+        "old": b"cmp, err := CompareVersions(m.Version, currentVersion)",
+        "new": b'cmp, err := CompareVersions(m.Version, "0.0.0")',
+        "cmd": ["go", "test", "-C", "agent-go", "./internal/update/...", "-count=1"],
+        "why": (
+            "The downgrade check is the one auto-update defence that passes every "
+            "signature and hash test by construction, because a replayed release IS "
+            "genuine -- correctly signed, correct hash, simply old. An attacker who "
+            "re-serves last month's build reintroduces whatever was patched since, "
+            "and nothing about the bytes looks wrong. Pinning the version floor to a "
+            "constant is how it dies in real life: a debugging edit or a refactor "
+            "that loses the parameter, leaving the happy path green and every "
+            "crypto assertion still passing. Only an explicit test that replays an "
+            "authentic older manifest can notice."
+        ),
+    },
+    {
+        "id": "update-keyid-hint-becomes-a-filter",
+        "path": "agent-go/internal/update/update.go",
+        "old": (b"\tfor id, pub := range trusted {\n"
+                b"\t\tif id != sm.KeyID {\n"
+                b"\t\t\tcandidates = append(candidates, pub)\n"
+                b"\t\t}\n"
+                b"\t}"),
+        "new": (b"\tif len(candidates) == 0 {\n"
+                b"\t\tfor _, pub := range trusted {\n"
+                b"\t\t\tcandidates = append(candidates, pub)\n"
+                b"\t\t}\n"
+                b"\t}"),
+        "cmd": ["go", "test", "-C", "agent-go", "./internal/update/...", "-count=1"],
+        "why": (
+            "KeyID travels outside the signature, so an attacker rewrites it for "
+            "free. Treating it as a filter instead of a hint is not a signature "
+            "bypass -- an unknown key still fails -- which is exactly why it slips "
+            "through review and through every forgery test. It is an availability "
+            "attack that is a security attack here: naming any OTHER trusted key "
+            "makes every genuine update fail verification, freezing the fleet on "
+            "whatever build it runs. That is the same outcome as a downgrade, "
+            "reached by denial rather than replay. An unauthenticated field may "
+            "reorder work; it must never change the outcome. The mutated form also "
+            "breaks key rotation, so it costs availability even with no attacker."
+        ),
+    },
 ]
 
 
@@ -648,6 +693,7 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="meshpool-mut-"))
     worktree = tmp / "wt"
     survivors: list[dict] = []
+    unrunnable: list[tuple[dict, str]] = []
 
     # A detached worktree at HEAD keeps every mutation off the working tree, so
     # the eleven other things that might be editing this repo cannot be harmed
@@ -670,6 +716,19 @@ def main() -> int:
                 proc = subprocess.run(mut["cmd"], cwd=str(worktree), env=env,
                                       stdout=subprocess.PIPE,
                                       stderr=subprocess.STDOUT, timeout=1800)
+            except FileNotFoundError as exc:
+                # The gate's command needs a toolchain this machine lacks -- since
+                # entries were added for the Go agent, that is usually a missing
+                # `go`. Letting this propagate would abort the loop and take the
+                # verdict on every *other* mutation down with it, turning "one
+                # toolchain is absent" into "we learned nothing". So record it as
+                # its own loud category and keep going. It is never silently
+                # skipped: an unrunnable entry fails the gate at the end, exactly
+                # like a survivor, because an unevaluated claim is not a passed one.
+                unrunnable.append((mut, str(exc)))
+                print(f"   [UNRUNNABLE] cannot execute {mut['cmd'][0]!r}: {exc}")
+                print()
+                continue
             finally:
                 (worktree / mut["path"]).write_bytes(original)
 
@@ -707,10 +766,23 @@ def main() -> int:
             print(f"  {mut['why']}")
             print(f"  Guarded by: {' '.join(mut['cmd'][1:])}")
             print()
+
+    if unrunnable:
+        print()
+        for mut, why in unrunnable:
+            print(f"NOT EVALUATED: {mut['id']}")
+            print(f"  {why}")
+            print(f"  Needed: {' '.join(mut['cmd'])}")
+            print()
+
+    if survivors or unrunnable:
         raise AssertionError(
-            f"{len(survivors)} of {len(selected)} mutations survived. The gates "
-            "above cannot fail, so they are not protecting what they claim to. Fix "
-            "the tests -- a surviving mutation never means the code was fine.")
+            f"{len(survivors)} of {len(selected)} mutations survived and "
+            f"{len(unrunnable)} could not be evaluated. A survivor means the gate "
+            "above cannot fail, so it is not protecting what it claims to -- fix "
+            "the test, because a surviving mutation never means the code was fine. "
+            "An unevaluated mutation means we have no evidence either way, which "
+            "is not the same as passing: install the missing toolchain.")
 
     print(f"\nALL {len(selected)} MUTATIONS CAUGHT")
     return 0
