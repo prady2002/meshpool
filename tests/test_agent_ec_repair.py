@@ -170,6 +170,39 @@ def test_agent_fails_when_forgery_drops_honest_shards_below_k(agent, peer, monke
     assert not agent.state.blobs.has(_sha(shards[4]))
 
 
+def test_agent_rejects_reconstruction_from_mismatched_generations(agent, peer, monkeypatch):
+    """Shards that are individually authentic can still be mutually inconsistent.
+
+    A content address proves a shard is the bytes it claims to be. It proves nothing
+    about *which encoding* it came from. Mix shards from two generations of an object
+    -- a stale manifest, an interrupted re-encode, a peer that never deleted an old
+    version -- and every fetch verifies while the decode silently yields garbage.
+
+    The reconstructed shard is therefore checked against the id the coordinator asked
+    for. Without that check the decoder's output would be written to disk under a hash
+    it does not have, and since nothing downstream re-derives the object from its
+    shards, the corruption would become the stored truth and every later read would
+    reproduce it faithfully.
+    """
+    a = RSCodec(K, M).encode(DATA)
+    b = RSCodec(K, M).encode(DATA + b"second-generation")
+    _serve(peer, monkeypatch)
+
+    plan = _plan(a, 4)
+    # Index 2 is served from the other generation. Its id in the plan is that
+    # shard's true content address, so it passes fetch verification cleanly.
+    plan["shards"][2]["id"] = _sha(b[2])
+    for i in (0, 1, 3):
+        peer.disk[_sha(a[i])] = a[i]
+    peer.disk[_sha(b[2])] = b[2]
+
+    c = TestClient(agent.app)
+    r = c.post("/blob_ec_repair", json=plan)
+    assert r.status_code == 502, r.text
+    assert "integrity" in r.text
+    assert not agent.state.blobs.has(_sha(a[4])), "wrote a shard it could not verify"
+
+
 def test_agent_rejects_a_malformed_plan(agent):
     shards = RSCodec(K, M).encode(DATA)
     c = TestClient(agent.app)
