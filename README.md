@@ -441,6 +441,27 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
 
 ## ⚖️ Honest constraints (we report real numbers, never invented ones)
 
+- **Auto-update is fully implemented and completely inert, on purpose.**
+  `agent-go/internal/update` verifies Ed25519-signed release manifests, refuses
+  downgrades, and swaps the binary through a rename dance that restores the previous
+  build if the swap fails — 42 tests, including four attack cases and the two
+  recovery branches. It cannot update anything, because **no MeshPool release signing
+  key exists yet**, so the compiled-in trust store is empty and `Verify` returns
+  `ErrUnknownKey` for every manifest. That is deliberate: the two alternatives are a
+  placeholder key nobody holds the private half of (a lie that looks like security,
+  and one that survives review precisely because the surrounding code is correct), or
+  "no keys configured, so skip verification" — which turns the absence of security
+  into the absence of a check and makes the update channel a fleet-wide RCE
+  primitive. What is **not** built: release signing infrastructure, installers,
+  service registration, and uninstall. Generating the key is a release-engineering
+  task, not a code change, and the empty store is pinned by a test that will fail
+  loudly the day it stops being empty. Two findings here came from mutation testing
+  rather than review, and both are recorded in the meta-gate: the rollback branch was
+  unreachable by any portable test (a directory blocking the destination just gets
+  renamed aside too, so the branch never ran), and the download size-bound test
+  *survived deleting the bound* — twice, in two different files — because asserting
+  that an oversized body is rejected proves nothing when the length check fires
+  anyway, just after the bytes have arrived.
 - **Nodes are classified automatically, and the classification only ever expresses a
   preference.** `meshpool/controlplane/nodeclass.py` derives one of four classes --
   Anchor, Relay, Constellation, Drifter -- from signals that were actually measured:
