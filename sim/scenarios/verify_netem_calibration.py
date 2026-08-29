@@ -101,8 +101,34 @@ def check_determinism() -> None:
     pair = (ids1[0], ids1[1]) if len(ids1) >= 2 else ("relay-0", "node-1")
     d1 = ne1.one_way_delay_s(pair[0], pair[1], 1000)
     d2 = ne2.one_way_delay_s(pair[0], pair[1], 1000)
-    # Allow small floating-point difference; no time.monotonic_ns in deterministic path
-    _check(abs(d1 - d2) < 0.02, "delays deterministic within 20 ms", f"d1={d1*1000:.2f}ms d2={d2*1000:.2f}ms")
+    # Exact equality, not a tolerance. Two emulators built from the same seed must
+    # produce the SAME number, because the seed is the only input either was given.
+    # This check used to allow 20 ms of slack, and that slack is precisely why the
+    # emulator went years being reproducible for nothing: the jitter seed mixed in
+    # `time.monotonic_ns()`, so `seed` was decorative, and the tolerance was wide
+    # enough to hide it on most draws. It only failed once a sample hit the heavy
+    # tail (50.19 ms vs 29.97 ms). A tolerance on a quantity that is supposed to be
+    # deterministic is not a weak test, it is a non-test.
+    _check(d1 == d2, "delays are exactly reproducible from the seed",
+           f"d1={d1*1000:.4f}ms d2={d2*1000:.4f}ms")
+
+    # ...and reproducible must not be achieved by being constant, which would be the
+    # most useless possible way to pass the check above.
+    seq1 = [ne1.one_way_delay_s(pair[0], pair[1], 1000) for _ in range(8)]
+    ne3 = NetEm(residential_mixed(n=8, seed=77), time_scale=TIME_SCALE, seed=0)
+    _ = ne3.one_way_delay_s(pair[0], pair[1], 1000)   # align with ne1's first draw
+    seq3 = [ne3.one_way_delay_s(pair[0], pair[1], 1000) for _ in range(8)]
+    _check(len(set(seq1)) > 1,
+           "successive packets still get independent jitter under a fixed seed",
+           f"{len(set(seq1))} distinct values across 8 draws")
+    _check(seq1 == seq3,
+           "the whole draw sequence replays identically from the seed",
+           f"first={seq1[0]*1000:.4f}ms last={seq1[-1]*1000:.4f}ms")
+
+    # A different seed must give a different stream, or `seed` is being ignored.
+    ne4 = NetEm(residential_mixed(n=8, seed=77), time_scale=TIME_SCALE, seed=12345)
+    seq4 = [ne4.one_way_delay_s(pair[0], pair[1], 1000) for _ in range(9)]
+    _check(seq4[1:] != seq1, "a different seed produces a different stream")
 
 
 # ---------------------------------------------------------------------------

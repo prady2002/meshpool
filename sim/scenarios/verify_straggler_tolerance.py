@@ -49,6 +49,10 @@ DATA_DIR = str(Path(__file__).resolve().parent / "_data_straggler")
 
 # Big enough that the delay dominates a hop, small enough that the gate stays quick.
 STALL_MS = 120.0
+# Healthy requests driven before asserting that nothing rotated. Each request is
+# MAX_TOKENS traversals, so this is thousands of opportunities for a degenerate
+# threshold to fire -- and STRAGGLER_STREAK is only 4.
+HEALTHY_DRIVE = 15
 MAX_TOKENS = 24
 PROMPT = "the "
 
@@ -132,6 +136,37 @@ def main() -> int:
         print(f"  baseline: {baseline_s*1000:.0f} ms/request, "
               f"{len(baseline_text)} chars")
         _ok(f"healthy deployment answers in {baseline_s*1000:.0f} ms")
+
+        # ---- 1b: a healthy mesh must rotate nothing at all ---------------- #
+        print("\n== 1b: a healthy mesh rotates nothing ==")
+        # STRAGGLER_RATIO is peer-RELATIVE: a stage must be 3x the median peer before
+        # it is retired. If that threshold ever degenerates towards 1.0, "slower than
+        # the median peer" is satisfied by the maximum of any set BY DEFINITION, so a
+        # perfectly healthy mesh contains a "straggler" at all times and rotates
+        # forever -- paying a KV rebuild each time to swap one node for another drawn
+        # from the same population.
+        #
+        # Test 6 below hunts the same degeneration but measures a DELTA across a
+        # uniformly-slowed window, and that is blind to it: with a near-1.0 ratio the
+        # rotations happen HERE, in ordinary healthy traffic, and by the time test 6
+        # takes its "before" sample the spares are already spent. Rotation then stops
+        # on its own (`spares_remaining < 1` returns early), the delta is 0, and the
+        # check reports success on broken code. This was not hypothetical: the
+        # 3.0 -> 1.0 mutation survived the whole gate until this check existed.
+        #
+        # An ABSOLUTE count on a healthy mesh is the only formulation that sees it.
+        for _ in range(HEALTHY_DRIVE):
+            _complete(cp, model_id)
+        rot_healthy = _view(cp, model_id).get("straggler_rotations") or 0
+        print(f"  {HEALTHY_DRIVE + 5} healthy requests served; "
+              f"straggler_rotations={rot_healthy}")
+        if rot_healthy:
+            _fail(f"{rot_healthy} straggler rotation(s) on a mesh where nothing was "
+                  f"slowed. Every replacement is drawn from the same population, so "
+                  f"each one costs a KV rebuild and buys nothing -- the signature of "
+                  f"a threshold that is no longer peer-relative")
+        else:
+            _ok("no rotation on a healthy mesh; the threshold is peer-relative")
 
         # ---- 2: prove the stall is real, on a stage that cannot rotate ---- #
         print("\n== 2: a slowed stage with no spare keeps serving ==")

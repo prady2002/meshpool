@@ -70,18 +70,50 @@ class NetEm:
         time_scale:  Compress time by this factor.  ``time_scale=0.1`` means the
                      emulator runs 10× faster while preserving *relative* timings —
                      crucial for fast unit tests.
-        seed:        Additional seed offset layered on top of topology's per-pair RNG.
+        seed:        Seeds every random draw this emulator makes, so a whole run
+                     replays identically. Pass ``seed=None`` to draw from OS entropy
+                     instead, which is the only way to get an unreproducible run.
     """
 
     def __init__(
         self,
         topology: Topology,
         time_scale: float = 1.0,
-        seed: int = 0,
+        seed: int | None = 0,
     ) -> None:
         self.topology = topology
         self.time_scale = time_scale
         self._seed_offset = seed
+        self._streams: dict[tuple[str, str], random.Random] = {}
+
+    def _stream(self, a: str, b: str) -> random.Random:
+        """The long-lived RNG stream for one directed link.
+
+        One persistent stream per link, advanced by each draw, rather than a fresh
+        ``Random`` per packet. That gives both properties the emulator needs at once:
+        successive packets get independent noise, *and* the entire run is a pure
+        function of ``seed``.
+
+        The previous implementation seeded a per-call ``Random`` with
+        ``topology.rng(a, b).random() + time.monotonic_ns() + seed``. Mixing the
+        clock in made ``seed`` decorative -- two emulators constructed with the same
+        seed produced different delays, so no emulated measurement could ever be
+        replayed, and the docstring's promise that "tests can control it via the
+        seed" was false. This is the instrument the calibrated performance model is
+        fitted on, so non-reproducibility here silently undermines every projection
+        derived from it.
+
+        The stream is keyed on a *string*, never ``hash()``: string hashing is
+        randomised per process (PYTHONHASHSEED), which would make results reproducible
+        within one process but not across runs -- the subtler half of the same bug.
+        """
+        key = (a, b)
+        st = self._streams.get(key)
+        if st is None:
+            st = (random.Random() if self._seed_offset is None
+                  else random.Random(f"{a}|{b}|{self._seed_offset}"))
+            self._streams[key] = st
+        return st
 
     # ------------------------------------------------------------------
     # NAT / path
@@ -121,11 +153,7 @@ class NetEm:
         """Draw one jitter sample (ms) for the (a,b) link."""
         profile = self.topology.link(a, b)
         j = profile.jitter
-        # Use a fresh random per call (not seeded) for live transit so each
-        # packet gets independent noise — but tests can control it via the seed.
-        rng = random.Random(
-            self.topology.rng(a, b).random() + time.monotonic_ns() + self._seed_offset
-        )
+        rng = self._stream(a, b)
         base = rng.gauss(0.0, j.sigma_ms)
         if rng.random() < j.heavy_tail_prob:
             base *= j.heavy_tail_factor
@@ -156,7 +184,9 @@ class NetEm:
 
         profile = self.topology.link(src, dst)
         if profile.loss_prob > 0.0:
-            if random.random() < profile.loss_prob:
+            # Same seeded stream as jitter: packet loss has to replay identically too,
+            # or a run that dropped a packet cannot be reproduced to debug it.
+            if self._stream(src, dst).random() < profile.loss_prob:
                 raise PacketLost(src, dst, profile.loss_prob)
 
     async def transit_path(self, path: list[str], nbytes: int = 0) -> None:
