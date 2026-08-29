@@ -33,6 +33,24 @@ LOGS = ROOT / "_gatelogs"
 RESULTS = LOGS / "results.json"
 
 DEFAULT_TIMEOUT = 1800.0
+
+# Per-gate budgets, for the handful of gates whose honest cost genuinely exceeds
+# the default. Raising DEFAULT_TIMEOUT instead would hide a hung gate everywhere
+# else, so each entry here has to earn its place:
+#
+#   verify_mutation_coverage  44 mutations across 27 distinct guard commands,
+#                             and every one of those commands is now also run
+#                             UNMUTATED first -- without that baseline a guard
+#                             that fails on pristine code would certify every
+#                             mutation it guards. That correctness fix is what
+#                             pushed it past 1800s (it was ~1651s before).
+#   verify_console_mutation_coverage  rebuilds the console and runs Playwright
+#                             once per mutation; measured 690s, headroom for a
+#                             cold npm/browser cache.
+SLOW_GATES = {
+    "verify_mutation_coverage": 4200.0,
+    "verify_console_mutation_coverage": 2400.0,
+}
 SETTLE_SECONDS = 2.0
 TIMEOUT_EXIT = -9
 DIRTY_EXIT = -8
@@ -192,14 +210,19 @@ def main() -> int:
         print(f"{'RUN':<9} {name:<40} [{index}/{len(selected)}]", flush=True)
         started = time.time()
         with open(LOGS / f"{name}.log", "w", encoding="utf-8", errors="replace") as fh:
-            proc = subprocess.Popen([sys.executable, str(path)], cwd=str(ROOT),
+            # -u because stdout is a pipe to a file here, so Python would block
+            # -buffer it: a gate killed by the timeout below flushed NOTHING, and
+            # its log was three blank lines. A timeout you cannot diagnose is
+            # barely better than a hang.
+            proc = subprocess.Popen([sys.executable, "-u", str(path)], cwd=str(ROOT),
                                     stdout=fh, stderr=subprocess.STDOUT)
+            budget = SLOW_GATES.get(name, timeout) if timeout == DEFAULT_TIMEOUT else timeout
             try:
-                code = proc.wait(timeout=timeout)
+                code = proc.wait(timeout=budget)
             except subprocess.TimeoutExpired:
                 _kill_tree(proc)
                 code = TIMEOUT_EXIT
-                fh.write(f"\n\n[run_all_gates] TIMEOUT after {timeout:.0f}s; "
+                fh.write(f"\n\n[run_all_gates] TIMEOUT after {budget:.0f}s; "
                          f"process tree killed\n")
         elapsed = time.time() - started
 

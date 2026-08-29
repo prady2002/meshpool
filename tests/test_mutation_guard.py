@@ -252,3 +252,54 @@ def test_harness_still_detects_a_real_survivor():
     """Non-vacuity of the test above: the harness has not simply stopped judging."""
     verdict = _run_harness()
     assert "1 of 2 mutations survived" in verdict, verdict
+
+
+# ---------------------------------------------------------------------------
+# The mutation gate's worktree sweep must not delete a live run's directory.
+#
+# This is not hypothetical. The full 44-mutation run failed because two of its
+# own guard mutations run `pytest tests/test_mutation_guard.py`, whose harness
+# creates a nested meshpool-mut-* directory; the nested sweep then removed the
+# OUTER run's temp dir and the outer run died with FileNotFoundError on its own
+# worktree. Both mutations were reported VACUOUS, which was correct but pointed
+# at the wrong culprit: the guard was fine, the sweep was not.
+# ---------------------------------------------------------------------------
+
+def test_sweep_leaves_a_worktree_owned_by_a_live_process_alone(tmp_path):
+    from sim.scenarios.verify_mutation_coverage import worktree_is_abandoned
+
+    owned = tmp_path / "meshpool-mut-live"
+    (owned / "wt").mkdir(parents=True)
+    # Our own pid is unambiguously alive, which is the whole point.
+    (owned / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    assert not worktree_is_abandoned(str(owned / "wt")), (
+        "the sweep would delete a worktree that a running gate is using"
+    )
+
+
+def test_sweep_still_reclaims_a_worktree_whose_owner_is_gone(tmp_path):
+    """Non-vacuity: the check above must not be true of everything.
+
+    Without this, `worktree_is_abandoned` could simply `return False` and the
+    test above would still pass while the sweep silently stopped reclaiming
+    anything -- which is how a killed run permanently accumulates worktrees.
+    """
+    from sim.scenarios.verify_mutation_coverage import worktree_is_abandoned
+
+    dead = tmp_path / "meshpool-mut-dead"
+    (dead / "wt").mkdir(parents=True)
+    (dead / "owner.pid").write_text(str(_dead_pid()), encoding="utf-8")
+    assert worktree_is_abandoned(str(dead / "wt"))
+
+    # And a directory nobody ever claimed is reclaimable, as it always was.
+    orphan = tmp_path / "meshpool-mut-orphan"
+    (orphan / "wt").mkdir(parents=True)
+    assert worktree_is_abandoned(str(orphan / "wt"))
+
+
+def _dead_pid() -> int:
+    """A pid that is certainly not running: spawn a process and wait for it."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid

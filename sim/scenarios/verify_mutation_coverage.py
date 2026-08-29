@@ -43,6 +43,27 @@ sys.path.insert(0, str(ROOT))
 from sim import mutation_guard  # noqa: E402
 
 
+def worktree_is_abandoned(wt: str) -> bool:
+    """Is this ``meshpool-mut-*`` worktree safe to delete?
+
+    "Abandoned" has to mean abandoned. The sweep used to remove EVERY matching
+    worktree, so a second run -- or, as it turned out, this gate's own guard
+    tests running nested inside it -- deleted the temp directory of a run that
+    was still using it, and the outer run died with ``FileNotFoundError`` on its
+    own worktree. Every run now claims its directory with ``owner.pid`` before
+    creating the worktree, and a live owner is left strictly alone.
+
+    A directory with no readable owner file predates this scheme (or lost the
+    file to a hard kill), so it is treated as abandoned -- that is the old
+    behaviour and it is the safe default for a temp directory nobody claims.
+    """
+    try:
+        pid = int((Path(wt).parent / "owner.pid").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return True
+    return not mutation_guard._pid_alive(pid)
+
+
 def _sweep_abandoned_worktrees() -> None:
     """Remove worktrees a previous killed run could not clean up.
 
@@ -65,6 +86,9 @@ def _sweep_abandoned_worktrees() -> None:
             continue
         wt = line.split(" ", 1)[1].strip()
         if "meshpool-mut-" not in wt:
+            continue
+        if not worktree_is_abandoned(wt):
+            print(f"   [skip] worktree {wt} is owned by a live run")
             continue
         subprocess.run(["git", "worktree", "remove", "--force", wt],
                        cwd=str(ROOT), stdout=subprocess.DEVNULL,
@@ -898,6 +922,9 @@ def main() -> int:
 
     pre = {m["path"]: _sha(ROOT / m["path"]) for m in selected}
     tmp = Path(tempfile.mkdtemp(prefix="meshpool-mut-"))
+    # Claim it before creating the worktree, so a concurrent sweep can never see
+    # an unowned directory that is about to be in use.
+    (tmp / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
     worktree = tmp / "wt"
     survivors: list[dict] = []
     unrunnable: list[tuple[dict, str]] = []
