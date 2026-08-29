@@ -806,7 +806,12 @@ class _PullError(Exception):
     """No peer served a verified copy of a requested blob."""
 
 
-async def _pull_verified(c: httpx.AsyncClient, blob_id: str, sources: list[str]) -> bytes:
+async def _pull_verified(
+    c: httpx.AsyncClient,
+    blob_id: str,
+    sources: list[str],
+    accepted_sources: Optional[list[dict[str, str]]] = None,
+) -> bytes:
     """Return the bytes for ``blob_id`` from the first peer that serves a copy whose
     SHA-256 matches the id. The digest check means a dishonest or misconfigured peer can
     never hand back the wrong bytes -- and doubles as SSRF-exfiltration protection: any
@@ -827,6 +832,8 @@ async def _pull_verified(c: httpx.AsyncClient, blob_id: str, sources: list[str])
         except (binascii.Error, ValueError):
             continue
         if hashlib.sha256(raw).hexdigest() == blob_id:
+            if accepted_sources is not None:
+                accepted_sources.append({"blob_id": blob_id, "source": src})
             return raw
     raise _PullError(f"no peer served a valid copy of {blob_id[:12]}")
 
@@ -844,6 +851,7 @@ async def blob_pull(req: BlobPullRequest) -> dict:
         raise HTTPException(status_code=400, detail="blob_id must be a sha256 hex digest")
     if state.blobs.has(req.blob_id):
         return {"blob_id": req.blob_id, "stored": True, "bytes": 0, "cached": True}
+    accepted_sources: list[dict[str, str]] = []
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as c:
         try:
             if req.chunks:
@@ -852,13 +860,13 @@ async def blob_pull(req: BlobPullRequest) -> dict:
                     if not _HEX64.match(ch.id):
                         raise HTTPException(status_code=400,
                                             detail="chunk id must be a sha256 hex digest")
-                    parts.append(await _pull_verified(c, ch.id, ch.sources))
+                    parts.append(await _pull_verified(c, ch.id, ch.sources, accepted_sources))
                 whole = b"".join(parts)
                 if hashlib.sha256(whole).hexdigest() != req.blob_id:
                     raise HTTPException(status_code=502,
                                         detail="reassembled object failed integrity check")
             else:
-                whole = await _pull_verified(c, req.blob_id, req.sources or [])
+                whole = await _pull_verified(c, req.blob_id, req.sources or [], accepted_sources)
         except _PullError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
     try:
@@ -867,7 +875,8 @@ async def blob_pull(req: BlobPullRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc))
     except StorageFull as exc:
         raise HTTPException(status_code=507, detail=str(exc))
-    return {"blob_id": req.blob_id, "stored": True, "bytes": len(whole)}
+    return {"blob_id": req.blob_id, "stored": True, "bytes": len(whole),
+            "sources": accepted_sources}
 
 
 @app.post("/blob_ec_repair")

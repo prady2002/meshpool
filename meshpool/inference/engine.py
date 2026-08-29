@@ -603,15 +603,25 @@ class InferenceManager:
         return None
 
     def _holder_urls(self, node_ids, exclude_node: str) -> list[str]:
-        """Advertised URLs of the online nodes that hold a blob, minus the target."""
-        urls: list[str] = []
+        """Advertised URLs of online holders, nearest to ``exclude_node`` first."""
+        holders: list[tuple[float, str]] = []
+        rtt = getattr(self.registry, "predicted_rtt", None)
         for nid in node_ids:
             if nid == exclude_node:
                 continue
             n = self.registry.get(nid)
             if n is not None and n.status is NodeStatus.ONLINE and getattr(n, "url", None):
-                urls.append(n.url)
-        return urls
+                distance = float("inf")
+                if callable(rtt):
+                    try:
+                        v = rtt(exclude_node, nid)
+                        if v is not None and v >= 0.0:
+                            distance = float(v)
+                    except Exception:  # noqa: BLE001
+                        pass
+                holders.append((distance, n.url))
+        holders.sort(key=lambda x: (x[0], x[1]))
+        return [url for _distance, url in holders]
 
     async def _load_shards(self, dep: ModelDeployment, cfg: M.ModelConfig,
                            manifest: Optional[dict] = None) -> None:
