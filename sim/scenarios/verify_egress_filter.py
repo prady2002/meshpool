@@ -116,12 +116,30 @@ def _test_hard_blocked_ports(egress_mod) -> None:
 
 
 def _test_private_ranges(egress_mod) -> None:
-    policy = egress_mod.EgressPolicy()
-    for host in ("127.0.0.1", "192.168.1.1", "169.254.169.254"):
+    policy = egress_mod.EgressPolicy(allow_all=True)
+    for host in (
+        "0.0.0.0",
+        "127.0.0.1",
+        "10.0.0.1",
+        "172.16.0.1",
+        "192.168.1.1",
+        "169.254.169.254",
+        "::1",
+        "::ffff:10.0.0.1",
+        "[::ffff:10.0.0.1]",
+        "2130706433",
+        "0177.0.0.1",
+        "0x7f000001",
+        "012.0.0.1",
+        "0x0a000001",
+    ):
         try:
             policy.check(host, 80)
-        except egress_mod.EgressDenied:
-            continue
+        except egress_mod.EgressDenied as exc:
+            if "blocked network" in exc.reason:
+                continue
+            raise AssertionError(
+                f"private destination {host} was not recognized as blocked: {exc.reason}")
         raise AssertionError(f"private destination {host} unexpectedly allowed")
 
 
@@ -158,6 +176,26 @@ def _positive_control(egress_mod) -> None:
     th.join(timeout=2)
     if not accepted:
         raise AssertionError("positive-control server was never reached")
+
+
+def _test_dns_rebind_denied(egress_mod) -> None:
+    original_getaddrinfo = socket.getaddrinfo
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        if host == "allowed.meshpool.test":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", port))]
+        return original_getaddrinfo(host, port, *args, **kwargs)
+
+    socket.getaddrinfo = fake_getaddrinfo
+    try:
+        policy = egress_mod.EgressPolicy(whitelist=[("allowed.meshpool.test", 443)])
+        try:
+            policy.check("allowed.meshpool.test", 443)
+        except egress_mod.EgressDenied:
+            return
+        raise AssertionError("whitelisted DNS name rebinding to RFC1918 was allowed")
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
 
 
 def _test_sandbox_blocks_real_connection() -> None:
@@ -367,6 +405,8 @@ def main() -> int:
         check("private ranges denied", True)
         _positive_control(egress_mod)
         check("whitelist positive control", True)
+        _test_dns_rebind_denied(egress_mod)
+        check("DNS rebinding to blocked IP denied", True)
         wasm_ok, wasm_detail = _test_wasm_preflight()
         check("wasm has no network capability", wasm_ok, wasm_detail)
         _check_runtime_markers()

@@ -110,8 +110,9 @@ def test_allow_all_permits_public_but_still_blocks_private() -> None:
     "[::ffff:10.0.0.1]",
 ])
 def test_blocked_ip_encodings_are_denied_even_when_allow_all(host: str) -> None:
-    with pytest.raises(EgressDenied):
+    with pytest.raises(EgressDenied) as exc:
         EgressPolicy(allow_all=True).check(host, 80)
+    assert "blocked network" in exc.value.reason
 
 
 def test_dns_resolution_to_blocked_ip_is_denied(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -174,6 +175,14 @@ def test_socket_hook_positive_control_allows_whitelisted_public_destination() ->
     with _temporary_egress_hook(EgressPolicy(whitelist=[("93.184.216.34", 443)])) as calls:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.connect(("93.184.216.34", 443))
+    assert calls == [("93.184.216.34", 443)]
+
+
+def test_socket_hook_connect_ex_positive_control_allows_whitelisted_public_destination() -> None:
+    with _temporary_egress_hook(EgressPolicy(whitelist=[("93.184.216.34", 443)])) as calls:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            err = sock.connect_ex(("93.184.216.34", 443))
+    assert err == 0
     assert calls == [("93.184.216.34", 443)]
 
 

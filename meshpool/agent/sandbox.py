@@ -316,8 +316,16 @@ def _worker_main() -> int:
             host = str(payload.get("host", "127.0.0.1"))
             port = int(payload.get("port", 0))
             whitelist = [(str(h), int(p)) for h, p in payload.get("whitelist", [])]
-            install_egress_hook(EgressPolicy(
-                whitelist=whitelist, allow_all=bool(payload.get("allow_all", False))))
+            # Only override the policy the production path installed when a test
+            # explicitly asks for a different one. Re-installing unconditionally made
+            # this selftest prove its OWN hook worked rather than the one installed
+            # above: deleting that install still left this branch installing a
+            # deny-by-default policy, so the connection was still refused and the
+            # gate still passed. That is precisely the blindness this selftest exists
+            # to remove, so the default path must inherit whatever _worker_main set up.
+            if "whitelist" in payload or "allow_all" in payload:
+                install_egress_hook(EgressPolicy(
+                    whitelist=whitelist, allow_all=bool(payload.get("allow_all", False))))
             original_calls: list[tuple[str, int]] = []
             if payload.get("fake_original_connect"):
                 from ..common import egress as _egress
