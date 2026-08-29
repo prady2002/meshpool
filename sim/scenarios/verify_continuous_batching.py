@@ -42,7 +42,9 @@ Exit code: 0 on PASS, 1 on FAIL.
 from __future__ import annotations
 
 import concurrent.futures as cf
+import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -105,6 +107,66 @@ def chat(cp: str, prompt: str, **kw) -> dict:
     r = _http().post(f"{cp}/api/v1/inference/chat", json=body, timeout=300)
     r.raise_for_status()
     return r.json()
+
+
+def chat_streaming(cp: str, prompt: str, started: threading.Event, **kw) -> dict:
+    """Stream a request, signalling ``started`` the instant the server emits a token.
+
+    Test 5 needs a *barrier*, not a stopwatch: the short requests must be issued while
+    the long one is provably mid-generation. The obvious way to arrange that -- submit
+    the long request, ``time.sleep(0.5)``, then submit the shorts -- is wrong, and it
+    is wrong in a way that only shows up under load. ``ThreadPoolExecutor.submit``
+    returns before the worker thread has run, so on a busy machine the long request's
+    POST may not have reached the server at all when the sleep expires. The shorts then
+    arrive first, run to completion in two steps each, and the long request finally
+    starts alone -- producing ``mean_batch == 1.0`` and a confident accusation of
+    static batching against a server that is batching perfectly well. That is a false
+    failure in a gate, which is worse than no gate.
+
+    Streaming removes the guess. ``{"delta": ...}`` frames are emitted per token as
+    they are produced, so the *first* one is positive server-side proof that this
+    sequence is in the running batch right now. The terminal ``{"done": true,
+    "result": {...}}`` frame carries exactly what the non-streaming form returns, so
+    the per-sequence batch accounting the test asserts on is unchanged.
+    """
+    body = {"prompt": prompt, "max_new_tokens": N_TOKENS, "temperature": 0.0,
+            "stream": True}
+    body.update(kw)
+    result: dict | None = None
+    deltas = 0
+    try:
+        with _http().stream("POST", f"{cp}/api/v1/inference/chat", json=body,
+                            timeout=300) as r:
+            if r.status_code != 200:
+                r.read()
+                raise AssertionError(
+                    f"streaming chat returned {r.status_code}: {r.text[:300]}")
+            for line in r.iter_lines():
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                if "error" in obj:
+                    raise AssertionError(f"stream reported an error: {obj['error']}")
+                if obj.get("done"):
+                    result = obj["result"]
+                    break
+                deltas += 1
+                started.set()
+    finally:
+        # Never leave the barrier unset: a caller blocked on it would otherwise wait
+        # out its whole timeout on what is really an immediate, reportable failure.
+        started.set()
+    if result is None:
+        raise AssertionError("the stream ended without a terminal done frame")
+    if deltas == 0:
+        # The barrier was released by the ``finally`` above, i.e. at completion rather
+        # than at first token. Any batching verdict drawn from that ordering would be
+        # meaningless, so say what actually went wrong instead.
+        raise AssertionError(
+            "the long request streamed no incremental deltas, so 'it has started "
+            "generating' was never observable; the batching verdict that depends on "
+            "this barrier cannot be trusted and is not reported")
+    return result
 
 
 def fire_concurrently(cp: str, prompts: list[str], **kw) -> tuple[list[dict], float]:
@@ -283,11 +345,20 @@ def main() -> int:  # noqa: C901
         # alone, so under static batching its mean_batch is exactly 1.0 no matter how
         # busy the server gets: nothing can join it. Above 1.0 it is proof that the
         # later arrivals were admitted into a batch already in progress. That cannot be
-        # faked by the short requests batching among themselves, and it does not depend
-        # on machine load, so it neither flakes nor passes for the wrong reason.
+        # faked by the short requests batching among themselves.
+        #
+        # The *assertion* is load-independent. Establishing its precondition is not,
+        # and an earlier version of this test got that wrong: it slept 0.5s and hoped
+        # the long request had started. Under a loaded machine it had not, the shorts
+        # ran and finished first, and the gate failed an innocent server. The
+        # measurement was sound; the setup was racy. Both have to be right.
         #
         # The wall-clock ordering check is kept as the user-visible consequence, but it
         # is the exact check above that makes this gate mean something.
+        #
+        # The shorts are released by a *barrier*, not a sleep: see ``chat_streaming``.
+        # A stopwatch here made this test fail under load for a reason that had nothing
+        # to do with the server -- the long request's POST had not been sent yet.
         done_at: dict[str, float] = {}
 
         def timed(label: str, prompt: str, n: int) -> dict:
@@ -295,9 +366,21 @@ def main() -> int:  # noqa: C901
             done_at[label] = time.perf_counter()
             return d
 
+        def timed_long(started: threading.Event) -> dict:
+            d = chat_streaming(cp, "a ", started, max_new_tokens=55,
+                               speculative=False)
+            done_at["long"] = time.perf_counter()
+            return d
+
+        generating = threading.Event()
         with cf.ThreadPoolExecutor(max_workers=4) as ex:
-            long_f = ex.submit(timed, "long", "a ", 55)
-            time.sleep(0.5)                      # let the long one start generating
+            long_f = ex.submit(timed_long, generating)
+            # Block until the server has actually emitted a token for the long
+            # request. Only then can a late arrival possibly join it in flight.
+            assert generating.wait(120), (
+                "the long request produced no token within 120s, so the short "
+                "requests were never released; this test could not observe "
+                "mid-flight admission either way")
             short_fs = [ex.submit(timed, f"short{i}", PROMPTS[i + 1], 2)
                         for i in range(3)]
             shorts = [f.result() for f in short_fs]
@@ -312,7 +395,8 @@ def main() -> int:  # noqa: C901
 
         long_mb = long_d["batch"]["mean_batch"]
         print(f"  long request: 55 tokens, mean_batch={long_mb:.3f}")
-        print(f"  short requests: 2 tokens each, submitted 0.5s after it started")
+        print("  short requests: 2 tokens each, released once the long one "
+              "had streamed its first token")
         assert long_mb > 1.0, (
             f"the long request rode every one of its {long_d['batch']['max_batch']}-slot "
             f"traversals alone (mean_batch={long_mb:.3f}). Requests that arrived while "

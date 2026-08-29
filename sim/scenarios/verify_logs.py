@@ -129,9 +129,19 @@ def main() -> int:
         marker = "sentinel-42"
         for _ in range(6):
             assert get(cp, dep_id, marker).status_code == 200
-        time.sleep(0.6)  # let the reader threads drain the pipes
-        data = fetch_logs(cp, dep_id).json()
-        all_lines = "\n".join(ln for rep in data["replicas"] for ln in rep["lines"])
+        # Poll for the line instead of sleeping a fixed 0.6s and hoping. The reader
+        # threads drain the child's pipes asynchronously, so the only honest wait is
+        # one that ends when the evidence arrives. A fixed sleep either flakes on a
+        # loaded machine or wastes time on an idle one; this does neither, and the
+        # failure message below is still the one that matters if it never arrives.
+        deadline = time.time() + 20.0
+        all_lines = ""
+        while time.time() < deadline:
+            data = fetch_logs(cp, dep_id).json()
+            all_lines = "\n".join(ln for rep in data["replicas"] for ln in rep["lines"])
+            if f"path=/{marker}" in all_lines:
+                break
+            time.sleep(0.05)
         assert f"path=/{marker}" in all_lines, \
             f"our request was not logged (capture is not live): ...{all_lines[-400:]}"
         print(f"  PASS: request to /{marker} appears in the captured logs")

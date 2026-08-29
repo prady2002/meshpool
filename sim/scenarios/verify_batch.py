@@ -34,6 +34,43 @@ def _counts(job: dict) -> dict:
     return dict(c)
 
 
+_IN_FLIGHT = {"running", "assigned"}
+
+
+def _await_inflight_victim(cp: str, job_id: str, name_by_id: dict,
+                           timeout: float = 45.0) -> tuple[int, str, dict]:
+    """Block until a unit is observably in flight; return the node hosting it.
+
+    Replaces ``time.sleep(1.0)  # let some units start`` followed by killing a
+    hardcoded node. That was racy in two independent ways, and both produce the same
+    misleading outcome -- a failure blamed on the product:
+
+    * On a loaded machine no unit may have started within the fixed second, so the
+      kill lands on an idle node.
+    * Even when units *had* started, nothing guaranteed one was on the node the test
+      chose to kill.
+
+    In either case no work is lost, so nothing is ever retried, and the
+    ``max_attempts >= 2`` assertion fails against a system that is behaving
+    perfectly. Choosing the victim from observed server state removes both races:
+    the node killed is, by construction, one that is running a unit right now.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = _job(cp, job_id)
+        for u in job["units"]:
+            name = name_by_id.get(u.get("assigned_node") or "", "")
+            if str(u["status"]).lower() in _IN_FLIGHT and name.startswith("sim-node-"):
+                return int(name.rsplit("-", 1)[1]) - 1, name, _counts(job)
+        if str(job["status"]).startswith("completed"):
+            raise AssertionError(
+                "the job finished before any unit was seen in flight, so there was "
+                "no live work to interrupt; this test cannot observe failover")
+        time.sleep(0.05)
+    raise TimeoutError(
+        f"no unit of job {job_id} entered a running state within {timeout:.0f}s")
+
+
 def _wait_job(cp: str, job_id: str, timeout: float = 60) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -77,11 +114,10 @@ def main() -> int:
         print("\n== test 2: kill a node mid-flight, expect retry + completion ==")
         payloads = [{"seconds": 1.5, "echo": i} for i in range(12)]
         jid = _submit(cp, "sleep_echo", payloads, cpu_pct=15)
-        time.sleep(1.0)  # let some units start
-        mid = _counts(_job(cp, jid))
+        victim_idx, victim_name, mid = _await_inflight_victim(cp, jid, name_by_id)
         print(f"  mid-flight counts: {mid}")
-        print("  killing sim-node-2 ...")
-        h.stop_agent(1)
+        print(f"  killing {victim_name} (observed running a unit right now) ...")
+        h.stop_agent(victim_idx)
         job = _wait_job(cp, jid, timeout=60)
         done = sum(1 for u in job["units"] if u["status"] == "done")
         max_attempts = max(u["attempts"] for u in job["units"])
