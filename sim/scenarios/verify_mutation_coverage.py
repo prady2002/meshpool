@@ -105,6 +105,25 @@ def _sweep_abandoned_worktrees() -> None:
 # plausible -- the shape a real regression actually takes.
 MUTATIONS = [
     {
+        "id": "sandbox-runs-work-without-egress-enforcement",
+        "path": "meshpool/agent/sandbox.py",
+        "old": b"        install_egress_hook(EgressPolicy())  # deny-by-default",
+        "new": b"        pass  # egress hook not installed",
+        "cmd": [sys.executable, "sim/scenarios/verify_egress_filter.py"],
+        "why": (
+            "This one line stands between a donated PC and a botnet, and deleting it "
+            "used to be completely undetectable. Every egress assertion in the suite "
+            "exercised an EgressPolicy object directly -- which proves the policy's "
+            "logic but not that any workload is subject to it -- and the one check that "
+            "claimed to cover runtimes read a class attribute the class sets on itself. "
+            "Policy logic can be flawless and still protect nobody if nothing installs "
+            "it. The gate now runs a real sandboxed child against a real listener and "
+            "requires the listener to accept nothing, with a nonce proving the child "
+            "actually ran and a paired unhooked connection proving the destination was "
+            "reachable all along, so 'denied' cannot quietly mean 'unreachable'."
+        ),
+    },
+    {
         "id": "batching-degrades-to-serial",
         "path": "meshpool/inference/batching.py",
         "old": b"while self._queue and len(self._active) < self.max_batch:",

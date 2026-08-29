@@ -3,17 +3,26 @@
 What this gate proves (end-to-end, no cluster needed for most tests):
   (a) All 4 hard-blocked ports (25/445/3389/6667) are unconditionally denied.
   (b) RFC1918 / loopback / link-local / APIPA (169.254.x.x) are denied by default.
-  (c) A whitelisted destination actually succeeds (positive control with a real TCP server).
+  (c) A whitelisted destination actually succeeds (positive control with a real TCP server),
+      and a whitelist entry can NOT re-open a blocked network (SSRF / metadata defence).
   (d) WASM workloads have NO network capability (WASI p1 has no socket API ? structural).
   (e) ProcessRuntime declares egress policy compliance.
-  (f) ALL runtime classes declare _EGRESS_POLICY_COMPLIANT=True ? adding a new runtime
-      without this attribute FAILS this gate immediately.
+  (f) ALL runtime classes declare _EGRESS_POLICY_COMPLIANT=True. NOTE: this is a
+      structural lint, NOT a security control ? a class asserting its own compliance
+      proves nothing about enforcement. Test (h) is what actually proves enforcement.
   (g) The abuse-report endpoint works over a real cluster.
+  (h) A REAL sandboxed child process attempting a REAL TCP connection to a REAL
+      listener is refused, the listener accepts nothing, and the child proves it ran.
+      This is the only test here that exercises enforcement where it actually lives.
 
 Non-vacuity:
   - Positive control (c) proves the filter is not just "all connections fail".
+  - Test (h) carries its own paired control: the same destination is connected to
+    successfully from an unhooked process, so "denied" cannot mean "unreachable",
+    and a nonce echoed by the child distinguishes "refused" from "never ran".
   - Mutation 1: change HARD_BLOCKED_PORTS default to frozenset() ? gate fails at test (a).
   - Mutation 2: flip deny-by-default to allow-by-default ? gate fails at test (b).
+  - Mutation 3: delete the install_egress_hook call in sandbox.py ? gate fails at (h).
   Both mutations are byte-level and restored identically (sha256 verified).
 """
 from __future__ import annotations
@@ -26,7 +35,9 @@ import json
 import shutil
 import socket
 import sys
+import threading
 import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -119,8 +130,18 @@ def _positive_control(egress_mod) -> None:
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
     port = listener.getsockname()[1]
-    policy = egress_mod.EgressPolicy(whitelist=[("127.0.0.1", port)])
-    policy.check("127.0.0.1", port)
+    # A whitelisted *public* destination is allowed, so the policy is not a blanket deny.
+    egress_mod.EgressPolicy(whitelist=[("93.184.216.34", 443)]).check("93.184.216.34", 443)
+    # ...but a whitelist entry must NOT re-open a blocked network. Otherwise one
+    # whitelist line becomes an SSRF primitive against the operator's own LAN and
+    # the cloud metadata endpoint. Blocked-network checks run before the whitelist.
+    try:
+        egress_mod.EgressPolicy(whitelist=[("127.0.0.1", port)]).check("127.0.0.1", port)
+    except egress_mod.EgressDenied:
+        pass
+    else:
+        listener.close()
+        raise AssertionError("whitelist overrode the blocked-network rule (SSRF risk)")
     accepted: list[tuple[str, int]] = []
 
     def _serve() -> None:
@@ -130,7 +151,6 @@ def _positive_control(egress_mod) -> None:
         conn.close()
         listener.close()
 
-    import threading
     th = threading.Thread(target=_serve, daemon=True)
     th.start()
     with socket.create_connection(("127.0.0.1", port), timeout=2) as conn:
@@ -138,6 +158,77 @@ def _positive_control(egress_mod) -> None:
     th.join(timeout=2)
     if not accepted:
         raise AssertionError("positive-control server was never reached")
+
+
+def _test_sandbox_blocks_real_connection() -> None:
+    """Prove egress enforcement is live in the sandbox child, not merely declared.
+
+    Every other assertion in this gate exercises an ``EgressPolicy`` object directly.
+    That proves the policy's *logic*, but a policy nobody installs protects nobody —
+    so this test runs a real sandboxed child, has it attempt a real TCP connection to
+    a real listener, and requires all four of:
+
+      1. the child echoes a nonce  -> it genuinely ran (vs. crashed / never started)
+      2. connected is False        -> it did not reach the destination
+      3. denied is True           -> refused BY POLICY (EgressDenied chained as the
+                                      cause of ConnectionRefusedError), not by a
+                                      closed port or a timeout
+      4. the listener accepted 0   -> independently observed from the other side
+
+    Then a paired control connects to the SAME listener from this unhooked process
+    and requires it to succeed, so "denied" cannot silently mean "unreachable".
+    """
+    from meshpool.agent.sandbox import SELFTEST_CONNECT, SandboxLimits, run_sandboxed
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    listener.settimeout(15.0)
+    port = int(listener.getsockname()[1])
+    accepted: list = []
+
+    def _serve() -> None:
+        try:
+            while True:
+                conn, addr = listener.accept()
+                accepted.append(addr)
+                conn.close()
+        except OSError:
+            pass
+
+    threading.Thread(target=_serve, daemon=True).start()
+    nonce = uuid.uuid4().hex
+    try:
+        result = run_sandboxed(SELFTEST_CONNECT,
+                               {"host": "127.0.0.1", "port": port, "nonce": nonce},
+                               SandboxLimits(wall_clock_s=30.0))
+        if not isinstance(result, dict) or result.get("nonce") != nonce:
+            raise AssertionError(
+                f"sandboxed child never ran the connect selftest: {result!r}")
+        if result.get("connected"):
+            raise AssertionError(
+                "a sandboxed workload REACHED a blocked destination - the egress hook "
+                "is not installed in the sandbox child")
+        if not result.get("denied"):
+            raise AssertionError(
+                "the connection failed, but not by egress policy - cannot distinguish "
+                f"enforcement from an unrelated network error: {result.get('error')!r}")
+        time.sleep(0.4)
+        if accepted:
+            raise AssertionError(
+                f"listener accepted {len(accepted)} connection(s) from a sandboxed workload")
+        # Paired control: the destination must be genuinely reachable from an
+        # unhooked process, or the negative result above would be vacuous.
+        with socket.create_connection(("127.0.0.1", port), timeout=5.0):
+            pass
+        time.sleep(0.4)
+        if not accepted:
+            raise AssertionError(
+                "control connection never reached the listener - the denial proved above "
+                "is vacuous because nothing could have connected anyway")
+    finally:
+        with contextlib.suppress(OSError):
+            listener.close()
 
 
 def _test_wasm_preflight() -> tuple[bool, str]:
@@ -173,6 +264,14 @@ def _runtime_classes(runtime_module) -> list[type]:
 
 
 def _check_runtime_markers() -> None:
+    """Structural lint: every runtime class declares _EGRESS_POLICY_COMPLIANT=True.
+
+    This is NOT a security control and must never be read as one. A class asserting
+    its own compliance, checked by a test that reads the assertion, would still pass
+    with every line of enforcement deleted. Its only value is as a review tripwire
+    that a newly added runtime has been consciously considered for egress policy.
+    The actual proof of enforcement is _test_sandbox_blocks_real_connection().
+    """
     import meshpool.agent.runtime as runtime_module
 
     classes = _runtime_classes(runtime_module)
@@ -271,7 +370,9 @@ def main() -> int:
         wasm_ok, wasm_detail = _test_wasm_preflight()
         check("wasm has no network capability", wasm_ok, wasm_detail)
         _check_runtime_markers()
-        check("runtime compliance markers", True)
+        check("runtime compliance markers (structural lint only)", True)
+        _test_sandbox_blocks_real_connection()
+        check("sandboxed workload cannot reach a blocked destination", True)
         _check_real_cluster()
         check("real abuse-report and egress-policy endpoints", True)
         _mutation_checks()

@@ -68,6 +68,15 @@ class SandboxLimits:
 # the test-suite prove memory enforcement deterministically on every platform.
 SELFTEST_ALLOC = "__sandbox_selftest_alloc__"
 
+# Test-only: attempt exactly one outbound TCP connection and report the outcome as
+# structured data. Like SELFTEST_ALLOC it is deliberately absent from the batch
+# registry, so it can never be dispatched through the real engine. It exists because
+# every other egress assertion in the suite exercises an EgressPolicy *object*, which
+# proves the policy's logic but not that any sandboxed workload is actually subject
+# to it. This is the only way to prove enforcement is live in the child, where it
+# is the thing standing between a donated PC and a botnet.
+SELFTEST_CONNECT = "__sandbox_selftest_connect__"
+
 
 # --------------------------------------------------------------------------- #
 # Parent side: spawn a limited child and enforce wall-clock + memory + output.
@@ -258,11 +267,23 @@ def _worker_main() -> int:
     # Install deny-by-default egress hook in this child process.
     # Curated functions are network-free by construction, so this is defence-in-depth.
     # For future code paths that attempt connections, this catches them before the OS call.
+    #
+    # This fails CLOSED. A sandbox whose egress filter did not install is not a sandbox,
+    # and running a stranger's work inside it is precisely the botnet/DDoS/spam-relay risk
+    # the filter exists to prevent. Silently continuing would leave the node unprotected
+    # while every test and dashboard still reported "sandboxed", which is worse than an
+    # outright failure because nobody would ever look.
     try:
         from ..common.egress import EgressPolicy, install_egress_hook
         install_egress_hook(EgressPolicy())  # deny-by-default
-    except Exception:  # noqa: BLE001 — egress enforcement failing must not stop legitimate work
-        pass
+    except Exception as exc:  # noqa: BLE001
+        sys.stdout.write(json.dumps({
+            "ok": False,
+            "error": f"EgressUnavailable: refusing to run work without egress enforcement: "
+                     f"{type(exc).__name__}: {exc}",
+        }))
+        sys.stdout.flush()
+        return 3
     raw = sys.stdin.readline()
     try:
         req = json.loads(raw)
@@ -277,6 +298,32 @@ def _worker_main() -> int:
                 buf[i] = 1
             compute_ms = (time.perf_counter() - t0) * 1000.0
             result = {"allocated_mb": mb, "checksum": buf[0]}
+        elif func == SELFTEST_CONNECT:
+            # Only reachable through run_sandboxed() — never via the batch engine.
+            import socket as _socket
+            host = str(payload.get("host", "127.0.0.1"))
+            port = int(payload.get("port", 0))
+            t0 = time.perf_counter()
+            # "nonce" is echoed back so the caller can distinguish "the child ran and
+            # was refused" from "the child never ran", which otherwise look identical.
+            outcome = {"attempted": True, "nonce": payload.get("nonce"),
+                       "connected": False, "denied": False, "error": None}
+            try:
+                conn = _socket.create_connection((host, port), timeout=3.0)
+            except Exception as exc:  # noqa: BLE001
+                # The hook re-raises EgressDenied as ConnectionRefusedError so blocked
+                # destinations are indistinguishable from ordinary network failures to
+                # the workload, but it chains the original via `from exc`. Inspecting
+                # __cause__ tells a *policy* refusal apart from a genuinely closed port
+                # without depending on message text.
+                cause = getattr(exc, "__cause__", None)
+                outcome["error"] = f"{type(exc).__name__}: {exc}"
+                outcome["denied"] = "EgressDenied" in (type(exc).__name__, type(cause).__name__)
+            else:
+                outcome["connected"] = True
+                conn.close()
+            compute_ms = (time.perf_counter() - t0) * 1000.0
+            result = outcome
         else:
             from ..batch.functions import run_function, validate_payload
             validate_payload(func, payload)

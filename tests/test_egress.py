@@ -64,8 +64,21 @@ def test_link_local_169_254_blocked() -> None:
         EgressPolicy().check("169.254.169.254", 80)
 
 
-def test_private_ip_overridden_by_whitelist() -> None:
-    EgressPolicy(whitelist=[("127.0.0.1", 8080)]).check("127.0.0.1", 8080)
+def test_whitelist_cannot_override_blocked_network() -> None:
+    """A whitelist entry must not re-open a private or link-local destination.
+
+    If it could, a single whitelist entry would become an SSRF primitive against
+    the node operator's own LAN and against the cloud metadata endpoint at
+    169.254.169.254 — which is exactly how credentials get stolen from a host
+    that is otherwise "sandboxed".
+    """
+    with pytest.raises(EgressDenied):
+        EgressPolicy(whitelist=[("127.0.0.1", 8080)]).check("127.0.0.1", 8080)
+    with pytest.raises(EgressDenied):
+        EgressPolicy(whitelist=[("169.254.169.254", 80)]).check("169.254.169.254", 80)
+    # Non-vacuity: the rule above is a targeted restriction, not a blanket denial —
+    # a whitelisted *public* destination is still allowed.
+    EgressPolicy(whitelist=[("93.184.216.34", 443)]).check("93.184.216.34", 443)
 
 
 def test_deny_by_default_for_public_ip() -> None:

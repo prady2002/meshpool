@@ -16,8 +16,10 @@ import types
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from meshpool.agent import runtime
+from meshpool.controlplane import app as cp_app
 from meshpool.cli.main import _detect_start_cmd
 from meshpool.common.models import Deployment, Replica
 from meshpool.common.transport import HttpTransport
@@ -307,6 +309,64 @@ def test_framework_detection_fastapi_start_cmd(tmp_path):
     assert "uvicorn app:app" in plan.start_cmd
 
 
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        (
+            {
+                "package.json": (
+                    '{"scripts":{"build":"vite build"},"devDependencies":{"vite":"latest"}}'
+                ),
+                "dist/index.html": "<h1>vite</h1>",
+            },
+            ("site", "vite", "dist", ""),
+        ),
+        (
+            {
+                "package.json": (
+                    '{"scripts":{"build":"react-scripts build"},'
+                    '"dependencies":{"react-scripts":"latest"}}'
+                ),
+                "build/index.html": "<h1>cra</h1>",
+            },
+            ("site", "create-react-app", "build", ""),
+        ),
+        (
+            {
+                "package.json": (
+                    '{"scripts":{"build":"next build","start":"next start"},'
+                    '"dependencies":{"next":"latest"}}'
+                ),
+            },
+            ("proc", "next", ".", "npm run start"),
+        ),
+        (
+            {"package.json": '{"scripts":{"start":"node server.js"}}', "server.js": ""},
+            ("proc", "node", ".", "npm run start"),
+        ),
+        (
+            {"index.html": "<h1>static</h1>"},
+            ("site", "static", ".", ""),
+        ),
+        (
+            {"package.json": '{"scripts":{"build":"vite build"}}'},
+            ("site", "node-static", "dist", ""),
+        ),
+    ],
+)
+def test_framework_auto_detection_matrix_is_discriminating(tmp_path, files, expected):
+    for rel, text in files.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    plan = infer_app(tmp_path)
+    kind, framework, deploy_rel, start_cmd = expected
+    assert plan.kind == kind
+    assert plan.framework == framework
+    assert plan.deploy_dir == (tmp_path if deploy_rel == "." else tmp_path / deploy_rel)
+    assert plan.start_cmd == start_cmd
+
+
 # --------------------------- session affinity ------------------------------ #
 def _manager_with_deployment(dep) -> HostingManager:
     class FakeStore:
@@ -315,6 +375,7 @@ def _manager_with_deployment(dep) -> HostingManager:
 
     mgr = object.__new__(HostingManager)   # bypass __init__: sticky only needs the store
     mgr.store = FakeStore()
+    mgr._rr = {}                           # round-robin cursor, used by pick_replica()
     return mgr
 
 
@@ -352,6 +413,21 @@ def test_sticky_replica_none_when_id_unknown_or_blank():
 def test_sticky_replica_none_when_deployment_missing():
     mgr = _manager_with_deployment(None)
     assert mgr.sticky_replica("dep-1", "rA") is None
+
+
+def test_pick_replica_never_delivers_to_unhealthy_replica():
+    healthy = Replica(id="healthy", node_id="n1", node_name="node-1",
+                      url="http://healthy", healthy=True)
+    unhealthy = Replica(id="unhealthy", node_id="n2", node_name="node-2",
+                        url="http://unhealthy", healthy=False)
+    mgr = _manager_with_deployment(_dep_with([healthy, unhealthy]))
+    delivered = {"healthy": 0, "unhealthy": 0}
+    for _ in range(25):
+        picked = mgr.pick_replica("dep-1")
+        assert picked is not None
+        delivered[picked.id] += 1
+    assert delivered["healthy"] == 25
+    assert delivered["unhealthy"] == 0
 
 
 # --------------------------- deployment removal ---------------------------- #
@@ -517,6 +593,65 @@ def test_autoscale_raises_desired_replicas_on_slow_real_requests():
     changed = asyncio.run(mgr._autoscale_deployment(records["dep-1"]))
     assert changed is True
     assert records["dep-1"].replicas_desired == 2
+
+
+def test_rollout_requires_all_desired_new_replicas_before_cutover(monkeypatch):
+    old_replicas = [
+        Replica(id="old1", node_id="n1", node_name="node-1", url="http://old1", healthy=True),
+        Replica(id="old2", node_id="n2", node_name="node-2", url="http://old2", healthy=True),
+    ]
+    old_dep = _dep_with(old_replicas)
+    old_dep.replicas_desired = 2
+    mgr, records, _started, stopped = _manager_for_rollout(old_dep)
+
+    async def healthy(_replica):
+        return True
+
+    monkeypatch.setattr(mgr, "_healthy", healthy)
+    monkeypatch.setenv("MESHPOOL_ROLLOUT_DRAIN_S", "0")
+    dep = asyncio.run(mgr.rollout("dep-1", "app", "site", 2, site={"index.html": b64("v2")}))
+    assert dep is not None
+    assert len(records["dep-1"].replicas) == 2
+    assert all(r.id not in {"old1", "old2"} for r in records["dep-1"].replicas)
+    assert sorted(stopped) == ["old1", "old2"]
+
+
+def test_proxy_retries_5xx_replica_before_serving_response(monkeypatch):
+    bad = Replica(id="bad", node_id="n1", node_name="bad-node", url="http://bad", healthy=True)
+    good = Replica(id="good", node_id="n2", node_name="good-node", url="http://good", healthy=True)
+    picks = [bad, good]
+    recorded: list[int] = []
+
+    class FakeHosting:
+        def sticky_replica(self, dep_id, replica_id, exclude=None):
+            return None
+
+        def pick_replica(self, dep_id, exclude=None):
+            while picks:
+                candidate = picks.pop(0)
+                if exclude and candidate.id in exclude:
+                    continue
+                return candidate
+            return None
+
+        def record_request(self, dep_id, status_code, duration_ms):
+            recorded.append(status_code)
+
+    class FakeTransport:
+        async def proxy_open(self, node_id, method, url, **kwargs):
+            if node_id == "n1":
+                return httpx.Response(503, content=b"bad")
+            return httpx.Response(200, content=b"good")
+
+    monkeypatch.setattr(cp_app, "CP", types.SimpleNamespace(
+        hosting=FakeHosting(), transport=FakeTransport(),
+        settings=types.SimpleNamespace(auth_mode="open")))
+    client = TestClient(cp_app.app)
+    response = client.get("/app/dep-1/")
+    assert response.status_code == 200
+    assert response.text == "good"
+    assert response.headers["x-meshpool-served-by"] == "good-node"
+    assert recorded == [200]
 
 
 # --------------------------- header passthrough ---------------------------- #

@@ -17,6 +17,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import ipaddress
+import re
 import socket
 import threading
 import time
@@ -44,7 +45,9 @@ _BLOCKED_NETWORKS: tuple[ipaddress._BaseNetwork, ...] = (
 
 _HOOK_INSTALLED = False
 _ORIGINAL_CONNECT = socket.socket.connect
+_ORIGINAL_CONNECT_EX = socket.socket.connect_ex
 _ACTIVE_POLICY: "EgressPolicy | None" = None
+_LEGACY_IPV4_RE = re.compile(r"^[0-9A-Fa-fxX.]+$")
 
 
 class EgressDenied(Exception):
@@ -57,11 +60,37 @@ class EgressDenied(Exception):
         self.port = int(port)
 
 
-def _parse_ip(host: str) -> ipaddress._BaseAddress | None:
-    try:
-        return ipaddress.ip_address(host)
-    except ValueError:
+def _clean_host(host: str) -> str:
+    host = str(host).strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    if "%" in host:
+        host = host.split("%", 1)[0]
+    return host
+
+
+def _canonical_ip(addr: ipaddress._BaseAddress) -> ipaddress._BaseAddress:
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
+def _parse_legacy_ipv4(host: str) -> ipaddress.IPv4Address | None:
+    """Parse OS-accepted IPv4 spellings such as 2130706433 or 0x7f000001."""
+    if not _LEGACY_IPV4_RE.match(host):
         return None
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(host))
+    except OSError:
+        return None
+
+
+def _parse_ip(host: str) -> ipaddress._BaseAddress | None:
+    host = _clean_host(host)
+    try:
+        return _canonical_ip(ipaddress.ip_address(host))
+    except ValueError:
+        return _parse_legacy_ipv4(host)
 
 
 def _is_blocked_ip(addr: ipaddress._BaseAddress) -> bool:
@@ -69,6 +98,7 @@ def _is_blocked_ip(addr: ipaddress._BaseAddress) -> bool:
 
 
 def _resolve_ips(host: str, port: int) -> list[ipaddress._BaseAddress]:
+    host = _clean_host(host)
     literal = _parse_ip(host)
     if literal is not None:
         return [literal]
@@ -85,7 +115,7 @@ def _resolve_ips(host: str, port: int) -> list[ipaddress._BaseAddress]:
         if ip_text in seen:
             continue
         seen.add(ip_text)
-        addrs.append(ipaddress.ip_address(ip_text))
+        addrs.append(_canonical_ip(ipaddress.ip_address(ip_text)))
     if not addrs:
         raise EgressDenied(f"unable to resolve destination {host}:{port}", host, port)
     return addrs
@@ -97,16 +127,16 @@ class EgressPolicy:
     allow_all: bool = False
 
     def check(self, host: str, port: int) -> None:
-        host = str(host)
+        host = _clean_host(host)
         port = int(port)
         if port in HARD_BLOCKED_PORTS:
             raise EgressDenied(f"port {port} is hard-blocked", host, port)
-        if (host, port) in self.whitelist:
-            return
         ips = _resolve_ips(host, port)
         for addr in ips:
             if _is_blocked_ip(addr):
                 raise EgressDenied(f"destination {addr} is in a blocked network", host, port)
+        if (host, port) in self.whitelist:
+            return
         if self.allow_all:
             return
         raise EgressDenied(f"{host}:{port} denied by default", host, port)
@@ -185,18 +215,36 @@ def install_egress_hook(policy: EgressPolicy) -> None:
     if _HOOK_INSTALLED:
         return
 
-    def _guarded_connect(sock: socket.socket, address) -> object:
+    def _check_address(address) -> tuple[str, int] | None:
         if isinstance(address, (tuple, list)) and len(address) >= 2 and _ACTIVE_POLICY is not None:
             host = address[0]
             port = address[1]
+            host_text = host.decode("utf-8", "replace") if isinstance(host, bytes) else str(host)
+            return host_text, int(port)
+        return None
+
+    def _guarded_connect(sock: socket.socket, address) -> object:
+        checked = _check_address(address)
+        if checked is not None:
+            host_text, port = checked
             try:
-                host_text = host.decode("utf-8", "replace") if isinstance(host, bytes) else str(host)
-                _ACTIVE_POLICY.check(host_text, int(port))
+                _ACTIVE_POLICY.check(host_text, port)
             except EgressDenied as exc:
                 raise ConnectionRefusedError(str(exc)) from exc
         return _ORIGINAL_CONNECT(sock, address)
 
+    def _guarded_connect_ex(sock: socket.socket, address) -> int:
+        checked = _check_address(address)
+        if checked is not None:
+            host_text, port = checked
+            try:
+                _ACTIVE_POLICY.check(host_text, port)
+            except EgressDenied:
+                return 10061
+        return _ORIGINAL_CONNECT_EX(sock, address)
+
     socket.socket.connect = _guarded_connect
+    socket.socket.connect_ex = _guarded_connect_ex
     _HOOK_INSTALLED = True
 
 
