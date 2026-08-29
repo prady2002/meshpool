@@ -67,29 +67,41 @@ class PipelineStats:
     traversals: int = 0
     hops: int = 0
     stage_calls: int = 0
+    hydration_stage_calls: int = 0
+    hydration_bytes: int = 0
     wire_bytes: int = 0
     link_seconds: float = 0.0
     compute_seconds: float = 0.0
     positions_processed: int = 0
+    layer_positions_processed: int = 0
+    hydration_positions: int = 0
 
     def merge(self, other: "PipelineStats") -> None:
         self.traversals += other.traversals
         self.hops += other.hops
         self.stage_calls += other.stage_calls
+        self.hydration_stage_calls += other.hydration_stage_calls
+        self.hydration_bytes += other.hydration_bytes
         self.wire_bytes += other.wire_bytes
         self.link_seconds += other.link_seconds
         self.compute_seconds += other.compute_seconds
         self.positions_processed += other.positions_processed
+        self.layer_positions_processed += other.layer_positions_processed
+        self.hydration_positions += other.hydration_positions
 
     def as_dict(self) -> dict:
         return {
             "traversals": self.traversals,
             "hops": self.hops,
             "stage_calls": self.stage_calls,
+            "hydration_stage_calls": self.hydration_stage_calls,
+            "hydration_bytes": self.hydration_bytes,
             "wire_bytes": self.wire_bytes,
             "link_seconds": round(self.link_seconds, 6),
             "compute_seconds": round(self.compute_seconds, 6),
             "positions_processed": self.positions_processed,
+            "layer_positions_processed": self.layer_positions_processed,
+            "hydration_positions": self.hydration_positions,
         }
 
 
@@ -115,6 +127,22 @@ class StageCall:
         return int(np.asarray(self.data, dtype=np.float32).shape[0])
 
 
+def _stage_layer_span(stage: object) -> int:
+    """How many transformer layers a stage owns, for work accounting.
+
+    Both :class:`CachedShard` and :class:`~meshpool.inference.remote.RemoteShard`
+    expose ``start``/``end``, but a stage may legitimately be a thin proxy that
+    wraps one, so the wrapped object is consulted too. A stats counter must never
+    be able to abort a generation, so an unrecognisable stage contributes 0 rather
+    than raising.
+    """
+    for obj in (stage, getattr(stage, "inner", None)):
+        start, end = getattr(obj, "start", None), getattr(obj, "end", None)
+        if isinstance(start, int) and isinstance(end, int):
+            return max(0, end - start)
+    return 0
+
+
 class CachedShard:
     """One pipeline stage: a contiguous block of layers plus a per-session KV cache.
 
@@ -134,6 +162,12 @@ class CachedShard:
         full = params if params is not None else M.load_params(cfg)[0]
         self.P = M.slice_params(full, start, end, is_first, is_last)
         self._caches: dict[str, KV.KVCache] = {}
+        # Work actually performed by this stage. With a correct KV cache these grow
+        # by one position per decode step, not by the whole sequence length --
+        # which is the observable difference between caching and recomputing.
+        self.positions_computed = 0
+        self.layer_positions_computed = 0
+        self.forward_calls = 0
 
     def cache(self, session: str) -> KV.KVCache:
         c = self._caches.get(session)
@@ -159,7 +193,13 @@ class CachedShard:
         ``session`` selects the KV cache; ``None`` disables caching entirely, which is
         the exact-recompute path used as the correctness oracle.
         """
+        self.forward_calls += 1
         cache = self.cache(session) if (session is not None and self.start < self.end) else None
+        if cache is not None:
+            # Recorded BEFORE the rebuild branch below mutates the cache: once
+            # reset() has run, length is 0 and a rebuild would be indistinguishable
+            # from a first-ever prefill.
+            cache.record_access(pos_offset)
         if cache is not None and not cache.accepts(0, pos_offset):
             # The caller jumped to a position that does not continue this cache
             # (window slide, or a fresh sequence reusing the id). Rebuilding is the
@@ -179,6 +219,9 @@ class CachedShard:
             x = np.asarray(data, dtype=np.float32)
 
         x = KV.run_layers_cached(self.P, self.cfg, x, self.start, self.end, cache)
+        rows = int(np.asarray(x).shape[0])
+        self.positions_computed += rows
+        self.layer_positions_computed += rows * (self.end - self.start)
         return M.head(self.P, self.cfg, x) if self.is_last else x
 
     def forward_batch(self, items: list["StageCall"]) -> list[np.ndarray]:
@@ -327,6 +370,13 @@ class Pipeline:
             out = stage.forward(act, is_tokens=False, pos_offset=pos, session=session)
             if inspect.isawaitable(out):
                 await out
+            # Recovery work is counted on its own axis. Folding it into stage_calls
+            # or traversals would let a churn-heavy run look like a more expensive
+            # generation, and would corrupt the tok/traversal numbers the
+            # speculative-decoding gates assert on.
+            self.stats.hydration_stage_calls += 1
+            self.stats.hydration_positions += min(upto_pos, pos + chunk) - pos
+            self.stats.hydration_bytes += int(np.asarray(act, dtype=np.float32).nbytes)
 
     async def hydrate_stage_from_tokens(
         self,
@@ -361,6 +411,13 @@ class Pipeline:
                                 session=session)
             if inspect.isawaitable(out):
                 await out
+            self.stats.hydration_stage_calls += 1
+            self.stats.hydration_positions += len(span)
+            # Measured the same way as the activation path rather than assumed.
+            # Token replay ships int32 ids, not [T, D] activations -- which is
+            # precisely why stage 0 is the cheapest stage to rebuild.
+            self.stats.hydration_bytes += int(
+                np.asarray(list(span), dtype=np.int32).nbytes)
 
     async def rehydrate_stage(
         self,
@@ -415,6 +472,7 @@ class Pipeline:
                 self.activation_cache.record(session, idx + 1, pos_offset, np.asarray(data, dtype=np.float32))
             st.compute_seconds += time.perf_counter() - t0
             st.stage_calls += 1
+            st.layer_positions_processed += len(tokens) * _stage_layer_span(stage)
             is_tokens = False
 
         self.stats.merge(st)
@@ -475,6 +533,8 @@ class Pipeline:
                     f"batch items")
             st.compute_seconds += time.perf_counter() - t0
             st.stage_calls += 1
+            st.layer_positions_processed += (
+                sum(c.rows for c in calls) * _stage_layer_span(stage))
 
             if idx < len(self.stages) - 1:
                 for c, arr in zip(current, out):

@@ -43,9 +43,13 @@ def _node(nid: str, url: str, online: bool = True):
 class FakeReg:
     def __init__(self, nodes):
         self._nodes = nodes
+        self.rtts = {}
 
     def get(self, nid):
         return self._nodes.get(nid)
+
+    def predicted_rtt(self, a, b):
+        return self.rtts.get((a, b))
 
 
 class FakeStorage:
@@ -157,6 +161,28 @@ def test_pull_plan_skips_offline_holders():
     plan = mgr._pull_plan(bid, exclude_node="Z")
 
     assert plan == {"blob_id": bid, "sources": ["http://b:9"]}   # offline A dropped
+
+
+def test_pull_plan_orders_sources_by_nearest_peer():
+    """The property is WHICH peer will do the work, not merely that bytes arrive.
+
+    Non-vacuity: both holders are online, both genuinely hold the blob in metadata,
+    and their RTTs to the target are distinct. If the planner ignores topology and
+    preserves replica/origin order, it routes to the far peer first and this fails.
+    """
+    bid = _sha(b"nearer-than-origin")
+    storage = FakeStorage(metas={bid: types.SimpleNamespace(replicas=["origin", "near"], chunks=[])})
+    reg = FakeReg({
+        "origin": _node("origin", "http://origin:9"),
+        "near": _node("near", "http://near:9"),
+        "target": _node("target", "http://target:9"),
+    })
+    reg.rtts = {("target", "origin"): 80.0, ("target", "near"): 3.0}
+    mgr = _mgr(FakePlaceTransport(), storage, reg)
+
+    plan = mgr._pull_plan(bid, exclude_node="target")
+
+    assert plan == {"blob_id": bid, "sources": ["http://near:9", "http://origin:9"]}
 
 
 # --------------------------------------------------------------------------- #
@@ -332,7 +358,29 @@ def test_blob_pull_chunked_reassembles_and_stores(tmp_path, monkeypatch):
         {"id": id2, "sources": ["http://b"]}])
     out = _run_pull(monkeypatch, state, peers, req)
     assert out["stored"] is True and out["bytes"] == len(whole)
+    assert out["sources"] == [
+        {"blob_id": id1, "source": "http://a"},
+        {"blob_id": id2, "source": "http://b"},
+    ]
     assert state.blobs.get(bid) == whole
+
+
+def test_blob_pull_records_the_source_that_actually_verified(tmp_path, monkeypatch):
+    """A good final blob is insufficient evidence: the first peer may have lied.
+
+    This positive-control pull proves a good copy succeeds, and records that the
+    dishonest first source did not do the accepted work.
+    """
+    data = b"verified source bytes"
+    bid = _sha(data)
+    state = _fake_state(tmp_path)
+    out = _run_pull(monkeypatch, state,
+                    {"http://liar": {bid: b"wrong" + data}, "http://honest": {bid: data}},
+                    daemon.BlobPullRequest(blob_id=bid, sources=["http://liar", "http://honest"]))
+
+    assert out["stored"] is True
+    assert out["sources"] == [{"blob_id": bid, "source": "http://honest"}]
+    assert state.blobs.get(bid) == data
 
 
 def test_blob_pull_rejects_tampered_chunk(tmp_path, monkeypatch):

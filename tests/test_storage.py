@@ -358,6 +358,46 @@ def test_chunked_object_dedupes_on_reput(monkeypatch):
     assert [b.id for b in mgr.list()] == [m1.id]      # one manifest, not duplicated
 
 
+def test_chunked_object_reuses_shared_chunks_between_related_models(monkeypatch):
+    """Dedup is about bytes not transferred, not whether the second object reads.
+
+    Two fine-tunes of the same base should share the base chunks. This asserts the
+    second upload only places the one changed chunk; if chunk ids include an offset,
+    random salt, or anything other than content, the byte-transfer count jumps.
+    """
+    monkeypatch.setenv("MESHPOOL_CHUNK_SIZE", "64")
+    mgr, _reg, _s, t, _ev = _manager(["A", "B", "C"])
+    base = b"A" * 64 + b"B" * 64 + b"C" * 64
+    tuned = b"A" * 64 + b"B" * 64 + b"D" * 64
+
+    m1 = asyncio.run(mgr.put(base, replication=2))
+    puts_after_base = sum(1 for _nid, method in t.calls if method == "blob_put")
+    m2 = asyncio.run(mgr.put(tuned, replication=2))
+    new_puts = sum(1 for _nid, method in t.calls if method == "blob_put") - puts_after_base
+
+    assert m1.chunks[:2] == m2.chunks[:2]             # base chunks genuinely shared
+    assert m1.chunks[2] != m2.chunks[2]               # changed chunk non-vacuity
+    assert new_puts == 2                              # one changed chunk × 2 replicas
+
+
+def test_chunked_upload_resumes_from_existing_chunks(monkeypatch):
+    """A resumed upload must not restart from byte zero; count chunk writes."""
+    monkeypatch.setenv("MESHPOOL_CHUNK_SIZE", "64")
+    mgr, _reg, store, t, _ev = _manager(["A", "B", "C"])
+    data = b"R" * 64 + b"S" * 64 + b"T" * 64
+    first, second, third = data[:64], data[64:128], data[128:]
+
+    asyncio.run(mgr.put(first + second, replication=2))
+    initial_puts = sum(1 for _nid, method in t.calls if method == "blob_put")
+    meta = asyncio.run(mgr.put(data, replication=2))
+    resumed_puts = sum(1 for _nid, method in t.calls if method == "blob_put") - initial_puts
+
+    assert meta.chunks[:2] == [_sha(first), _sha(second)]
+    assert store.get_blob(_sha(first)).replicas
+    assert store.get_blob(_sha(second)).replicas
+    assert resumed_puts == 2                          # only the missing final chunk
+
+
 def test_chunked_object_survives_node_loss_and_reassembles(monkeypatch):
     # The headline durability property at object scale: lose a machine holding chunks
     # and the repair loop rebuilds every under-replicated chunk from a surviving copy.
@@ -415,5 +455,4 @@ def test_internal_put_is_hidden_from_listing_but_still_readable():
     assert mgr.list(owner="alice") == []               # even for its own owner
     assert store.get_blob(meta.id) is not None         # but the metadata exists
     assert asyncio.run(mgr.get(meta.id)) == data       # and it round-trips
-
 

@@ -144,6 +144,15 @@ class KVCache:
     page_size: int = 16
     window_start: int = 0
     layers: dict[int, LayerCache] = field(default_factory=dict)
+    cache_hits: int = 0
+    cache_misses: int = 0
+
+    def record_access(self, pos_offset: int) -> None:
+        """Record whether a stage forward used previously cached positions."""
+        if self.length > 0 and pos_offset == self.length:
+            self.cache_hits += 1
+        else:
+            self.cache_misses += 1
 
     def layer(self, i: int) -> LayerCache:
         lc = self.layers.get(i)

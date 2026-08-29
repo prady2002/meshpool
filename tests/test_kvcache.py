@@ -15,7 +15,7 @@ from gguf_fixtures import build_llama_gguf
 from meshpool.inference import gguf_loader as G
 from meshpool.inference import kvcache as KV
 from meshpool.inference import model as M
-from meshpool.inference.pipeline import Pipeline, build_stages, generate_baseline, prefill
+from meshpool.inference.pipeline import Pipeline, StageCall, build_stages, generate_baseline, prefill
 
 # float32 matmul is not associative, so cached and uncached paths accumulate in a
 # different order. 1e-4 is far below the gap between competing logits in practice.
@@ -142,6 +142,82 @@ def test_stage_cache_contains_only_owned_layers(cfg_params):
     assert all(2 <= i < 5 for i in cache.layers)
 
 
+def test_decode_uses_cached_prefix_instead_of_recomputing_it(cfg_params):
+    """The cache property is work *not done*, not just identical logits."""
+    cfg, P = cfg_params
+    prompt = TOKENS[:7]
+    max_new = 6
+    pipe = Pipeline(cfg, build_stages(cfg, 2, P, cache_page_size=3))
+    out, stats = asyncio.run(generate_baseline(
+        pipe, prompt, max_new, temperature=0.0, session="counted"))
+
+    assert len(out) == max_new
+    assert stats.positions_processed == len(prompt) + max_new
+    assert stats.layer_positions_processed == (len(prompt) + max_new) * cfg.n_layer
+    assert stats.positions_processed > 0
+    assert stats.layer_positions_processed > stats.positions_processed
+
+    for stage in pipe.stages:
+        cache = stage.cache("counted")
+        assert stage.positions_computed == len(prompt) + max_new
+        assert stage.layer_positions_computed == (len(prompt) + max_new) * (stage.end - stage.start)
+        assert cache.cache_misses == 1
+        assert cache.cache_hits == max_new
+        assert cache.cache_hits > 0 and cache.cache_misses > 0
+
+
+def test_cached_forward_reports_rebuild_miss_not_hit(cfg_params):
+    cfg, P = cfg_params
+    stage = build_stages(cfg, 1, P, cache_page_size=3)[0]
+    session = "reused"
+    stage.forward(TOKENS[:4], True, 0, session)
+    assert stage.cache(session).cache_misses == 1
+    assert stage.cache(session).cache_hits == 0
+
+    stage.forward(TOKENS[4:5], True, 4, session)
+    assert stage.cache(session).cache_hits == 1
+
+    stage.forward(TOKENS[:3], True, 0, session)
+    assert stage.cache(session).cache_misses == 2
+    assert stage.cache(session).cache_hits == 1
+    assert stage.cache(session).length == 3
+
+
+def test_two_sessions_keep_independent_pages_and_counters(cfg_params):
+    cfg, P = cfg_params
+    pipe = Pipeline(cfg, build_stages(cfg, 2, P, cache_page_size=2))
+    asyncio.run(pipe.forward_batch([
+        StageCall("left", TOKENS[:3], True, 0),
+        StageCall("right", TOKENS[3:7], True, 0),
+    ]))
+    asyncio.run(pipe.forward_batch([
+        StageCall("left", [TOKENS[7]], True, 3),
+        StageCall("right", [TOKENS[8]], True, 4),
+    ]))
+
+    for stage in pipe.stages:
+        left = stage.cache("left")
+        right = stage.cache("right")
+        assert left is not right
+        assert left.length == 4
+        assert right.length == 5
+        assert left.cache_misses == right.cache_misses == 1
+        assert left.cache_hits == right.cache_hits == 1
+
+
+def test_activation_cache_keeps_sessions_independent():
+    act = KV.ActivationCache(page_size=2)
+    a = np.arange(3 * 4, dtype=np.float32).reshape(3, 4)
+    b = (100 + np.arange(2 * 4, dtype=np.float32)).reshape(2, 4)
+    act.record("left", 1, 0, a)
+    act.record("right", 1, 0, b)
+
+    assert act.length("left", 1) == 3
+    assert act.length("right", 1) == 2
+    assert np.array_equal(act.get("left", 1), a)
+    assert np.array_equal(act.get("right", 1), b)
+
+
 def _rope_ref(q: np.ndarray, k: np.ndarray, pos_offset: int, theta: float) -> tuple[np.ndarray, np.ndarray]:
     hd = q.shape[-1]
     half = hd // 2
@@ -222,8 +298,15 @@ def test_client_activation_cache_hydrates_failed_middle_stage(cfg_params):
     assert rec.activation_cache.page_count(session, 1) == 3
     rec.stages[1].drop(session)
     assert rec.stages[1].cache(session).length == 0
+    before = rec.stats.as_dict()
     asyncio.run(rec.hydrate_stage_from_activations(session, 1, len(prompt), chunk=3))
     assert rec.stages[1].cache(session).length == len(prompt)
+    assert rec.stats.traversals == before["traversals"]
+    assert rec.stats.stage_calls == before["stage_calls"]
+    assert rec.stats.hydration_stage_calls == 3
+    assert rec.stats.hydration_positions == len(prompt)
+    assert rec.stats.hydration_bytes == len(prompt) * cfg.d_model * 4
+    assert rec.stats.hydration_bytes > 0
     ref_logits = asyncio.run(ref.forward([7], pos_offset=len(prompt), session="ref"))
     rec_logits = asyncio.run(rec.forward([7], pos_offset=len(prompt), session=session))
     assert np.abs(ref_logits - rec_logits).max() < TOL

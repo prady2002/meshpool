@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import socket
 import time
+from contextlib import contextmanager
 
 import pytest
 
+import meshpool.common.egress as egress
 from meshpool.common.egress import AbuseReport, AbuseReportStore, EgressDenied, EgressPolicy, RateLimiter
 
 
@@ -91,6 +94,103 @@ def test_allow_all_permits_public_but_still_blocks_private() -> None:
     policy.check("1.2.3.4", 80)
     with pytest.raises(EgressDenied):
         policy.check("10.0.0.1", 80)
+
+
+@pytest.mark.parametrize("host", [
+    "0.0.0.0",
+    "127.0.0.1",
+    "2130706433",
+    "0177.0.0.1",
+    "0x7f000001",
+    "127.1",
+    "012.0.0.1",
+    "0x0a000001",
+    "::1",
+    "::ffff:10.0.0.1",
+    "[::ffff:10.0.0.1]",
+])
+def test_blocked_ip_encodings_are_denied_even_when_allow_all(host: str) -> None:
+    with pytest.raises(EgressDenied):
+        EgressPolicy(allow_all=True).check(host, 80)
+
+
+def test_dns_resolution_to_blocked_ip_is_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "metadata.meshpool.test"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(EgressDenied, match="169.254.169.254"):
+        EgressPolicy(allow_all=True).check("metadata.meshpool.test", 80)
+
+
+def test_whitelisted_dns_name_cannot_rebind_to_private_ip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "allowed.meshpool.test"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(EgressDenied, match="10.0.0.1"):
+        EgressPolicy(whitelist=[("allowed.meshpool.test", 443)]).check(
+            "allowed.meshpool.test", 443)
+
+
+@contextmanager
+def _temporary_egress_hook(policy: EgressPolicy):
+    saved_connect = socket.socket.connect
+    saved_connect_ex = socket.socket.connect_ex
+    saved_original = egress._ORIGINAL_CONNECT
+    saved_original_ex = egress._ORIGINAL_CONNECT_EX
+    saved_active = egress._ACTIVE_POLICY
+    saved_installed = egress._HOOK_INSTALLED
+    calls: list[tuple[str, int]] = []
+
+    def fake_connect(_sock, address):
+        calls.append((str(address[0]), int(address[1])))
+        return None
+
+    def fake_connect_ex(_sock, address):
+        calls.append((str(address[0]), int(address[1])))
+        return 0
+
+    try:
+        egress._ORIGINAL_CONNECT = fake_connect
+        egress._ORIGINAL_CONNECT_EX = fake_connect_ex
+        egress._HOOK_INSTALLED = False
+        egress.install_egress_hook(policy)
+        yield calls
+    finally:
+        socket.socket.connect = saved_connect
+        socket.socket.connect_ex = saved_connect_ex
+        egress._ORIGINAL_CONNECT = saved_original
+        egress._ORIGINAL_CONNECT_EX = saved_original_ex
+        egress._ACTIVE_POLICY = saved_active
+        egress._HOOK_INSTALLED = saved_installed
+
+
+def test_socket_hook_positive_control_allows_whitelisted_public_destination() -> None:
+    with _temporary_egress_hook(EgressPolicy(whitelist=[("93.184.216.34", 443)])) as calls:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.connect(("93.184.216.34", 443))
+    assert calls == [("93.184.216.34", 443)]
+
+
+def test_socket_hook_blocks_before_os_connect_for_private_destination() -> None:
+    with _temporary_egress_hook(EgressPolicy(allow_all=True)) as calls:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            with pytest.raises(ConnectionRefusedError, match="blocked network"):
+                sock.connect(("10.0.0.1", 80))
+    assert calls == [], "blocked destination reached the OS connect boundary"
+
+
+def test_socket_hook_blocks_connect_ex_private_destination() -> None:
+    with _temporary_egress_hook(EgressPolicy(allow_all=True)) as calls:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            err = sock.connect_ex(("10.0.0.1", 80))
+    assert err != 0
+    assert calls == [], "connect_ex bypassed the egress hook"
 
 
 def test_rate_limiter_allows_up_to_limit() -> None:
