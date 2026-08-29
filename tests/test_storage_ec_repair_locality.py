@@ -1,4 +1,4 @@
-﻿"""Does erasure repair funnel k shards through the coordinator?
+"""Does erasure repair funnel k shards through the coordinator?
 
 Replication repair was fixed to send a byte-free plan naming peer URLs
 (``tests/test_storage_repair_locality.py``). Erasure repair is the harder half of
@@ -193,6 +193,35 @@ def test_ec_repair_never_names_the_target_as_its_own_source():
     for entry in tr.ec_plans[0]["shards"]:
         for url in entry.get("sources") or []:
             assert tr._resolve(url) != target, "node told to fetch from itself"
+
+
+def test_ec_repair_places_rebuilt_shard_on_a_node_without_existing_piece():
+    """Repair must not co-locate two shards of one codeword on the same node."""
+    mgr, reg, store, tr = _manager(NODES)
+    blob_id = _ec_put(mgr)
+    meta = store.get_blob(blob_id)
+    before_holders = {
+        store.get_blob(sid).replicas[0]
+        for sid in meta.chunks
+        if store.get_blob(sid) and store.get_blob(sid).replicas
+    }
+
+    tr.reset_counters()
+    reg.kill(_a_shard_holder(mgr, blob_id))
+    asyncio.run(mgr._reconcile())
+
+    target = tr.ops("blob_ec_repair")[0][0]
+    assert target not in before_holders, (
+        f"repair target {target} already held a shard before repair")
+
+    after_holders = []
+    meta = store.get_blob(blob_id)
+    for sid in meta.chunks:
+        sm = store.get_blob(sid)
+        assert sm and sm.replicas, f"shard {sid[:12]} is still missing after repair"
+        after_holders.extend(sm.replicas)
+    assert len(after_holders) == len(set(after_holders)), (
+        f"repair co-located shards on one node: {after_holders}")
 
 
 def test_ec_repair_restores_the_object_and_it_still_reads_back():

@@ -629,6 +629,54 @@ MUTATIONS = [
         ),
     },
     {
+        "id": "erasure-parity-copied-from-data-shard",
+        "path": "meshpool/storage/erasure.py",
+        "old": b"payload = Parity[i].tobytes()",
+        "new": b"payload = D[i % k].tobytes()",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_erasure.py",
+                "-m", "slow or not slow", "-p", "no:cacheprovider"],
+        "why": (
+            "The easiest fake erasure implementation is to emit shard-shaped parity "
+            "that is only a copy of systematic data. Round trips and decode paths "
+            "that mostly use data shards can still look healthy, but there is no "
+            "new information to survive loss of the copied data. The test checks the "
+            "parity payloads themselves and forces recovery with data shards missing, "
+            "so a replica masquerading as parity cannot pass."
+        ),
+    },
+    {
+        "id": "erasure-decoder-refuses-parity-shards",
+        "path": "meshpool/storage/erasure.py",
+        "old": b"chosen = valid_indices[:k]   # first k available",
+        "new": b"raise ValueError(\"parity disabled\")\n        chosen = valid_indices[:k]   # first k available",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_erasure.py",
+                "-m", "slow or not slow", "-p", "no:cacheprovider"],
+        "why": (
+            "A systematic RS code can appear to work if every read happens to keep "
+            "all data shards. That proves replication-like storage, not erasure "
+            "recovery. This mutation makes the decoder reject any path that needs "
+            "parity; the dedicated test chooses fewer than k systematic shards and "
+            "therefore requires parity rows and matrix inversion to produce the bytes."
+        ),
+    },
+    {
+        "id": "erasure-repair-colocates-rebuilt-shard",
+        "path": "meshpool/storage/engine.py",
+        "old": b"candidates = self._pick_nodes(1, exclude=holders)",
+        "new": b"candidates = self._pick_nodes(1, exclude=set())",
+        "cmd": [sys.executable, "-m", "pytest",
+                "tests/test_storage_ec_repair_locality.py",
+                "-m", "slow or not slow", "-p", "no:cacheprovider"],
+        "why": (
+            "A repaired EC shard can be byte-perfect and still reduce durability if "
+            "it is placed on a node that already holds another shard of the same "
+            "object. Every read still succeeds, the repair RPC was delegated, and "
+            "the shard count returns to k+m, but a later single-node failure loses "
+            "two pieces. The guard asserts the repair target was not already a "
+            "holder and that the final holder list has no duplicates."
+        ),
+    },
+    {
         "id": "erasure-repair-trusts-a-shard-that-fails-its-content-address",
         "path": "meshpool/agent/daemon.py",
         "old": b"        if hashlib.sha256(raw).hexdigest() != ref.id:\n            raise HTTPException(status_code=502,\n                                detail=\"reconstructed shard failed integrity check\")",
