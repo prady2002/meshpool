@@ -374,6 +374,9 @@ class InferSubmit(BaseModel):
     draft_k: int = 4
     draft_layers: int = 2
     chunked_prefill: int = 0
+    # Stream the answer as NDJSON deltas instead of one JSON object at the end.
+    # Off by default so every existing caller keeps its current response shape.
+    stream: bool = False
 
 
 class ChatMessage(BaseModel):
@@ -1604,9 +1607,23 @@ def _register_routes(app: FastAPI) -> None:
     @app.get("/api/v1/jobs")
     async def list_jobs() -> dict:
         cp = _cp()
-        return {"jobs": [{"id": j.id, "name": j.name, "func": j.func,
-                          "status": j.status, "progress": j.progress()}
-                         for j in cp.batch.list()]}
+        def summary(j) -> dict:
+            # `units` is deliberately not sent: it is unbounded and the list view
+            # never needs the payloads. `active_nodes` is the one thing consumers
+            # actually read off it (which machines are working right now), so it
+            # is projected here instead of being silently absent -- the console
+            # used to fall back to `job.units ?? []`, which made the mesh map's
+            # live-work highlight and the jobs task grid permanently empty.
+            active = sorted({u.assigned_node for u in j.units
+                             if u.assigned_node
+                             and str(getattr(u.status, "value", u.status))
+                             in ("assigned", "running")})
+            return {"id": j.id, "name": j.name, "func": j.func,
+                    "status": j.status, "progress": j.progress(),
+                    "owner": j.owner, "created_ms": j.created_ms,
+                    "active_nodes": active, "units_total": len(j.units)}
+
+        return {"jobs": [summary(j) for j in cp.batch.list()]}
 
     @app.get("/api/v1/jobs/{job_id}")
     async def get_job(job_id: str) -> dict:
@@ -2527,24 +2544,68 @@ def _register_routes(app: FastAPI) -> None:
         return {"removed": model_id}
 
     @app.post("/api/v1/inference/chat")
-    async def inference_chat(req: InferSubmit, request: Request) -> dict:
+    async def inference_chat(req: InferSubmit, request: Request):
+        """Generate an answer, optionally streaming it.
+
+        The non-streaming form answers with the engine's full result object. The
+        console used to call that form, read the response body through a
+        ByteStreamReader, and append the decoded bytes straight into the chat
+        bubble -- so the user was shown the JSON envelope rather than the answer,
+        and "streaming" was only however TCP happened to fragment one body. With
+        ``stream: true`` this yields NDJSON: ``{"delta": "..."}`` per piece of new
+        text, then ``{"done": true, "result": {...}}`` carrying exactly what the
+        non-streaming form would have returned.
+        """
         cp = _cp()
         owner = _consumer_owner(cp, request, "default")
         _require_credits(cp, owner)
         model_id = _resolve_model_id(req.model_id)
         if not model_id:
             raise HTTPException(status_code=409, detail="no model deployed; deploy one first")
+        gen_kw = dict(temperature=req.temperature, seed=req.seed,
+                      speculative=req.speculative, draft_k=req.draft_k,
+                      draft_layers=req.draft_layers,
+                      chunked_prefill=req.chunked_prefill)
+        if not req.stream:
+            try:
+                return await cp.inference.chat(model_id, req.prompt,
+                                               req.max_new_tokens, **gen_kw)
+            except KeyError:
+                raise HTTPException(status_code=404, detail="unknown model deployment")
+            except RuntimeError as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
+
+        agen = cp.inference.chat_stream(model_id, req.prompt, req.max_new_tokens,
+                                        **gen_kw)
+        # Pull the first item before committing to a 200. Deployment failures
+        # surface on the very first step, and a client can act on a 404/409 body
+        # but not on an exception buried inside an already-started stream.
         try:
-            return await cp.inference.chat(model_id, req.prompt, req.max_new_tokens,
-                                           temperature=req.temperature, seed=req.seed,
-                                           speculative=req.speculative,
-                                           draft_k=req.draft_k,
-                                           draft_layers=req.draft_layers,
-                                           chunked_prefill=req.chunked_prefill)
+            first = await agen.__anext__()
+        except StopAsyncIteration:
+            first = None
         except KeyError:
+            await agen.aclose()
             raise HTTPException(status_code=404, detail="unknown model deployment")
         except RuntimeError as exc:
+            await agen.aclose()
             raise HTTPException(status_code=409, detail=str(exc))
+
+        async def _ndjson():
+            item = first
+            try:
+                while item is not None:
+                    yield json.dumps(item) + "\n"
+                    try:
+                        item = await agen.__anext__()
+                    except StopAsyncIteration:
+                        item = None
+            except Exception as exc:  # noqa: BLE001
+                # The status line is long gone, so report the truncation in-band:
+                # a cut-off answer must be visible as one, not look complete.
+                yield json.dumps({"error": str(exc)}) + "\n"
+
+        return StreamingResponse(_ndjson(), media_type="application/x-ndjson")
 
     # OpenAI-compatible surface (/v1/*) — registered from openai_api.py so the
     # implementation lives in one place and the non-vacuity gate can mutate it.
@@ -2852,6 +2913,7 @@ def _node_view(cp: ControlPlane, n) -> dict:
         "trust_tier": int(n.trust_tier),
         "trust_score": round(cp.trust.score(n.id), 3),
         "last_heartbeat_ms": n.last_heartbeat_ms,
+        "registered_ms": n.registered_ms,
     }
 
 

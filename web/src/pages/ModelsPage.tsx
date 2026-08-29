@@ -52,16 +52,16 @@ export function ModelsPage() {
               <Metric label="Tokens/sec" value={model.tokens_per_sec != null ? model.tokens_per_sec.toFixed(1) : '—'} unit="tok/s" tier="measured" />
             </div>
             <div className="mt-5 flex gap-3 overflow-x-auto pb-2">
-              {model.partition.map((slice) => (
-                <div key={`${model.id}-${slice.node_id}-${slice.start_layer}`} className="min-w-44 rounded-3xl border border-[var(--color-border)] bg-[var(--color-surface)] p-4">
-                  <p className="text-sm text-[var(--color-muted)]">{slice.node_id}</p>
-                  <p className="mt-2 text-lg font-semibold">Layers {slice.start_layer}–{slice.end_layer}</p>
+              {model.stages.map((slice) => (
+                <div key={`${model.id}-${slice.node_id}-${slice.first}`} className="min-w-44 rounded-3xl border border-[var(--color-border)] bg-[var(--color-surface)] p-4">
+                  <p className="text-sm text-[var(--color-muted)]">{slice.node_name || slice.node_id}</p>
+                  <p className="mt-2 text-lg font-semibold">Layers {slice.first}–{slice.last}</p>
                   <p className="mt-2 text-xs text-[var(--color-muted)]">{slice.is_first ? 'Ingress' : slice.is_last ? 'Egress' : 'Relay'} stage</p>
                 </div>
               ))}
             </div>
             <div className="mt-5 flex gap-3">
-              <Button type="button" className="bg-transparent text-[var(--color-text)] ring-1 ring-[var(--color-border)] hover:bg-[var(--color-surface)]" onClick={() => apiClient.deployModel({ model: model.model, owner: model.owner }).then(load)}>Redeploy</Button>
+              <Button type="button" className="bg-transparent text-[var(--color-text)] ring-1 ring-[var(--color-border)] hover:bg-[var(--color-surface)]" onClick={() => apiClient.deployModel({ model: model.model }).then(load)}>Redeploy</Button>
               <Button type="button" className="bg-transparent text-rose-700 dark:text-rose-300 ring-1 ring-rose-500/30 hover:bg-rose-500/10" onClick={() => apiClient.deleteModel(model.id).then(load)}>Remove</Button>
             </div>
           </Card>

@@ -74,19 +74,47 @@ export interface WorkUnit {
   error?: string | null
 }
 
-export interface BatchJob {
+/**
+ * What `GET /api/v1/jobs` returns for each job.
+ *
+ * This is deliberately NOT the same shape as `GET /api/v1/jobs/{id}`. The list
+ * endpoint omits `units` because it is unbounded; it projects `active_nodes`
+ * and `units_total` instead. Keeping the two shapes as one interface is what
+ * made `job.units` undefined in the list views, and the `?? []` fallbacks hid
+ * it -- the mesh map's live-work highlight and the jobs task grid rendered
+ * empty forever while every test passed.
+ */
+export interface BatchJobSummary {
   id: string
   name: string
   func: string
-  units: WorkUnit[]
   owner: string
   status: string
   created_ms: number
+  active_nodes: string[]
+  units_total: number
   progress: { pending: number; assigned: number; running: number; done: number; failed: number; total: number }
 }
 
+/** What `GET /api/v1/jobs/{id}` returns: the summary plus the full unit list. */
+export interface BatchJob extends BatchJobSummary {
+  units: WorkUnit[]
+}
+
 export interface JobsResponse {
-  jobs: BatchJob[]
+  jobs: BatchJobSummary[]
+}
+
+/**
+ * What `POST /api/v1/jobs` returns. Note `units` is a *count* here, not a list:
+ * this is a third distinct job shape, and pretending it was a `BatchJob` is why
+ * the caller had to cast through `unknown` to reach `job_id`.
+ */
+export interface JobSubmitResponse {
+  job_id: string
+  units: number
+  owner: string
+  trace_id: string | null
 }
 
 export interface TimelineEvent {
@@ -136,11 +164,22 @@ export interface JobSubmitRequest {
   secret_names: string[]
 }
 
-export interface PartitionSlice {
+/**
+ * One pipeline stage: the layer range a single machine holds.
+ *
+ * Transcribed field-for-field from InferenceEngine.view() in
+ * meshpool/inference/engine.py. It was previously declared as `PartitionSlice`
+ * with `start_layer`/`end_layer`/`url` under a `partition` key -- a shape the
+ * server has never sent. Because `request<T>()` is a type assertion over
+ * network data rather than a validation, tsc, eslint and 119 vitest tests were
+ * all green while every screen that touched it crashed the moment a model was
+ * actually deployed.
+ */
+export interface ModelStage {
   node_id: string
-  url: string
-  start_layer: number
-  end_layer: number
+  node_name: string
+  first: number
+  last: number
   is_first: boolean
   is_last: boolean
 }
@@ -149,12 +188,18 @@ export interface ModelDeployment {
   id: string
   model: string
   backend: string
+  deployed: boolean
+  pooled: boolean
+  weight_groups: string[] | null
   n_layers: number
-  partition: PartitionSlice[]
-  owner: string
+  replicas: number
+  /** 'ready' | 'loading' | 'degraded'. Never 'running' -- that is a hosting status. */
   status: string
   tokens_per_sec: number | null
-  created_ms: number
+  protected_stages: number
+  /** stage node name -> the warm standbys holding the same layers. */
+  spares: Record<string, string[]>
+  stages: ModelStage[]
 }
 
 export interface ModelsResponse {
@@ -169,7 +214,9 @@ export interface AvailableModelsResponse {
 
 export interface DeployModelRequest {
   model: string
-  owner: string
+  /** Optional. The control plane resolves the real owner from the session; a
+   *  client-supplied owner is a request, not an identity. Redeploy omits it. */
+  owner?: string
 }
 
 export interface Deployment {
@@ -288,6 +335,29 @@ export interface ChatRequest {
   max_new_tokens: number
   model_id: string
   temperature: number
+  stream?: boolean
+}
+
+/** What the engine reports about a finished run. Mirrors InferenceEngine.chat(). */
+export interface ChatRunResult {
+  model: string
+  deployment_id: string
+  prompt: string
+  text: string
+  tokens: number
+  finish_reason: string
+  tokens_per_sec: number
+  elapsed_s: number
+  batch?: { mean_batch: number; queued_s: number; ttft_s: number; max_batch: number }
+  stages?: Array<{ node_name: string; first: number; last: number }>
+}
+
+/** One NDJSON frame from POST /api/v1/inference/chat with `stream: true`. */
+export interface ChatStreamEvent {
+  delta?: string
+  done?: boolean
+  result?: ChatRunResult
+  error?: string
 }
 
 export interface ChatCompletionRequest {

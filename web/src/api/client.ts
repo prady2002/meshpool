@@ -2,9 +2,12 @@
   AuthResponse,
   AvailableModelsResponse,
   BatchJob,
+  BatchJobSummary,
+  JobSubmitResponse,
   BlobMeta,
   BlobsResponse,
   ChatRequest,
+  ChatStreamEvent,
   ClusterResponse,
   DeployModelRequest,
   Deployment,
@@ -112,10 +115,10 @@ export class ApiClient {
   async getNodes() { const data = await this.request<{ nodes: Node[] }>('/api/v1/nodes'); return data.nodes }
   getWallet() { return this.request<WalletResponse>('/api/v1/wallet') }
   getLedger() { return this.request<LedgerResponse>('/api/v1/ledger') }
-  async getJobs() { return (await this.request<JobsResponse>('/api/v1/jobs')).jobs }
+  async getJobs(): Promise<BatchJobSummary[]> { return (await this.request<JobsResponse>('/api/v1/jobs')).jobs }
   getJob(id: string) { return this.request<BatchJob>(`/api/v1/jobs/${id}`) }
   getJobTimeline(id: string) { return this.request<JobTimeline>(`/api/v1/jobs/${id}/timeline`) }
-  submitJob(body: JobSubmitRequest) { return this.request<BatchJob>('/api/v1/jobs', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(body) }) }
+  submitJob(body: JobSubmitRequest) { return this.request<JobSubmitResponse>('/api/v1/jobs', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(body) }) }
   async getModels() { return (await this.request<ModelsResponse>('/api/v1/models')).models }
   /**
    * The endpoint returns `{builtin: string[], ollama: string[]}`, NOT a bare array.
@@ -197,7 +200,22 @@ export class ApiClient {
   setSpendCap(cap: number | null) { return this.request<SpendCapStatus>('/api/v1/account/spend-cap', { method: 'PUT', headers: jsonHeaders, body: JSON.stringify({ cap }) }) }
   resetSpendCap() { return this.request<SpendCapStatus>('/api/v1/account/spend-cap/reset', { method: 'POST' }) }
 
-  async chat(prompt: string, options: Omit<ChatRequest, 'prompt'>): Promise<ReadableStreamDefaultReader<string>> {
+  /**
+   * Stream a chat completion, yielding one NDJSON frame at a time.
+   *
+   * This used to call the *non-streaming* endpoint, take a byte reader over its
+   * response and hand the caller raw decoded chunks, which the Playground
+   * appended straight into the chat bubble -- so the user was shown the JSON
+   * envelope (`{"model":...,"deployment_id":...,"text":...}`) instead of the
+   * answer, and what looked like streaming was only however TCP happened to
+   * fragment one body. The engine has produced incremental deltas since
+   * chat_stream() landed; this asks for them and decodes them properly.
+   */
+  async *chat(
+    prompt: string,
+    options: Omit<ChatRequest, 'prompt'>,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ChatStreamEvent> {
     const token = this.getSessionToken()
     const response = await fetch(`${this.baseUrl}/api/v1/inference/chat`, {
       method: 'POST',
@@ -205,27 +223,36 @@ export class ApiClient {
         ...jsonHeaders,
         ...(token ? { 'X-MeshPool-Session': token } : {}),
       },
-      body: JSON.stringify({ prompt, ...options }),
+      body: JSON.stringify({ prompt, ...options, stream: true }),
+      signal,
     })
 
     if (!response.ok || !response.body) {
       throw new ApiError('Unable to start chat stream', response.status)
     }
 
-    const decoder = new TextDecoder()
     const reader = response.body.getReader()
-
-    return {
-      async read(): Promise<ReadableStreamReadResult<string>> {
+    const decoder = new TextDecoder()
+    let buffered = ''
+    try {
+      for (;;) {
         const { done, value } = await reader.read()
-        // The discriminated union requires done:true to carry value:undefined and
-        // done:false to carry a value, so the two cases must be built separately.
-        if (done) return { done: true, value: undefined }
-        return { done: false, value: decoder.decode(value) }
-      },
-      releaseLock() { reader.releaseLock() },
-      cancel(reason?: unknown) { return reader.cancel(reason) },
-      closed: Promise.resolve(undefined),
+        // A chunk can split a line and a multi-byte character, so decode with
+        // stream:true and only ever parse whole lines.
+        buffered += decoder.decode(value, { stream: !done })
+        let nl = buffered.indexOf('\n')
+        while (nl >= 0) {
+          const line = buffered.slice(0, nl).trim()
+          buffered = buffered.slice(nl + 1)
+          if (line) yield JSON.parse(line) as ChatStreamEvent
+          nl = buffered.indexOf('\n')
+        }
+        if (done) break
+      }
+      const tail = buffered.trim()
+      if (tail) yield JSON.parse(tail) as ChatStreamEvent
+    } finally {
+      reader.releaseLock()
     }
   }
 

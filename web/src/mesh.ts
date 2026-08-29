@@ -89,6 +89,7 @@ export function aggregateNodes(nodes: Node[]): MeshAggregate {
  */
 export function inferNodeClass(node: Node): NodeClass {
   const ageDays = (Date.now() - node.registered_ms) / 86_400_000
+  if (!Number.isFinite(ageDays)) return 'constellation'  // no age => cannot classify
   if (node.link.latency_ms > 100 || node.trust_score < 0.70 || ageDays < 1) return 'drifter'
   if (node.trust_score >= 0.93 && ageDays >= 7 && node.link.latency_ms <= 30) return 'anchor'
   if (node.link.bandwidth_mbps >= 500 && node.load.running_units === 0) return 'relay'

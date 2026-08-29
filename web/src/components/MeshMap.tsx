@@ -1,5 +1,5 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { BatchJob, ConstellationGroup, ModelDeployment, Node, NodeClass, NodeStatus } from '../api/types'
+import type { BatchJobSummary, ConstellationGroup, ModelDeployment, Node, NodeClass, NodeStatus } from '../api/types'
 import { aggregateNodes, groupConstellations, inferNodeClass, resolveConstellationHalos } from '../mesh'
 import { Metric } from './ui'
 
@@ -159,7 +159,7 @@ function buildSEdges(nodes: SNode[], models: ModelDeployment[]): SEdge[] {
   const edges: SEdge[] = []
   models.forEach((m, mi) => {
     const color = PIPELINE_COLORS[mi % PIPELINE_COLORS.length]
-    const sorted = [...m.partition].sort((a, b) => a.start_layer - b.start_layer)
+    const sorted = [...m.stages].sort((a, b) => a.first - b.first)
     for (let k = 0; k + 1 < sorted.length; k++) {
       const ai = nodes.findIndex((sn) => sn.raw.some((r) => r.id === sorted[k].node_id))
       const bi = nodes.findIndex((sn) => sn.raw.some((r) => r.id === sorted[k + 1].node_id))
@@ -212,7 +212,7 @@ function tickSim(nodes: SNode[], edges: SEdge[], alpha: number) {
 
 export interface MeshMapProps {
   nodes: Node[]
-  jobs?: BatchJob[]
+  jobs?: BatchJobSummary[]
   models?: ModelDeployment[]
 }
 
@@ -255,11 +255,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
 
   const activeNodeIds = useMemo<Set<string>>(() => {
     const s = new Set<string>()
-    for (const job of jobs) {
-      for (const unit of (job.units ?? [])) {
-        if (unit.status === 'running' && unit.assigned_node) s.add(unit.assigned_node)
-      }
-    }
+    for (const job of jobs) for (const id of job.active_nodes) s.add(id)
     return s
   }, [jobs])
   activeNodeIdsRef.current = activeNodeIds
@@ -433,7 +429,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
             for (const pt of pipelineTokensRef.current) {
               const m = modelsRef.current[pt.modelIdx]
               if (!m) continue
-              const sorted = [...m.partition].sort((a, b) => a.start_layer - b.start_layer)
+              const sorted = [...m.stages].sort((a, b) => a.first - b.first)
               let stageIdx = pt.stageIdx
               let progress = pt.progress + pt.speed
               if (progress >= 1) { progress = 0; stageIdx++ }
@@ -454,7 +450,11 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
             // Spawn new tokens for running models
             for (let mi = 0; mi < modelsRef.current.length; mi++) {
               const m = modelsRef.current[mi]
-              if (m.status !== 'running' || !m.tokens_per_sec || m.partition.length < 2) continue
+              // 'ready' is what the inference engine reports for a live deployment;
+              // 'running' is a *hosting* status that never appears on a model, so
+              // this guard used to skip every model and the pipeline animation on
+              // the signature screen never once ran against a real server.
+              if (m.status !== 'ready' || !m.tokens_per_sec || m.stages.length < 2) continue
               const spawnP = Math.min(0.12, (m.tokens_per_sec) / 60)
               if (Math.random() < spawnP) {
                 nextTokens.push({ modelIdx: mi, stageIdx: 0, progress: 0, speed: 0.018 + Math.random() * 0.012 })
@@ -601,7 +601,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
 
   const nodeModels = useMemo(
     () => models.filter((m) =>
-      selectedNode && m.partition.some((p) => p.node_id === selectedNode.id)
+      selectedNode && m.stages.some((p) => p.node_id === selectedNode.id)
     ),
     [models, selectedNode],
   )
@@ -718,11 +718,11 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
                   <p className="text-xs uppercase tracking-widest text-slate-400">Model layers</p>
                   <ul className="mt-2 space-y-1.5">
                     {nodeModels.map((m) => {
-                      const slice = m.partition.find((p) => p.node_id === selectedNode.id)
+                      const slice = m.stages.find((p) => p.node_id === selectedNode.id)
                       return slice ? (
                         <li key={m.id} className="rounded-2xl border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-xs">
                           <span className="font-medium text-indigo-300">{m.model}</span>
-                          <span className="ml-2 text-slate-400">layers {slice.start_layer}–{slice.end_layer}</span>
+                          <span className="ml-2 text-slate-400">layers {slice.first}–{slice.last}</span>
                           <span className="ml-2 text-slate-400">{slice.is_first ? '· Ingress' : slice.is_last ? '· Egress' : '· Relay'}</span>
                         </li>
                       ) : null
@@ -785,7 +785,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
           </p>
           <div className="mt-4 space-y-4">
             {models.map((m) => {
-              const sorted = [...m.partition].sort((a, b) => a.start_layer - b.start_layer)
+              const sorted = [...m.stages].sort((a, b) => a.first - b.first)
               return (
                 <div key={m.id} className="space-y-2">
                   <div className="flex flex-wrap items-center gap-2">
@@ -814,7 +814,7 @@ export function MeshMap({ nodes, jobs = [], models = [] }: MeshMapProps) {
                               setSelectedId(sn?.id ?? null)
                             }}>
                             <span className="font-medium">{nodeName}</span>
-                            <span className="ml-1.5 text-slate-400">{slice.start_layer}–{slice.end_layer}</span>
+                            <span className="ml-1.5 text-slate-400">{slice.first}–{slice.last}</span>
                             <span className="ml-1 text-slate-400">{slice.is_first ? '· in' : slice.is_last ? '· out' : '· relay'}</span>
                           </button>
                           {idx < sorted.length - 1 && <span className="text-slate-600" aria-hidden="true">→</span>}

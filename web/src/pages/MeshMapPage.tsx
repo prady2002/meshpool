@@ -3,11 +3,11 @@ import { apiClient } from '../api/client'
 import { MeshMap } from '../components/MeshMap'
 import { Skeleton } from '../components/Skeleton'
 import { useCluster } from '../hooks/useCluster'
-import type { BatchJob, ModelDeployment } from '../api/types'
+import type { BatchJobSummary, ModelDeployment } from '../api/types'
 
 export function MeshMapPage() {
   const { cluster, loading, error } = useCluster()
-  const [jobs, setJobs]     = useState<BatchJob[]>([])
+  const [jobs, setJobs]     = useState<BatchJobSummary[]>([])
   const [models, setModels] = useState<ModelDeployment[]>([])
 
   useEffect(() => {

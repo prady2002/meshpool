@@ -133,6 +133,38 @@ MUTATIONS = [
             "what a rendering-only assertion cannot distinguish."
         ),
     },
+    {
+        "id": "console-playground-shows-the-json-envelope",
+        "path": "web/src/api/client.ts",
+        "old": b"      body: JSON.stringify({ prompt, ...options, stream: true }),",
+        "new": b"      body: JSON.stringify({ prompt, ...options, stream: false }),",
+        "test": "e2e/playground.spec.ts",
+        "why": (
+            "Reintroduces the shipped defect: without stream:true the endpoint "
+            "answers with one JSON object, the console renders no deltas, and "
+            "the chat bubble shows the envelope rather than the answer. Every "
+            "jsdom test passes either way because they mock fetch and therefore "
+            "invent the response shape, and console.spec.ts runs against a "
+            "control plane with no nodes where the Send button is disabled and "
+            "this path never executes at all."
+        ),
+    },
+    {
+        "id": "console-playground-renders-only-the-final-answer",
+        "path": "web/src/hooks/useChat.ts",
+        "old": b"        if (typeof event.delta === 'string' && event.delta) {",
+        "new": b"        if (false) {",
+        "test": "e2e/playground.spec.ts -g \"progressively\"",
+        "why": (
+            "Drops every incremental delta and falls back to painting the final "
+            "text in one go. The finished answer is still completely correct, so "
+            "an assertion on the final content cannot see this -- yet "
+            "time-to-first-token becomes total generation time, which on a "
+            "wide-area mesh is the difference between a live product and a "
+            "minute of silence. Only sampling the DOM while the request is still "
+            "in flight can detect it."
+        ),
+    },
 ]
 
 

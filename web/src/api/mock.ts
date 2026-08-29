@@ -22,15 +22,27 @@ export const mockNodes: Node[] = [
   { id: 'node-mno345', name: 'Eves-Raspberry-Pi', url: 'https://node-e.mesh', owner: 'alice@example.com', status: 'offline', capability: { cpu_cores: 4, cpu_arch: 'arm64', ram_mb: 4096, gpu: false, vram_mb: 0, disk_mb: 32768, flops_estimate: 5.1, ollama_models: [] }, link: { latency_ms: 0, bandwidth_mbps: 0 }, policy: { cpu_pct: 90, ram_mb: 3072, gpu_allowed: false, schedule: 'always', idle_minutes: 10 }, load: { cpu_load_pct: 0, ram_used_mb: 0, running_units: 0, idle_seconds: 0 }, trust_score: 0.62, last_heartbeat_ms: now - 3600000, registered_ms: now - 432000000 },
 ]
 
+// These fixtures previously invented a `partition` array of
+// {url, start_layer, end_layer} and a status of 'running'/'warming'. The server
+// sends `stages` of {node_name, first, last} and a status of
+// 'ready'/'loading'/'degraded', and has never sent anything else. A mock that
+// disagrees with the server does not merely fail to catch bugs, it actively
+// manufactures them: the console was written to satisfy these fixtures, so it
+// crashed on contact with a real deployment while 119 tests stayed green.
+// Every field below is transcribed from InferenceEngine.view().
 export const mockModels: ModelDeployment[] = [
-  { id: 'mdep-aaa111', model: 'nano-gpt', backend: 'meshshard', n_layers: 12, partition: [
-    { node_id: 'node-abc123', url: 'http://node-a', start_layer: 0, end_layer: 4, is_first: true, is_last: false },
-    { node_id: 'node-def456', url: 'http://node-b', start_layer: 4, end_layer: 8, is_first: false, is_last: false },
-    { node_id: 'node-ghi789', url: 'http://node-c', start_layer: 8, end_layer: 12, is_first: false, is_last: true },
-  ], owner: 'default', status: 'running', tokens_per_sec: 47.3, created_ms: now - 3600000 },
-  { id: 'mdep-bbb222', model: 'qwen2.5:7b', backend: 'ollama', n_layers: 32, partition: [
-    { node_id: 'node-abc123', url: 'http://node-a', start_layer: 0, end_layer: 32, is_first: true, is_last: true },
-  ], owner: 'default', status: 'warming', tokens_per_sec: 18.1, created_ms: now - 900000 },
+  { id: 'mdep-aaa111', model: 'nano-gpt', backend: 'meshshard', deployed: true, pooled: false,
+    weight_groups: null, n_layers: 12, replicas: 3, status: 'ready', tokens_per_sec: 47.3,
+    protected_stages: 1, spares: { 'node-c': ['node-b'] }, stages: [
+      { node_id: 'node-abc123', node_name: 'node-a', first: 0, last: 4, is_first: true, is_last: false },
+      { node_id: 'node-def456', node_name: 'node-b', first: 4, last: 8, is_first: false, is_last: false },
+      { node_id: 'node-ghi789', node_name: 'node-c', first: 8, last: 12, is_first: false, is_last: true },
+    ] },
+  { id: 'mdep-bbb222', model: 'qwen2.5:7b', backend: 'ollama', deployed: false, pooled: false,
+    weight_groups: null, n_layers: 32, replicas: 1, status: 'loading', tokens_per_sec: 18.1,
+    protected_stages: 0, spares: {}, stages: [
+      { node_id: 'node-abc123', node_name: 'node-a', first: 0, last: 32, is_first: true, is_last: true },
+    ] },
 ]
 
 export const mockCluster: ClusterResponse = {
@@ -43,10 +55,22 @@ export const mockCluster: ClusterResponse = {
   },
 }
 
-export const mockJobs: BatchJob[] = [  { id: 'job-bbb222', name: 'embed-docs', func: 'embed', status: 'running', progress: { pending: 20, assigned: 5, running: 8, done: 67, failed: 0, total: 100 }, owner: 'default', created_ms: now - 600000, units: Array.from({ length: 8 }, (_, index) => ({ id: `unit-run-${index}`, status: 'running' as const, assigned_node: mockNodes[index % 3].id, attempts: 1 })) },
+// active_nodes/units_total are DERIVED from units with the same rule the server
+// uses (controlplane/app.py list_jobs), so the mock cannot drift from the wire
+// shape and invent bugs that do not exist -- or hide ones that do.
+const withActive = (j: Omit<BatchJob, 'active_nodes' | 'units_total'>): BatchJob => ({
+  ...j,
+  units_total: j.units.length,
+  active_nodes: [...new Set(j.units
+    .filter((u) => u.status === 'running' || u.status === 'assigned')
+    .map((u) => u.assigned_node)
+    .filter((n): n is string => Boolean(n)))].sort(),
+})
+
+export const mockJobs: BatchJob[] = ([  { id: 'job-bbb222', name: 'embed-docs', func: 'embed', status: 'running', progress: { pending: 20, assigned: 5, running: 8, done: 67, failed: 0, total: 100 }, owner: 'default', created_ms: now - 600000, units: Array.from({ length: 8 }, (_, index) => ({ id: `unit-run-${index}`, status: 'running' as const, assigned_node: mockNodes[index % 3].id, attempts: 1 })) },
   { id: 'job-ccc333', name: 'batch-transform', func: 'square', status: 'completed_with_failures', progress: { pending: 0, assigned: 0, running: 0, done: 50, failed: 2, total: 52 }, owner: 'default', created_ms: now - 7200000, units: Array.from({ length: 10 }, (_, index) => ({ id: `unit-done-${index}`, status: (index < 8 ? 'done' : 'failed') as 'done' | 'failed', assigned_node: mockNodes[index % 4].id, attempts: index >= 8 ? 5 : 1, result: index < 8 ? { squared: index * index } : null, error: index >= 8 ? 'OOM retry suggested' : null })) },
   { id: 'job-ddd444', name: 'pending-analysis', func: 'wasm:9f2c1a4b6d8e0f13579bdf2468ace013579bdf2468ace013579bdf2468ace013', status: 'pending', progress: { pending: 200, assigned: 0, running: 0, done: 0, failed: 0, total: 200 }, owner: 'default', created_ms: now - 60000, units: [] },
-]
+] as Omit<BatchJob, 'active_nodes' | 'units_total'>[]).map(withActive)
 
 export const mockBlobs: BlobMeta[] = [
   { id: 'sha256:aabbcc', owner: 'default', size: 1048576, name: 'dataset.csv', replicas: ['node-abc123', 'node-ghi789'], replication_desired: 2, status: 'stored', chunks: [], created_ms: now - 86400000 },
@@ -200,3 +224,4 @@ export function setupMock() {
     value: MockEventSource,
   })
 }
+

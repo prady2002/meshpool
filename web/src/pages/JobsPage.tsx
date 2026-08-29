@@ -1,13 +1,20 @@
 ﻿import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { apiClient } from '../api/client'
-import type { BatchJob } from '../api/types'
+import type { BatchJobSummary, Node } from '../api/types'
 import { Metric } from '../components/ui'
 import { ProgressBar } from '../components/ProgressBar'
 
 export function JobsPage() {
-  const [jobs, setJobs] = useState<BatchJob[]>([])
-  const load = () => apiClient.getJobs().then(setJobs)
+  const [jobs, setJobs] = useState<BatchJobSummary[]>([])
+  const [nodes, setNodes] = useState<Node[]>([])
+  const load = () => Promise.all([
+    apiClient.getJobs().then(setJobs),
+    apiClient.getNodes().then(setNodes).catch(() => undefined),
+  ])
+  // Resolve to the machine's real name; fall back to the id rather than to a
+  // placeholder, so a missing node is visible instead of silently blank.
+  const nodeName = (id: string) => nodes.find((n) => n.id === id)?.name ?? id
   // useEffect must return a cleanup function or nothing — never a Promise, or React
   // would treat the promise as the cleanup callback.
   useEffect(() => { void load() }, [])
@@ -39,10 +46,10 @@ export function JobsPage() {
                 {Object.entries(job.progress).map(([key, value]) => <div key={key} className="rounded-2xl border border-slate-200 dark:border-slate-800 p-3 text-sm"><p className="text-slate-600 dark:text-slate-400">{key}</p><p className="mt-1 text-lg font-semibold text-slate-900 dark:text-slate-100">{value}</p></div>)}
               </div>
               <div className="mt-5 rounded-3xl border border-slate-200 dark:border-slate-800 p-4">
-                <h4 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Per-task timeline</h4>
-                <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-                  {(job.units ?? []).slice(0, 9).map((unit) => <div key={unit.id} className="rounded-2xl bg-slate-100 dark:bg-slate-900/80 p-3 text-sm text-slate-700 dark:text-slate-300">{unit.id} · {unit.status}{unit.error ? ` · ${unit.error}` : ''}</div>)}
-                  {!(job.units ?? []).length ? <div className="rounded-2xl bg-slate-100 dark:bg-slate-900/80 p-3 text-sm text-slate-600 dark:text-slate-400">Open the trace waterfall for assignment, retry, and node timing detail.</div> : null}
+                <h4 className="text-sm font-semibold text-slate-800 dark:text-slate-200">Running on {job.active_nodes.length} of {job.units_total} tasks&apos; machines</h4>
+                <div className="mt-3 flex flex-wrap gap-2" data-testid={`job-active-nodes-${job.id}`}>
+                  {job.active_nodes.map((id) => <span key={id} className="rounded-2xl bg-indigo-500/10 px-3 py-2 text-sm font-medium text-indigo-700 dark:text-indigo-300">{nodeName(id)}</span>)}
+                  {!job.active_nodes.length ? <span className="rounded-2xl bg-slate-100 dark:bg-slate-900/80 px-3 py-2 text-sm text-slate-600 dark:text-slate-400">No tasks in flight right now.</span> : null}
                 </div>
                 <Link to={`/jobs/${job.id}/timeline`} className="mt-4 inline-flex rounded-2xl border border-indigo-400/40 px-4 py-2 text-sm font-semibold text-indigo-700 dark:text-indigo-300 hover:bg-indigo-500/10">
                   View trace timeline

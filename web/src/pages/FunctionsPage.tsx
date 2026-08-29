@@ -83,7 +83,7 @@ export function FunctionsPage() {
         owner: apiClient.getOwner(),
         secret_names: [],
       })
-      const id = (created as unknown as { job_id?: string }).job_id ?? created.id
+      const id = created.job_id
       setJob(null)
       pollRef.current = window.setInterval(async () => {
         const detail = await apiClient.getJob(id)

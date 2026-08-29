@@ -12,7 +12,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { FunctionsPage } from '../src/pages/FunctionsPage'
 import { apiClient, ApiError } from '../src/api/client'
-import type { BatchJob, FunctionUpload } from '../src/api/types'
+import type { BatchJob, FunctionUpload, JobSubmitResponse } from '../src/api/types'
 
 const SHA = '3'.repeat(64)
 
@@ -27,8 +27,12 @@ const upload: FunctionUpload = {
   owner: 'default',
 }
 
+const submitted: JobSubmitResponse = { job_id: 'job-1', units: 2, owner: 'default', trace_id: null }
+
 function completedJob(func: string): BatchJob {
   return {
+    active_nodes: [],
+    units_total: 2,
     id: 'job-1',
     name: func.slice(0, 40),
     func,
@@ -110,7 +114,7 @@ describe('running a module', () => {
   it('submits one unit per requested index, naming the uploaded function', async () => {
     vi.spyOn(apiClient, 'uploadFunction').mockResolvedValue(upload)
     const submit = vi.spyOn(apiClient, 'submitJob')
-      .mockResolvedValue({ job_id: 'job-1' } as unknown as BatchJob)
+      .mockResolvedValue(submitted)
     vi.spyOn(apiClient, 'getJob').mockResolvedValue(completedJob(`wasm:${SHA}`))
 
     renderPage()
@@ -149,7 +153,7 @@ describe('running a module', () => {
 
   it('shows each unit\'s result and which machine produced it', async () => {
     vi.spyOn(apiClient, 'uploadFunction').mockResolvedValue(upload)
-    vi.spyOn(apiClient, 'submitJob').mockResolvedValue({ job_id: 'job-1' } as unknown as BatchJob)
+    vi.spyOn(apiClient, 'submitJob').mockResolvedValue(submitted)
     vi.spyOn(apiClient, 'getJob').mockResolvedValue(completedJob(`wasm:${SHA}`))
 
     renderPage()

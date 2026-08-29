@@ -11,13 +11,14 @@ import { useChat } from '../hooks/useChat'
 
 export function Playground() {
   const [models, setModels] = useState<ModelDeployment[]>([])
+  const [nodes, setNodes] = useState<Node[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [prompt, setPrompt] = useState('Show how MeshPool would route a customer support summarization job across the mesh.')
   const [temperature, setTemperature] = useState([0.7])
   const [maxTokens, setMaxTokens] = useState([256])
   const [selectedModel, setSelectedModel] = useState('')
-  const { messages, streaming, error: chatError, sendMessage } = useChat()
+  const { messages, streaming, error: chatError, lastRun, sendMessage } = useChat()
 
   useEffect(() => {
     apiClient.getModels()
@@ -27,15 +28,24 @@ export function Playground() {
       })
       .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load models'))
       .finally(() => setLoading(false))
+    // Node details are a secondary panel: if this fails the chat must still work,
+    // so the failure is swallowed here rather than blanking the page.
+    apiClient.getNodes().then(setNodes).catch(() => setNodes([]))
   }, [])
 
   const selectedDeployment = useMemo(() => models.find((model) => model.id === selectedModel) ?? null, [models, selectedModel])
+  // Look the stage's machine up in the real node list. This used to synthesise a
+  // Node from the deployment with cpu_cores: 0, ram_mb: 0 and trust_score: 1 --
+  // invented numbers on a user-facing surface, which the plan forbids outright.
+  // A stage whose node has since left the pool simply does not render a card,
+  // rather than rendering a card full of zeros.
   const assignedNodes = useMemo<Node[]>(() => {
     if (!selectedDeployment) return []
-    const ids = new Set(selectedDeployment.partition.map((slice) => slice.node_id))
-    return selectedDeployment.partition.map((slice): Node => ({ id: slice.node_id, name: slice.node_id, owner: selectedDeployment.owner, url: slice.url, status: 'online', capability: { cpu_cores: 0, cpu_arch: 'unknown', ram_mb: 0, gpu: false, vram_mb: 0, disk_mb: 0, flops_estimate: 0, ollama_models: [] }, link: { latency_ms: 0, bandwidth_mbps: 0 }, policy: { cpu_pct: 0, ram_mb: 0, gpu_allowed: false, schedule: 'always', idle_minutes: 0 }, load: { cpu_load_pct: 0, ram_used_mb: 0, running_units: 0, idle_seconds: 0 }, trust_score: 1, last_heartbeat_ms: Date.now(), registered_ms: Date.now() }))
-      .filter((node) => ids.has(node.id))
-  }, [selectedDeployment])
+    const byId = new Map(nodes.map((node) => [node.id, node]))
+    return selectedDeployment.stages
+      .map((stage) => byId.get(stage.node_id))
+      .filter((node): node is Node => node != null)
+  }, [selectedDeployment, nodes])
 
   return (
     <div className="grid gap-6 xl:grid-cols-[minmax(0,1.35fr)_360px]">
@@ -91,20 +101,27 @@ export function Playground() {
         <div className="mt-6 space-y-4">
           {messages.map((message, index) => <ChatMessage key={`${message.role}-${index}`} role={message.role} content={message.content} />)}
         </div>
+        {lastRun ? (
+          <div data-testid="chat-run-stats" className="mt-5 grid gap-3 sm:grid-cols-3">
+            <Metric label="Throughput" value={`${lastRun.tokens_per_sec.toFixed(2)} tok/s`} tier="measured" density="compact" />
+            <Metric label="Time to first token" value={`${(lastRun.batch?.ttft_s ?? 0).toFixed(2)} s`} tier="measured" density="compact" />
+            <Metric label="Tokens generated" value={lastRun.tokens} tier="measured" density="compact" />
+          </div>
+        ) : null}
       </section>
       <aside className="rounded-[28px] border border-slate-200 bg-white/90 p-5 shadow-xl shadow-slate-200/40 dark:border-slate-800 dark:bg-slate-950/75 dark:shadow-slate-950/40">
         <p className="text-sm uppercase tracking-[0.28em] text-indigo-600 dark:text-indigo-400">Computing on</p>
         <h3 className="mt-2 text-2xl font-semibold">Pipeline stages</h3>
         <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">Node assignments per layer slice. Estimates are labeled when the backend does not publish exact metrics.</p>
         <div className="mt-5 space-y-4">
-          {selectedDeployment?.partition.map((slice, index) => (
+          {selectedDeployment?.stages.map((slice, index) => (
             <div key={`${slice.node_id}-${index}`} className="rounded-3xl border border-slate-200 p-4 dark:border-slate-800">
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <p className="text-sm text-slate-600 dark:text-slate-400">Stage {index + 1}</p>
-                  <h4 className="font-semibold text-slate-900 dark:text-slate-100">{slice.node_id}</h4>
+                  <h4 className="font-semibold text-slate-900 dark:text-slate-100">{slice.node_name || slice.node_id}</h4>
                 </div>
-                <span className="rounded-full bg-indigo-500/15 px-2 py-1 text-xs text-indigo-700 dark:text-indigo-300">Layers {slice.start_layer}–{slice.end_layer}</span>
+                <span className="rounded-full bg-indigo-500/15 px-2 py-1 text-xs text-indigo-700 dark:text-indigo-300">Layers {slice.first}–{slice.last}</span>
               </div>
               <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800"><div className="h-full w-full animate-pulse rounded-full bg-gradient-to-r from-indigo-500 to-violet-500 motion-reduce:animate-none" /></div>
             </div>

@@ -81,7 +81,7 @@ export function CommandPalette({ nodes }: { nodes: Node[] }) {
       { id: 'run-inference', label: 'Run inference prompt', detail: 'Focus the real chat playground; requires a deployed model', keywords: ['chat', 'prompt', 'llm'], scope: 'Actions', kind: 'action', run: go('/inference') },
       { id: 'upload-function', label: 'Upload a WASM function', detail: 'Uses POST /api/v1/functions; no fake templates', keywords: ['wasm', 'function', 'deploy'], scope: 'Actions', kind: 'action', run: go('/functions') },
       { id: 'open-logs', label: 'Open job logs and trace timeline', detail: 'Shows submitted jobs from /api/v1/jobs', keywords: ['logs', 'trace', 'timeline', 'jobs'], scope: 'Logs', kind: 'logs', run: go('/apps') },
-      ...models.map((model): CommandItem => ({ id: `model-${model.id}`, label: `Switch model: ${model.model}`, detail: `${model.status} · ${model.partition.length} pipeline stage${model.partition.length === 1 ? '' : 's'}`, keywords: [model.id, model.model, model.backend], scope: 'Models', kind: 'model', run: go('/inference') })),
+      ...models.map((model): CommandItem => ({ id: `model-${model.id}`, label: `Switch model: ${model.model}`, detail: `${model.status} · ${model.stages.length} pipeline stage${model.stages.length === 1 ? '' : 's'}`, keywords: [model.id, model.model, model.backend], scope: 'Models', kind: 'model', run: go('/inference') })),
       ...nodes.slice(0, 50).map((node): CommandItem => ({ id: `node-${node.id}`, label: `Jump to node: ${node.name}`, detail: `${node.status} · ${node.owner} · ${node.capability.cpu_cores} cores`, keywords: [node.id, node.name, node.owner, node.status], scope: 'Nodes', kind: 'node', run: go('/mesh') })),
     ]
   }, [models, navigate, nodes, setPaletteOpen])
