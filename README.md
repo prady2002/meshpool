@@ -1127,6 +1127,7 @@ Full detail: [`docs/roadmap.md`](docs/roadmap.md).
 | [docs/hosting.md](docs/hosting.md) | Deploy flow, load balancing, failover |
 | [docs/deploy-cloud.md](docs/deploy-cloud.md) | Public coordinator deployment runbook |
 | [docs/security.md](docs/security.md) | Sandboxing, isolation, secrets, kill-switch |
+| [docs/slo.md](docs/slo.md) | Service levels, error budgets, incident runbooks |
 | [docs/testing.md](docs/testing.md) | Unit + e2e + chaos test strategy |
 | [docs/roadmap.md](docs/roadmap.md) | Delivered phases + honestly-deferred next steps |
 
