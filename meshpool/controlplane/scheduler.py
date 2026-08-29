@@ -291,30 +291,42 @@ def build_constellation_index(
                     stack.append(nxt)
         if len(component) < min_size:
             continue
-        rtts = [
-            pair_rtt.get((a, b), rtt_threshold_ms)
-            for i, a in enumerate(component)
-            for b in component[i + 1:]
-        ]
-        members = [by_id[nid] for nid in sorted(component)]
-        pooled_ram = sum(max(0, n.headroom_ram_mb()) for n in members)
-        pooled_vram = sum(max(0, int(n.capability.vram_mb or 0)) for n in members if n.capability.gpu)
-        pooled_usable = sum(
-            min(usable_layer_memory_mb(n), n.policy.ram_mb) if n.policy.ram_mb
-            else usable_layer_memory_mb(n)
-            for n in members
-        )
-        constellations.append(Constellation(
-            id=_constellation_id(component),
-            node_ids=tuple(sorted(component)),
-            pooled_ram_mb=pooled_ram,
-            pooled_vram_mb=pooled_vram,
-            pooled_usable_mb=int(pooled_usable),
-            total_flops=sum(max(1e-3, n.capability.flops_estimate or n.capability.cpu_cores)
-                            for n in members),
-            max_internal_rtt_ms=max(rtts) if rtts else 0.0,
-            avg_internal_rtt_ms=(sum(rtts) / len(rtts)) if rtts else 0.0,
-        ))
+        clusters: list[list[str]] = []
+        for candidate in sorted(component):
+            for cluster in clusters:
+                if all(pair_rtt.get((candidate, existing), float("inf")) <= rtt_threshold_ms
+                       for existing in cluster):
+                    cluster.append(candidate)
+                    break
+            else:
+                clusters.append([candidate])
+        for component in clusters:
+            if len(component) < min_size:
+                continue
+            rtts = [
+                pair_rtt[(a, b)]
+                for i, a in enumerate(component)
+                for b in component[i + 1:]
+            ]
+            members = [by_id[nid] for nid in sorted(component)]
+            pooled_ram = sum(max(0, n.headroom_ram_mb()) for n in members)
+            pooled_vram = sum(max(0, int(n.capability.vram_mb or 0)) for n in members if n.capability.gpu)
+            pooled_usable = sum(
+                min(usable_layer_memory_mb(n), n.policy.ram_mb) if n.policy.ram_mb
+                else usable_layer_memory_mb(n)
+                for n in members
+            )
+            constellations.append(Constellation(
+                id=_constellation_id(component),
+                node_ids=tuple(sorted(component)),
+                pooled_ram_mb=pooled_ram,
+                pooled_vram_mb=pooled_vram,
+                pooled_usable_mb=int(pooled_usable),
+                total_flops=sum(max(1e-3, n.capability.flops_estimate or n.capability.cpu_cores)
+                                for n in members),
+                max_internal_rtt_ms=max(rtts) if rtts else 0.0,
+                avg_internal_rtt_ms=(sum(rtts) / len(rtts)) if rtts else 0.0,
+            ))
     return ConstellationIndex(by_id, constellations)
 
 

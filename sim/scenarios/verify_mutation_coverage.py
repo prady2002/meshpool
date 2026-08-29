@@ -105,6 +105,104 @@ def _sweep_abandoned_worktrees() -> None:
 # plausible -- the shape a real regression actually takes.
 MUTATIONS = [
     {
+        "id": "constellation-transitive-chain-admitted",
+        "path": "meshpool/controlplane/scheduler.py",
+        "old": (b"        clusters: list[list[str]] = []\n"
+                b"        for candidate in sorted(component):\n"
+                b"            for cluster in clusters:\n"
+                b"                if all(pair_rtt.get((candidate, existing), float(\"inf\")) <= rtt_threshold_ms\n"
+                b"                       for existing in cluster):\n"
+                b"                    cluster.append(candidate)\n"
+                b"                    break\n"
+                b"            else:\n"
+                b"                clusters.append([candidate])\n"
+                b"        for component in clusters:\n"
+                b"            if len(component) < min_size:\n"
+                b"                continue\n"
+                b"            rtts = [\n"
+                b"                pair_rtt[(a, b)]\n"
+                b"                for i, a in enumerate(component)\n"
+                b"                for b in component[i + 1:]\n"
+                b"            ]"),
+        "new": (b"        clusters: list[list[str]] = [sorted(component)]\n"
+                b"        for component in clusters:\n"
+                b"            if len(component) < min_size:\n"
+                b"                continue\n"
+                b"            rtts = [\n"
+                b"                _safe_rtt(rtt_predictor, a, b)\n"
+                b"                for i, a in enumerate(component)\n"
+                b"                for b in component[i + 1:]\n"
+                b"            ]"),
+        "cmd": [sys.executable, "sim/scenarios/verify_constellation_formation.py"],
+        "why": (
+            "Reintroduces connected-component clustering: A-B and B-C being near is "
+            "treated as enough to put A, B, and C into one virtual machine even when "
+            "A-C is a 150 ms WAN hop. Larger happy-path metro tests still pass because "
+            "their injected clusters are cliques; only a non-vacuous chain fixture that "
+            "measures every advertised internal RTT can prove distant nodes did not join."
+        ),
+    },
+    {
+        "id": "constellation-selects-flops-before-rtt",
+        "path": "meshpool/controlplane/scheduler.py",
+        "old": (b"key=lambda c: (\n"
+                b"            max(0, pipeline_depth - 1) * c.avg_internal_rtt_ms,"),
+        "new": (b"key=lambda c: (\n"
+                b"            -c.total_flops,"),
+        "cmd": [sys.executable, "sim/scenarios/verify_constellation_formation.py"],
+        "why": (
+            "Makes the scheduler prefer the fastest aggregate FLOPS before RTT, which "
+            "keeps functional placements valid and is invisible to tests that only assert "
+            "a model fits somewhere. The constellation gate now constructs two fitting "
+            "groups where the lower-average-RTT group is deliberately slower and has a "
+            "higher max edge, so only the intended depth-times-average-RTT preference wins."
+        ),
+    },
+    {
+        "id": "app-router-ignores-health",
+        "path": "meshpool/hosting/engine.py",
+        "old": b"        healthy = [r for r in dep.replicas if r.healthy]",
+        "new": b"        healthy = list(dep.replicas)",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_procapp.py",
+                "-m", "slow or not slow", "-q"],
+        "why": (
+            "A dead process can remain in the deployment's replica list until the "
+            "next reconciliation pass. If the load balancer ignores the healthy bit, "
+            "every other request can still be routed to that dead replica while the "
+            "routing table looks populated. The guard counts selections as delivered "
+            "requests and requires the unhealthy replica to receive exactly zero."
+        ),
+    },
+    {
+        "id": "app-rollout-half-cutover",
+        "path": "meshpool/hosting/engine.py",
+        "old": b"            candidate.replicas = healthy_new",
+        "new": b"            candidate.replicas = healthy_new[:max(1, desired // 2)]",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_procapp.py",
+                "-m", "slow or not slow", "-q"],
+        "why": (
+            "A blue/green rollout is not complete when only half of the requested "
+            "green pool is healthy. One-replica happy paths cannot distinguish that "
+            "from a real cutover, so the guard rolls out two replicas and asserts "
+            "that all desired new replicas replace the old pool before it drains."
+        ),
+    },
+    {
+        "id": "app-proxy-serves-5xx-replica",
+        "path": "meshpool/controlplane/app.py",
+        "old": b"            if upstream.status_code >= 500:",
+        "new": b"            if False and upstream.status_code >= 500:",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_procapp.py",
+                "-m", "slow or not slow", "-q"],
+        "why": (
+            "Health-based routing also has to reject a replica that accepts the TCP "
+            "connection but returns a 5xx. A before/after deployment test can pass "
+            "while users receive that 503. The guard drives the proxy through a bad "
+            "replica followed by a good one and asserts the client only receives the "
+            "retried 200 from the healthy target."
+        ),
+    },
+    {
         "id": "sandbox-runs-work-without-egress-enforcement",
         "path": "meshpool/agent/sandbox.py",
         "old": b"        install_egress_hook(EgressPolicy())  # deny-by-default",
@@ -482,6 +580,50 @@ MUTATIONS = [
         ),
     },
     {
+        "id": "weight-peer-selection-ignores-rtt",
+        "path": "meshpool/inference/engine.py",
+        "old": b"        holders.sort(key=lambda x: (x[0], x[1]))",
+        "new": b"        holders.sort(key=lambda x: x[1])",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_weight_pull.py",
+                "-q", "-m", "slow or not slow"],
+        "why": (
+            "A model still loads correctly if every chunk comes from a far origin, "
+            "so outcome-only tests cannot see the cold-start killer returning. The "
+            "guard creates two genuine online holders with distinct RTTs and asserts "
+            "on the ordered source list itself, proving the nearest peer is the one "
+            "asked to do the work first."
+        ),
+    },
+    {
+        "id": "blob-pull-hides-accepted-source",
+        "path": "meshpool/agent/daemon.py",
+        "old": b'                accepted_sources.append({"blob_id": blob_id, "source": src})',
+        "new": b"                pass",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_weight_pull.py",
+                "-q", "-m", "slow or not slow"],
+        "why": (
+            "A verified blob on disk proves integrity but not which peer supplied "
+            "it. Without returning per-chunk source telemetry, a test can pass even "
+            "when the implementation tries a malicious or distant source first and "
+            "only succeeds later. The guard plants a lying first peer and asserts "
+            "the accepted source was the honest one."
+        ),
+    },
+    {
+        "id": "shared-weight-chunks-redownloaded",
+        "path": "meshpool/storage/engine.py",
+        "old": b"        placed = [nid for nid in existing.replicas if nid in live] if existing else []",
+        "new": b"        placed = []",
+        "cmd": [sys.executable, "-m", "pytest", "tests/test_storage.py",
+                "-q", "-m", "slow or not slow"],
+        "why": (
+            "Two related model uploads still reassemble correctly even if every "
+            "shared base chunk is uploaded again. The property is work not done, so "
+            "the guard counts blob_put calls and requires the second object to move "
+            "only the changed chunk, proving content-addressed chunk dedup is real."
+        ),
+    },
+    {
         "id": "under-replicated-objects-are-never-repaired",
         "path": "meshpool/storage/engine.py",
         "old": b"            if 0 < len(placed) < meta.replication_desired:",
@@ -570,23 +712,21 @@ MUTATIONS = [
         ),
     },
     {
-        "id": "rejected-tokens-are-recorded-as-successfully-used",
+        "id": "token-listing-leaks-a-derived-secret",
         "path": "meshpool/controlplane/app.py",
-        "old": b'    if row["revoked_ms"] is not None or int(row["expires_at_ms"]) < now:\n        return None',
-        "new": b'    if row["revoked_ms"] is not None:\n        return None',
+        "old": b'            "spent": row["spent"],\n',
+        "new": b'            "spent": row["spent"],\n            "token_hash": row["token_hash"],\n',
         "cmd": [sys.executable, "-m", "pytest",
                 "tests/test_capability_token_api.py",
                 "-m", "slow or not slow", "-p", "no:cacheprovider"],
         "why": (
-            "Access control still holds -- Authorizer.check_scope independently "
-            "rejects the expired principal, so no request is ever served. What "
-            "breaks is the evidence. last_used_ms means 'last successful use', and "
-            "here a refused probe advances it, so an operator who has just revoked "
-            "a leaked key watches the timestamp keep moving and concludes the "
-            "revocation did not work. Defence in depth means no single mutation "
-            "can grant access, which is exactly why this layer has to be pinned by "
-            "the audit trail it uniquely owns rather than by a 401 that the other "
-            "layer would produce anyway."
+            "Listing a token hash is still leaking a value derived from the secret. "
+            "The bearer cannot be recovered from SHA-256, but publishing a stable "
+            "verifier gives attackers an offline oracle and violates the product "
+            "promise that the secret is shown exactly once. This regression is "
+            "invisible to tests that assert only field names or only that the raw "
+            "secret string is absent; the gate asserts on the serialized response "
+            "body so any derived verifier added to the read path is caught."
         ),
     },
     {
@@ -736,6 +876,37 @@ MUTATIONS = [
             "machine was busy' even when it wins. It now asserts on fuel directly: "
             "a budget too small to finish must trap with kind == 'fuel', and a "
             "generous budget must complete having burned more than that budget."
+        ),
+    },
+    {
+        "id": "meshd-installer-skips-service-registration",
+        "path": "agent-go/internal/distribution/distribution.go",
+        "old": b"if err := req.Service.Register(spec); err != nil {\n\t\treturn err\n\t}\n\tif err := req.Service.Start(ServiceName); err != nil {",
+        "new": b"if false {\n\t\treturn nil\n\t}\n\tif err := req.Service.Start(ServiceName); err != nil {",
+        "cmd": ["go", "test", "-C", "agent-go", "./internal/distribution/...", "-count=1"],
+        "why": (
+            "An installer that lays down files but never registers the daemon is the "
+            "adoption failure this work exists to prevent: a non-technical "
+            "contributor believes they joined, but the node never starts at boot and "
+            "never donates capacity. A test that asserted only the install command's "
+            "exit code or the binary path would miss it. The guard inspects the "
+            "post-install service state by exact service name and requires it to be "
+            "both present and started."
+        ),
+    },
+    {
+        "id": "meshd-uninstall-leaves-runtime-secrets-behind",
+        "path": "agent-go/internal/distribution/distribution.go",
+        "old": b"p.IdentityPath,\n\t\tp.WeightCacheDir,",
+        "new": b"p.WeightCacheDir,",
+        "cmd": ["go", "test", "-C", "agent-go", "./internal/distribution/...", "-count=1"],
+        "why": (
+            "Uninstall completeness is an absence property, and the costly misses "
+            "are runtime state rather than the executable: identity keys tie a "
+            "machine to a pool identity and cached weights can occupy gigabytes. "
+            "A check that only proves meshd no longer launches would pass while "
+            "private keys and user data remain on disk. The guard first proves the "
+            "identity file existed, then requires that exact path to be gone."
         ),
     },
     {

@@ -85,6 +85,31 @@ def main() -> int:
     check(fake_found != expected,
           "paired control: node-id-shaped clusters differ from measured RTT truth")
 
+    two_node = build_constellation_index(
+        [node("pair-a"), node("pair-b")],
+        lambda _a, _b: 12.0,
+    )
+    check(len(two_node.constellations) == 1
+          and set(two_node.constellations[0].node_ids) == {"pair-a", "pair-b"},
+          "two-node metro is a valid minimum-size constellation",
+          f"found={list(two_node.constellations[0].node_ids) if two_node.constellations else []}")
+
+    chain_nodes = [node("chain-a"), node("chain-b"), node("chain-c")]
+
+    def chain_rtt(a: str, b: str) -> float:
+        return 150.0 if {a, b} == {"chain-a", "chain-c"} else 12.0
+
+    chain_index = build_constellation_index(chain_nodes, chain_rtt)
+    check(all(
+        max(chain_rtt(a, b) for i, a in enumerate(c.node_ids)
+            for b in c.node_ids[i + 1:]) <= CONSTELLATION_RTT_THRESHOLD_MS
+        for c in chain_index.constellations
+    ), "every advertised constellation is pairwise within the RTT threshold",
+       f"found={sorted(list(c.node_ids) for c in chain_index.constellations)}")
+    check(not any(set(c.node_ids) == {"chain-a", "chain-b", "chain-c"}
+                  for c in chain_index.constellations),
+          "paired control: a low-latency chain is not treated as one metro")
+
     print("\n== test 2: capacity-aware pooled virtual machine ==")
     small = [node(f"small-{i}", ram_mb=64_000, vram_mb=8_000) for i in range(3)]
     big = [node(f"big-{i}", ram_mb=256_000, vram_mb=64_000) for i in range(3)]
@@ -104,6 +129,13 @@ def main() -> int:
     check(small_const.pooled_ram_mb == 192_000 and small_const.pooled_vram_mb == 24_000,
           "constellation advertises pooled RAM and VRAM",
           f"ram={small_const.pooled_ram_mb} vram={small_const.pooled_vram_mb}")
+    before_small_lookup = cap_index.lookup_scans
+    low_need = cap_index.fitting(100_000)
+    check(low_need is not None and set(low_need.node_ids) == small_ids,
+          "capacity index returns the lowest-RTT fitting constellation",
+          f"chosen={list(low_need.node_ids) if low_need else None}")
+    check(cap_index.lookup_scans == before_small_lookup,
+          "paired control: low-need capacity lookup used the bucket index")
     kimi_mb = 550 * 1024
     chosen = constellation_nodes_for_model(
         small + big,
@@ -141,6 +173,38 @@ def main() -> int:
           f"fast={sum(n.capability.flops_estimate for n in fast)} slow={sum(n.capability.flops_estimate for n in slow)}")
     check((len(parts) - 1) * 15.0 < (3 - 1) * 150.0,
           "pipeline_depth × RTT discriminator favors the metro placement")
+
+
+    dense = [node(f"dense-{i}", ram_mb=128_000, flops=1000.0) for i in range(4)]
+    bursty = [node(f"bursty-{i}", ram_mb=128_000, flops=10.0) for i in range(4)]
+    dense_ids = {n.id for n in dense}
+    bursty_ids = {n.id for n in bursty}
+
+    def avg_rtt(a: str, b: str) -> float:
+        if {a, b} <= dense_ids:
+            return 20.0
+        if {a, b} <= bursty_ids:
+            return 24.0 if {a, b} == {"bursty-0", "bursty-1"} else 8.0
+        return 150.0
+
+    avg_choice = constellation_nodes_for_model(
+        dense + bursty,
+        avg_rtt,
+        required_memory_mb=300_000,
+        pipeline_depth=4,
+    )
+    bursty_pairs = [
+        avg_rtt(a, b)
+        for i, a in enumerate(sorted(bursty_ids))
+        for b in sorted(bursty_ids)[i + 1:]
+    ]
+    check({n.id for n in avg_choice} == bursty_ids,
+          "scheduler minimizes average pipeline RTT before FLOPS or max RTT",
+          f"chosen={sorted(n.id for n in avg_choice)}")
+    check(sum(bursty_pairs) / len(bursty_pairs) < 20.0
+          and max(bursty_pairs) > 20.0
+          and sum(n.capability.flops_estimate for n in bursty) < sum(n.capability.flops_estimate for n in dense),
+          "paired control: chosen group has lower average RTT, higher max RTT, and lower FLOPS")
 
     print("\n== test 4: degenerate meshes degrade sanely ==")
     two_scattered = build_constellation_index(
