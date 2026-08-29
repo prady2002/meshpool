@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test'
+﻿import { test, expect, type Page } from '@playwright/test'
 import { spawn, type ChildProcess } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -83,6 +83,19 @@ function assistantBubble(page: Page) {
   return page.getByTestId('chat-assistant').last()
 }
 
+/**
+ * Just the answer text -- NOT the bubble.
+ *
+ * The bubble renders the literal placeholder "Streaming..." while the answer is
+ * empty, so measuring the bubble reports ~10 characters for an answer that has
+ * not started. That made a single final paint look like two growth steps and
+ * let a mutation that drops every incremental delta pass this test.
+ */
+async function answerLength(page: Page) {
+  const text = page.getByTestId('chat-assistant-text').last()
+  return (await text.count()) === 0 ? 0 : (await text.innerText()).trim().length
+}
+
 async function openPlaygroundAndSend(page: Page, prompt: string) {
   await page.goto(`${base}/console/inference`, { waitUntil: 'networkidle' })
 
@@ -145,7 +158,6 @@ test('tokens arrive progressively rather than in one lump at the end', async ({ 
   test.setTimeout(180_000)
   await openPlaygroundAndSend(page, 'stream me something long enough to observe')
 
-  const bubble = assistantBubble(page)
   // While generating, the Send button is RELABELLED to "Streaming…", so a locator
   // for /send to mesh/i matches nothing at all during the request. isEnabled() on
   // a locator that does not currently match auto-waits for it to appear, so
@@ -157,13 +169,18 @@ test('tokens arrive progressively rather than in one lump at the end', async ({ 
   // Sample what the user can see, while they can see it. A non-streaming client
   // produces one jump from empty to final; a streaming one produces a staircase.
   const lengths: number[] = []
+  // Samples taken while the request was still in flight. This is the whole test:
+  // a partial answer visible DURING generation is the only thing that separates
+  // streaming from one paint at the end.
+  const partials: number[] = []
   const started = Date.now()
   let firstTextMs = -1
   let sawBusy = false
   for (;;) {
     const busyNow = (await busy.count()) > 0
     sawBusy = sawBusy || busyNow
-    const n = (await bubble.innerText()).trim().length
+    const n = await answerLength(page)
+    if (busyNow && n > 0) partials.push(n)
     if (n > 0 && firstTextMs < 0) firstTextMs = Date.now() - started
     if (lengths[lengths.length - 1] !== n) lengths.push(n)
     if (!busyNow && n > 0) break
@@ -188,6 +205,17 @@ test('tokens arrive progressively rather than in one lump at the end', async ({ 
     `the answer appeared in ${growth.length} step(s) (${JSON.stringify(lengths)}) ` +
       `after ${totalMs}ms -- the whole response landed at once, so this is not streaming`,
   ).toBeGreaterThanOrEqual(2)
+
+  // The decisive check. `growth.length >= 2` can still be satisfied by a
+  // placeholder followed by the finished answer; only an INCOMPLETE answer seen
+  // while the button still said "Streaming" proves tokens reached the user early.
+  const final = lengths[lengths.length - 1]
+  expect(
+    partials.filter((n) => n < final).length,
+    `no partial answer was ever visible while generating (in-flight samples ` +
+      `${JSON.stringify(partials)}, final length ${final}) -- the response was ` +
+      `painted in one go, so time-to-first-token equals total generation time`,
+  ).toBeGreaterThan(0)
 
   // Time-to-first-token must be a fraction of total time. If the client waits for
   // the complete body it cannot paint anything until the very end.

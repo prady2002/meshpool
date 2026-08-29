@@ -153,7 +153,10 @@ MUTATIONS = [
         "id": "console-playground-renders-only-the-final-answer",
         "path": "web/src/hooks/useChat.ts",
         "old": b"        if (typeof event.delta === 'string' && event.delta) {",
-        "new": b"        if (false) {",
+        # `if (false)` would be rejected by tsc's unreachable-code check, and a
+        # mutation that fails to build proves nothing about the test. This one is
+        # never true at run time but tsc cannot fold it away.
+        "new": b"        if (typeof event.delta === 'string' && event.delta.length < 0) {",
         "test": "e2e/playground.spec.ts -g \"progressively\"",
         "why": (
             "Drops every incremental delta and falls back to painting the final "
@@ -223,7 +226,7 @@ def main() -> int:
         return 1
     print("baseline green.\n")
 
-    caught, survived, unrunnable = [], [], []
+    caught, survived, unrunnable, not_restored = [], [], [], []
 
     for mut in selected:
         target = ROOT / mut["path"]
@@ -257,14 +260,21 @@ def main() -> int:
                 print(f"SURVIVED     {mut['id']}  <-- the test cannot see this defect")
         finally:
             target.write_bytes(original)
+            # Verify the post-condition, not that the write ran. Exact bytes is
+            # the only check that cannot false-positive; substring counting says
+            # "not restored" whenever a replacement string happens to occur in
+            # the original, and `git status` over the tree flags the developer's
+            # own uncommitted work.
+            if target.read_bytes() != original:
+                not_restored.append(f'{mut["path"]} (after {mut["id"]})')
             mutation_guard.clear(_mg)
 
     # Restore the built bundle so the tree is left exactly as found.
     _run([NPM, "run", "build"], WEB)
 
-    dirty = _run(["git", "status", "--porcelain", "--", "web/src", "meshpool"], ROOT)
-    if dirty.stdout.strip():
-        print("\nERROR: mutations were not fully restored:\n" + dirty.stdout)
+    if not_restored:
+        print("\nERROR: mutations were not fully restored:\n  "
+              + "\n  ".join(not_restored))
         return 1
 
     print(f"\n{len(caught)} caught, {len(survived)} survived, "

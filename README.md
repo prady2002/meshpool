@@ -962,6 +962,103 @@ against the pre-fix semantics: three of the five scheduler tests fail there, and
 that pass under both are precisely the positive control and the backwards-compatibility
 guard, which is the intended result.
 
+- **Publishing the benchmarks was how we found out the benchmarks were wrong.**
+  `sim/scenarios/bench_report.py` had been exiting 0 for weeks. Actually reading
+  what it printed found three defects stacked on top of each other. It divided
+  by `MAX_NEW_TOKENS`, but the demo model's context is 64 tokens and the prompt
+  eats 33, so a request for 48 returns 31 — **every throughput number was 1.55×
+  too high.** That inflation made measured throughput imply *less* elapsed time
+  than the emulated network alone, so the least-squares fit returned a negative
+  coefficient and quietly fell back to `base_tok_s = 1.0`, which rendered **a
+  full page of `0.00 tok/s` under a green exit code**. A fallback is not a
+  result, and it is now a hard failure: `R²` went from 0.000 to **0.925** and
+  MAPE from **96.1% to 13.4%**. Worse than the arithmetic was the method: the
+  projections scaled a 1-million-parameter NumPy model's throughput to 70B and
+  1T by the ratio of active parameters. That is a category error, not a
+  conservative estimate — the small model is bounded by Python and BLAS call
+  overhead and the large one by memory bandwidth, so nothing measured on one
+  transfers to the other. It was deleted rather than tuned. What replaced it is
+  arithmetic on things we did measure: a latency-plus-bandwidth **ceiling**
+  assuming compute is free, and a sensitivity table where assumed per-token
+  compute is an explicit input column rather than a smuggled result. The two
+  tables then disagreed by 57% about the same configuration, because one ignored
+  activation transfer; a cross-table consistency check now fails the run if they
+  ever diverge by more than 0.05 tok/s. See [`docs/benchmarks.md`](docs/benchmarks.md).
+
+- **Two of the plan's own headline claims did not survive that.** The first:
+  a 1T-parameter MoE model on eleven metro-area consumer machines has a ceiling
+  of **15.2 tok/s with speculative pipeline decoding and free compute** — not the
+  ~50 tok/s the plan projected. Compute is not free, so the real number is lower.
+  The measured mechanism is sound (SPD gives ×2.0–×2.25 at pipeline depth ≥ 2,
+  and — the sanity check that matters — ×0.93–×1.06 at depth 1, where there is no
+  hop to amortise); the projected magnitude was not. The second: "bandwidth is a
+  non-issue, latency is everything" is true at depth 2 and **false at depth 11**.
+  Ten hops of 14 KiB on a residential 20 Mbps uplink is 57 ms against 100 ms of
+  metro latency — roughly a third of the traversal. Uplink capacity belongs in
+  constellation formation next to RTT. The one claim that held up is the reason
+  constellations exist at all: the same eleven nodes are worth **5.1× more in one
+  metro than scattered worldwide.**
+
+- **The flagship screen was showing users a JSON object instead of an answer.**
+  The Playground is the product's front door — the plan's "default landing state
+  for a new user is a working chat box." Its client called
+  `POST /api/v1/inference/chat`, which is *not* a streaming endpoint, took a byte
+  reader over the response and appended the decoded bytes straight into the chat
+  bubble. So the user was shown `{"model":...,"deployment_id":...,"text":...}`,
+  and what looked like streaming was only however TCP happened to fragment one
+  JSON body. Nothing caught it: the jsdom suite mocks `fetch` and therefore
+  invents the response shape it then agrees with; `verify_console_api_contract`
+  covers GET responses and says so in its own docstring; and the existing browser
+  tests run against a control plane with **no nodes**, where the model list is
+  empty, the Send button is disabled, and this path never executes at all. Every
+  one of those suites passed. The endpoint now streams NDJSON deltas, the console
+  renders them incrementally and publishes the run's measured throughput and
+  time-to-first-token, and `web/e2e/playground.spec.ts` boots a **real** mesh
+  (control plane plus three agent processes, a real deployment) and samples the
+  DOM *while the request is in flight* — because an assertion on the finished
+  answer cannot tell streaming from a single lump at the end. Two mutations in
+  `verify_console_mutation_coverage.py` prove both halves of that can fail.
+
+- **The whole console white-screened the moment a model was deployed, and eight
+  suites agreed it was fine.** `web/src/api/types.ts` declared
+  `ModelDeployment.partition[]` with `url`/`start_layer`/`end_layer`; the server
+  has only ever sent `stages` of `{node_name, first, last}`. Because
+  `request<T>()` is a *type assertion over untrusted network data*, TypeScript,
+  eslint and 119 jsdom tests were all green while Playground, Models, the Mesh
+  Map and the command palette threw `Cannot read properties of undefined
+  (reading 'map')` — i.e. the console broke precisely when the product worked.
+  It was invisible because every existing test ran against a mesh with **zero
+  deployments**, and `mock.ts` encoded the same fiction, so the tests agreed
+  with the bug. Four more of the same species were underneath it: `Node.
+  registered_ms` was never sent, so `inferNodeClass` computed `NaN` and **no
+  node could ever be classified Anchor**; `job.units` does not exist on the job
+  *list* endpoint, and the `?? []` fallbacks turned that into two permanently
+  dead features (the Mesh Map's live-work highlight and the Jobs task grid)
+  rather than a visible crash; and `submitJob` was typed as a `BatchJob` while
+  returning `{job_id, units: <count>}`, so its caller cast through `unknown` to
+  a fallback that was always `undefined`. A fallback is not a result, and `?? []`
+  on data that is *always* absent is worse than a crash, because nobody notices.
+  `verify_console_api_contract.py` now **parses** `types.ts` rather than
+  restating it, populates every list first — an empty list is a failure, not a
+  pass — and asserts every non-optional field exists on a real element, with a
+  per-endpoint non-vacuity control.
+
+- **The tool we were using to prove none of this could happen was checking
+  nothing at all.** `npx tsc --noEmit` in `web/` exits 0 without opening a single
+  file: the tsconfig is solution-style (`"files": []` plus `references`), and
+  `--noEmit` builds no referenced project. Only `tsc -b` checks anything. This
+  was found by planting a deliberate type error that `--noEmit` passed and
+  `npm run build` caught. Verify the verifier: a checker that has never failed
+  may not be checking. The same lesson applied twice more in one sitting — the
+  mutation meta-gate scored a mutation "caught" on a non-zero exit code alone,
+  so any guard that fails on *unmutated* code would have certified every
+  mutation it guards (it now runs and requires a green baseline per guard
+  command), and the new streaming e2e test measured the chat *bubble*, which
+  renders the literal placeholder `Streaming…` when empty — so a response
+  painted in one lump read as two growth steps and a mutation that drops every
+  incremental token passed. It now requires an **incomplete** answer to be
+  visible while the Send button still says `Streaming`.
+
 ---
 
 ## 🗺️ Roadmap
