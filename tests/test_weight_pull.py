@@ -173,8 +173,8 @@ def test_pull_plan_orders_sources_by_nearest_peer():
     bid = _sha(b"nearer-than-origin")
     storage = FakeStorage(metas={bid: types.SimpleNamespace(replicas=["origin", "near"], chunks=[])})
     reg = FakeReg({
-        "origin": _node("origin", "http://origin:9"),
-        "near": _node("near", "http://near:9"),
+        "origin": _node("origin", "http://aaa-origin:9"),
+        "near": _node("near", "http://zzz-near:9"),
         "target": _node("target", "http://target:9"),
     })
     reg.rtts = {("target", "origin"): 80.0, ("target", "near"): 3.0}
@@ -182,7 +182,7 @@ def test_pull_plan_orders_sources_by_nearest_peer():
 
     plan = mgr._pull_plan(bid, exclude_node="target")
 
-    assert plan == {"blob_id": bid, "sources": ["http://near:9", "http://origin:9"]}
+    assert plan == {"blob_id": bid, "sources": ["http://zzz-near:9", "http://aaa-origin:9"]}
 
 
 # --------------------------------------------------------------------------- #
