@@ -52,9 +52,16 @@ for line in sys.stdin:
         for sid, cache in shard._caches.items():
             stats[sid] = {
                 "length": cache.length,
+                "cache_hits": cache.cache_hits,
+                "cache_misses": cache.cache_misses,
                 "layers": sorted(cache.layers),
                 "pages": {str(i): cache.layer(i).page_count for i in sorted(cache.layers)},
             }
+        stats["__metrics__"] = {
+            "forward_calls": shard.forward_calls,
+            "positions_computed": shard.positions_computed,
+            "layer_positions_computed": shard.layer_positions_computed,
+        }
         print(json.dumps({"stats": stats}), flush=True)
         continue
     data = req["data"] if req["is_tokens"] else np.array(req["data"], dtype=np.float32)
@@ -164,6 +171,16 @@ def main() -> int:  # noqa: C901
         assert cached == uncached
         assert len(set(cached)) > 1, f"degenerate output {cached}; equality proves nothing"
         assert cached_pos < uncached_pos
+        after_cached = _stats(workers)
+        actual_cached_positions = sum(s["__metrics__"]["positions_computed"] for s in after_cached) - uncached_pos
+        actual_cached_layer_positions = sum(s["__metrics__"]["layer_positions_computed"] for s in after_cached) - (
+            uncached_pos * 2)
+        assert actual_cached_positions == cached_pos, (
+            f"external counter said {cached_pos}, workers actually computed "
+            f"{actual_cached_positions} positions")
+        assert actual_cached_layer_positions == cached_pos * 2, (
+            f"workers computed {actual_cached_layer_positions} layer-positions; "
+            f"expected one layer per owned stage per new position")
         print("  PASS: cached and uncached outputs match; measured work drops")
 
         print("\n== test 3: paged server-side KV cache is per-stage and crosses page boundaries ==")
@@ -173,6 +190,9 @@ def main() -> int:  # noqa: C901
             s = st["cached"]
             print(f"  worker {idx}: length={s['length']} layers={s['layers']} pages={s['pages']}")
             assert s["length"] == expected_len
+            assert s["cache_misses"] == 1
+            assert s["cache_hits"] == n - 1
+            assert s["cache_hits"] > 0 and s["cache_misses"] > 0
             assert s["layers"] == ([0, 1] if idx == 0 else [2, 3])
             assert all(int(p) >= 4 for p in s["pages"].values())
         print("  PASS: each worker caches only owned layers in multiple pages")
@@ -182,10 +202,20 @@ def main() -> int:  # noqa: C901
         _call(workers[1], {"op": "drop", "session": "cached"})
         assert _stats(workers)[1].get("cached", {"length": 0})["length"] == 0
         boundary = act.get("cached", 1, 0, expected_len)
+        before_hydrate = _stats(workers)
         _call(workers[1], {
             "op": "forward", "data": boundary.tolist(), "is_tokens": False,
             "pos_offset": 0, "session": "cached",
         })
+        after_hydrate = _stats(workers)
+        hydrated_positions = (
+            after_hydrate[1]["__metrics__"]["positions_computed"]
+            - before_hydrate[1]["__metrics__"]["positions_computed"])
+        transferred = int(boundary.nbytes)
+        print(f"  hydration positions={hydrated_positions}, activation bytes={transferred}")
+        assert hydrated_positions == expected_len
+        assert transferred == expected_len * info.config.d_model * 4
+        assert transferred > 0
         assert _stats(workers)[1]["cached"]["length"] == expected_len
         ctx = prompt + cached
         uncached_next = _forward(workers, ctx, True, 0, None)[-1]

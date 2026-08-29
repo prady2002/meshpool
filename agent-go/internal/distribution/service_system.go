@@ -87,7 +87,7 @@ type launchdService struct{ run commandRunner }
 func (s *launchdService) Register(spec ServiceSpec) error {
 	// The plist itself is written by writeServiceDescriptor(); launchctl only
 	// needs to be pointed at it.
-	_, err := s.run("launchctl", "load", "-w", spec.ConfigPath)
+	_, err := s.run("launchctl", "load", "-w", spec.ServicePath)
 	return err
 }
 

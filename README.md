@@ -519,6 +519,22 @@ The unit suite includes the **shard-equals-full-model correctness oracle** and a
   `SIGKILL`/`TerminateProcess` it, because a cleanup path that only works when
   cleanup runs is the bug.
 
+- **meshd distribution is fail-closed until real installer credentials exist.**
+  The Go agent now has a release/package plan for six target binaries
+  (`windows/{amd64,arm64}`, `darwin/{amd64,arm64}`, `linux/{amd64,arm64}`) using
+  reproducible flags (`-trimpath`, blank Go build id, stamped version and
+  commit), plus service install/status/uninstall primitives for Windows SCM,
+  launchd and systemd. The installer signing step deliberately refuses to emit a
+  signed-looking artifact unless an actual signing identity is supplied through
+  the release environment (`MESHPOOL_INSTALLER_SIGN_CERT` or
+  `MESHPOOL_INSTALLER_SIGN_KEY`). There is no code-signing certificate in this
+  repository and none is faked: a release run without one fails with
+  `ErrSigningUnavailable` and leaves no `.signed.*` output. Unit tests assert on
+  resulting state rather than process exit: installed binaries and config files,
+  native service registration and started state, and uninstall removal of the
+  binary, service registration, config, identity key and cached weights, with a
+  positive pre-uninstall existence check so absence is not vacuous.
+
 - **The sweep runner could destroy its own multi-hour run.** `subprocess.run(timeout=)`
   *raises*, so one hung gate aborted all 78 and discarded every result collected
   so far; and killing only the direct child left control planes and agents holding

@@ -115,10 +115,11 @@ func (p Plan) AllRemovalPaths() []string {
 }
 
 type ServiceSpec struct {
-	Name       string
-	BinaryPath string
-	ConfigPath string
-	Args       []string
+	Name        string
+	BinaryPath  string
+	ConfigPath  string
+	ServicePath string
+	Args        []string
 }
 
 type ServiceState struct {
@@ -168,10 +169,11 @@ func Install(req InstallRequest) error {
 		return err
 	}
 	spec := ServiceSpec{
-		Name:       ServiceName,
-		BinaryPath: req.Plan.BinaryPath,
-		ConfigPath: req.Plan.ConfigPath,
-		Args:       []string{"--config", req.Plan.ConfigPath},
+		Name:        ServiceName,
+		BinaryPath:  req.Plan.BinaryPath,
+		ConfigPath:  req.Plan.ConfigPath,
+		ServicePath: req.Plan.ServicePath,
+		Args:        []string{"--config", req.Plan.ConfigPath},
 	}
 	if err := writeServiceDescriptor(req.Plan, spec); err != nil {
 		return err
