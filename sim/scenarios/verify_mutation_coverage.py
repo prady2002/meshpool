@@ -443,18 +443,27 @@ MUTATIONS = [
         "path": "meshpool/storage/engine.py",
         "old": b"            if 0 < len(placed) < meta.replication_desired:",
         "new": b"            if False:",
-        "cmd": [sys.executable, "sim/scenarios/verify_weight_swarm_coldstart.py"],
+        "cmd": [sys.executable, "-m", "pytest", "-q",
+                "tests/test_storage_repair_locality.py", "tests/test_storage.py",
+                "-m", "slow or not slow"],
         "why": (
             "Lets the pool bleed replicas. Nothing observable happens for a long "
             "time: every object still has a live copy, every read succeeds, every "
             "model still answers. The pool simply stops replacing what churn takes, "
             "walking monotonically down to one holder per object and staying there. "
             "The first user-visible symptom is permanent data loss, by which point "
-            "the bytes are gone -- a weight group cannot be rebuilt from the other "
-            "weight groups the way an erasure shard can be rebuilt from its "
-            "siblings. This is why the gate asserts redundancy exists *before* the "
-            "loss it insures against, at deploy time and again after churn, rather "
-            "than inferring health from the fact that requests are still working."
+            "the bytes are gone.\n"
+            "This mutation used to be pointed at verify_weight_swarm_coldstart, "
+            "and it SURVIVED there -- which was a fact about the gate, not about "
+            "the code. That gate asserts every layer group still has >=2 holders "
+            "after churn, and it does, but not because of this line: model weights "
+            "are made redundant deliberately by hot-spare warming "
+            "(InferenceEngine._place_blobs on each stage's standby), never left to "
+            "the generic storage repair loop. So the gate kept passing with "
+            "re-replication entirely disabled. The lesson is that a mutation "
+            "proves nothing until the command it names is the one that actually "
+            "depends on the mutated line; a plausible-sounding pairing is not "
+            "evidence. Re-pointed at the tests that drive _reconcile directly."
         ),
     },
     {
@@ -892,6 +901,15 @@ def main() -> int:
     worktree = tmp / "wt"
     survivors: list[dict] = []
     unrunnable: list[tuple[dict, str]] = []
+    vacuous: list[dict] = []
+    # A guard command that fails on UNMUTATED code would be scored "caught" for
+    # every mutation it guards, because this harness only ever looked at the exit
+    # code of the mutated run. That is the exact failure mode this whole file
+    # exists to hunt -- a check that cannot distinguish broken code from working
+    # code -- and it was sitting in the hunter. So every distinct command is run
+    # once against the pristine worktree first and must pass. Deduped and cached,
+    # because 44 mutations share only 27 commands and several take minutes.
+    baseline_ok: dict[tuple, bool] = {}
 
     # A detached worktree at HEAD keeps every mutation off the working tree, so
     # the eleven other things that might be editing this repo cannot be harmed
@@ -909,6 +927,37 @@ def main() -> int:
             print(f"-- [{i}/{len(selected)}] {mut['id']}")
             print(f"   {mut['path']}: {mut['old'].decode()}")
             print(f"                -> {mut['new'].decode()}")
+            key = tuple(mut["cmd"])
+            if key not in baseline_ok:
+                try:
+                    base = subprocess.run(mut["cmd"], cwd=str(worktree), env=env,
+                                          stdout=subprocess.PIPE,
+                                          stderr=subprocess.STDOUT, timeout=1800)
+                    baseline_ok[key] = base.returncode == 0
+                    if not baseline_ok[key]:
+                        print(f"   [BASELINE FAILED] exit {base.returncode} on "
+                              f"unmutated code")
+                        for line in base.stdout.decode("utf-8", "replace").strip(
+                                ).splitlines()[-6:]:
+                            safe = line[:120].encode("ascii", "replace").decode(
+                                "ascii")
+                            print(f"      | {safe}")
+                except FileNotFoundError as exc:
+                    unrunnable.append((mut, str(exc)))
+                    print(f"   [UNRUNNABLE] cannot execute {mut['cmd'][0]!r}: {exc}")
+                    print()
+                    continue
+                except subprocess.TimeoutExpired as exc:
+                    baseline_ok[key] = False
+                    print(f"   [BASELINE FAILED] timed out on unmutated code: {exc}")
+            if not baseline_ok[key]:
+                # Do not even run the mutation: its verdict would be meaningless.
+                vacuous.append(mut)
+                print("   [VACUOUS] the guarding gate does not pass on working "
+                      "code, so its failure proves nothing")
+                print()
+                continue
+
             original = _apply(worktree, mut)
             try:
                 proc = subprocess.run(mut["cmd"], cwd=str(worktree), env=env,
@@ -965,6 +1014,16 @@ def main() -> int:
             print(f"  Guarded by: {' '.join(mut['cmd'][1:])}")
             print()
 
+    if vacuous:
+        print()
+        for mut in vacuous:
+            print(f"VACUOUS GUARD: {mut['id']}")
+            print("  The guarding command below fails on unmutated code, so it "
+                  "would have scored this mutation 'caught' no matter what the "
+                  "mutation did. Fix the gate before trusting the verdict.")
+            print(f"  Guarded by: {' '.join(str(c) for c in mut['cmd'][1:])}")
+            print()
+
     if unrunnable:
         print()
         for mut, why in unrunnable:
@@ -973,16 +1032,20 @@ def main() -> int:
             print(f"  Needed: {' '.join(mut['cmd'])}")
             print()
 
-    if survivors or unrunnable:
+    if survivors or unrunnable or vacuous:
         raise AssertionError(
-            f"{len(survivors)} of {len(selected)} mutations survived and "
+            f"{len(survivors)} of {len(selected)} mutations survived, "
+            f"{len(vacuous)} had a vacuous guard and "
             f"{len(unrunnable)} could not be evaluated. A survivor means the gate "
             "above cannot fail, so it is not protecting what it claims to -- fix "
             "the test, because a surviving mutation never means the code was fine. "
+            "A vacuous guard means the gate fails on working code too, so its "
+            "failure was never evidence of anything. "
             "An unevaluated mutation means we have no evidence either way, which "
             "is not the same as passing: install the missing toolchain.")
 
-    print(f"\nALL {len(selected)} MUTATIONS CAUGHT")
+    print(f"\nALL {len(selected)} MUTATIONS CAUGHT "
+          f"({len(baseline_ok)} guard commands verified to pass unmutated)")
     return 0
 
 

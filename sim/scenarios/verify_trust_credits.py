@@ -43,24 +43,54 @@ def _auth(cp: str, identity: DeviceIdentity) -> dict:
     return r.json()
 
 
-def _wait_job(cp: str, job_id: str, timeout: float = 120) -> dict:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+def _wait_job(cp: str, job_id: str, stall_timeout: float = 90,
+              hard_timeout: float = 900) -> dict:
+    """Wait for a job, failing on stalled PROGRESS rather than on a fixed clock.
+
+    A flat 120s budget conflates two completely different events: "this machine
+    is slower than the author's" and "this job is never going to finish". The
+    first is not a defect and must not fail a gate -- these units are 200k
+    rounds of SHA each and a gate that fails when the CPU is busy will fail in
+    CI for reasons that have nothing to do with the product. The second is a
+    real defect and must fail loudly and fast.
+
+    So: reset the clock every time a unit changes state. A job that is making
+    progress may take as long as it likes (up to a generous ceiling); a job that
+    has stopped moving is reported within ``stall_timeout`` along with the exact
+    distribution of unit states that identifies the cause.
+    """
+    def _counts(j: dict) -> dict:
+        out: dict = {}
+        for u in j.get("units", []):
+            out[u["status"]] = out.get(u["status"], 0) + 1
+        return out
+
+    started = time.time()
+    last_change = started
+    last_seen: dict = {}
+    j: dict = {}
+    while time.time() - started < hard_timeout:
         j = httpx.get(f"{cp}/api/v1/jobs/{job_id}", timeout=10).json()
         if j["status"].startswith("completed"):
             return j
+        now = _counts(j)
+        if now != last_seen:
+            last_seen = now
+            last_change = time.time()
+        elif time.time() - last_change > stall_timeout:
+            break
         time.sleep(0.4)
+
     # Report what the job was actually doing. Polling only for a "completed"
     # prefix means a job stalled with units outstanding, a job whose units all
     # failed, and a job that was never dispatched at all all produce the SAME
     # message -- so the detail that would identify the cause is precisely the
-    # one this helper throws away. Fetch it once more on the way out.
-    try:
-        _last = httpx.get(f"{cp}/api/v1/jobs/{job_id}", timeout=10).json()
-        _detail = f" (last seen: {_last})"[:600]
-    except Exception as _exc:  # noqa: BLE001 - diagnostics must not mask the timeout
-        _detail = f" (control plane unreachable while diagnosing: {_exc})"
-    raise TimeoutError(f"job {job_id} did not finish in {timeout}s{_detail}")
+    # one this helper throws away.
+    stalled = time.time() - last_change
+    raise TimeoutError(
+        f"job {job_id} stopped progressing: status={j.get('status')!r} "
+        f"units={_counts(j)} unchanged for {stalled:.0f}s "
+        f"(elapsed {time.time() - started:.0f}s)")
 
 
 def main() -> int:  # noqa: C901 — a deliberately end-to-end gate

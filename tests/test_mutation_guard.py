@@ -186,3 +186,69 @@ def test_every_in_place_mutation_gate_uses_the_journal():
     assert not offenders, (
         "these gates mutate real source files without a crash-safe journal; "
         f"a kill mid-run corrupts the checkout: {offenders}")
+
+
+# --------------------------------------------------------------------------
+# The mutation harness scores a mutation "caught" when its guarding command
+# exits non-zero. That is only evidence if the same command exits ZERO on
+# unmutated code -- otherwise a gate that is simply broken (missing file, import
+# error, unrelated regression) is indistinguishable from a gate doing its job,
+# and it would certify every mutation it guards. The harness had no such check
+# until a mis-attributed mutation exposed the hole. These two tests hold the
+# door shut, and they test both branches, because a detector that never fires
+# and a detector that always fires are equally useless.
+# --------------------------------------------------------------------------
+
+_HARNESS_DRIVER = """
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location(
+    "mc", r"{root}/sim/scenarios/verify_mutation_coverage.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+real = m.MUTATIONS[0]
+
+def synth(mid, code):
+    return {{"id": mid, "path": real["path"], "old": real["old"],
+             "new": real["new"], "why": "synthetic",
+             "cmd": [sys.executable, "-c", "raise SystemExit(%d)" % code]}}
+
+m.MUTATIONS[:] = [synth("selftest-always-passes", 0),
+                  synth("selftest-always-fails", 1)]
+sys.argv = ["x"]
+try:
+    m.main()
+except AssertionError as exc:
+    print("VERDICT:" + " ".join(str(exc).split()))
+    sys.exit(0)
+print("VERDICT:main-returned-without-raising")
+sys.exit(0)
+"""
+
+
+def _run_harness() -> str:
+    """Drive the real harness with two synthetic mutations and return its verdict.
+
+    Both synthetic guards ignore the mutated file entirely, so the only thing
+    being measured is the harness's own bookkeeping.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         _HARNESS_DRIVER.format(root=ROOT.as_posix())],
+        cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        timeout=600)
+    out = proc.stdout.decode("utf-8", "replace")
+    for line in out.splitlines():
+        if line.startswith("VERDICT:"):
+            return line[len("VERDICT:"):]
+    raise AssertionError(f"harness produced no verdict:\n{out[-3000:]}")
+
+
+def test_harness_rejects_a_guard_that_fails_on_working_code():
+    """A guard failing unmutated must be VACUOUS, never 'caught'."""
+    verdict = _run_harness()
+    assert "1 had a vacuous guard" in verdict, verdict
+
+
+def test_harness_still_detects_a_real_survivor():
+    """Non-vacuity of the test above: the harness has not simply stopped judging."""
+    verdict = _run_harness()
+    assert "1 of 2 mutations survived" in verdict, verdict
