@@ -547,6 +547,9 @@ def _get_request_principal(request: Request, cp: "ControlPlane") -> Principal:
             owner = cp.accounts.owner_for_session(bearer_tok)
             if owner:
                 return mint_session_principal(owner)
+            stored = _principal_from_stored_capability(cp, bearer_tok)
+            if stored is not None:
+                return stored
             # Also accept a signed capability token delivered as a Bearer value
             verifier = _token_verifier(cp)
             if verifier:
@@ -989,8 +992,7 @@ def _register_routes(app: FastAPI) -> None:
     _declare_route("GET",    "/api/v1/buckets/{bucket}/objects/{key:path}", Scope.BLOBS_READ)
     _declare_route("GET",    "/api/v1/buckets/{bucket}/objects/{key:path}/versions", Scope.BLOBS_READ)
     _declare_route("POST",   "/api/v1/models",                Scope.MODELS_WRITE)
-    # Uploading user code is a job-authoring action, not a model action.
-    _declare_route("POST",   "/api/v1/functions",             Scope.JOBS_WRITE)
+    _declare_route("POST",   "/api/v1/functions",             Scope.FUNCTIONS_WRITE)
     _declare_route("POST",   "/api/v1/models/upload",         Scope.MODELS_WRITE)
     _declare_route("POST",   "/api/v1/models/weights/group",  Scope.MODELS_WRITE)
     _declare_route("POST",   "/api/v1/models/weights/register", Scope.MODELS_WRITE)

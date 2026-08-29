@@ -87,6 +87,7 @@ def test_mint_lists_without_secret_and_read_token_cannot_write(tmp_path):
                                    headers={"X-MeshPool-Session": session})
         assert list_response.status_code == 200, list_response.text
         assert minted["token"] not in list_response.text
+        assert "token_hash" not in list_response.text
         assert list_response.json()["tokens"] == [{
             "id": minted["id"],
             "label": "ci job reader",
