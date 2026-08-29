@@ -273,8 +273,19 @@ def verify_ttft_is_independent_of_answer_length(cp: str, token: str) -> None:
     grows linearly. Comparing a short request against a long one therefore
     distinguishes the two by their shape rather than by an absolute threshold --
     no calibration, no assumption about how fast this machine happens to be.
+
+    A single sample is unreliable: TTFT has ~20 ms of scheduling jitter on a
+    normal machine while the absolute values for short(4) and long(40) span
+    only ~22-50 ms.  One unlucky pair can therefore yield a 2x ratio even when
+    streaming is genuinely incremental.  Taking the median of several repeats
+    suppresses that noise without touching the threshold: real streaming keeps
+    the median well below 2x, and generate-then-replay gives ~8x regardless of
+    how many samples you take.
     """
+    _REPS = 5  # odd number so the median is a single measured value
+
     print("\n== time-to-first-token does not grow with the length of the answer ==")
+
     def once(n: int) -> dict:
         return _stream_timings(cp, token, "/v1/chat/completions", {
             "model": "nano-gpt",
@@ -283,12 +294,24 @@ def verify_ttft_is_independent_of_answer_length(cp: str, token: str) -> None:
             "speculative": False, "stream": True,
         }, _chat_delta)
 
-    short = once(4)
-    long = once(MAX_TOKENS)
+    def median_sample(n: int) -> dict:
+        """Return a synthetic sample whose ttft_s and total_s are the medians
+        of _REPS individual measurements.  Using the median rather than the mean
+        discards outliers from scheduler preemptions without requiring a fixed
+        floor, which would need calibration per machine."""
+        samples = [once(n) for _ in range(_REPS)]
+        med_ttft = sorted(s["ttft_s"] for s in samples)[_REPS // 2]
+        med_total = sorted(s["total_s"] for s in samples)[_REPS // 2]
+        # Return the raw sample closest to the median TTFT for the delta/text fields.
+        closest = min(samples, key=lambda s: abs(s["ttft_s"] - med_ttft))
+        return {**closest, "ttft_s": med_ttft, "total_s": med_total}
+
+    short = median_sample(4)
+    long = median_sample(MAX_TOKENS)
     print(f"  short(4):  ttft={short['ttft_s']*1000:6.1f}ms "
-          f"total={short['total_s']*1000:7.1f}ms")
+          f"total={short['total_s']*1000:7.1f}ms  (median of {_REPS})")
     print(f"  long({MAX_TOKENS}): ttft={long['ttft_s']*1000:6.1f}ms "
-          f"total={long['total_s']*1000:7.1f}ms")
+          f"total={long['total_s']*1000:7.1f}ms  (median of {_REPS})")
 
     growth = long["total_s"] / max(1e-6, short["total_s"])
     if growth < 2.0:
@@ -299,10 +322,11 @@ def verify_ttft_is_independent_of_answer_length(cp: str, token: str) -> None:
     print(f"  total grew {growth:.1f}x, ttft grew {ttft_growth:.2f}x")
     if ttft_growth > 2.0:
         _fail(f"asking for {MAX_TOKENS//4}x more tokens made the FIRST token "
-              f"{ttft_growth:.1f}x slower. The first token cannot depend on how many "
-              "come after it unless the answer is generated before the stream starts")
+              f"{ttft_growth:.1f}x slower (median of {_REPS} samples each). "
+              "The first token cannot depend on how many come after it unless "
+              "the answer is generated before the stream starts")
     _ok(f"answer got {growth:.1f}x longer, first token stayed flat "
-        f"({ttft_growth:.2f}x)")
+        f"({ttft_growth:.2f}x, median of {_REPS} samples)")
 
 
 def verify_finish_reason_is_terminal(cp: str, token: str) -> None:
