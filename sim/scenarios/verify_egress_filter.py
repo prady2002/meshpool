@@ -201,7 +201,7 @@ def _test_sandbox_blocks_real_connection() -> None:
     try:
         result = run_sandboxed(SELFTEST_CONNECT,
                                {"host": "127.0.0.1", "port": port, "nonce": nonce},
-                               SandboxLimits(wall_clock_s=30.0))
+                               SandboxLimits(wall_clock_s=30.0), allow_selftest=True)
         if not isinstance(result, dict) or result.get("nonce") != nonce:
             raise AssertionError(
                 f"sandboxed child never ran the connect selftest: {result!r}")

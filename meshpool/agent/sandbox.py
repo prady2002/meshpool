@@ -190,7 +190,8 @@ def _close_job(job) -> None:  # pragma: no cover - Windows only
 
 def run_sandboxed(func: str, payload: Optional[dict] = None,
                   limits: Optional[SandboxLimits] = None,
-                  return_timing: bool = False) -> Any:
+                  return_timing: bool = False,
+                  allow_selftest: bool = False) -> Any:
     """Run one curated function in a limited child process and return its result.
 
     Blocking. Raises :class:`SandboxError` on any limit breach or worker failure.
@@ -200,7 +201,8 @@ def run_sandboxed(func: str, payload: Optional[dict] = None,
     """
     limits = limits or SandboxLimits()
     payload = payload or {}
-    request = json.dumps({"func": func, "payload": payload}).encode() + b"\n"
+    request = json.dumps({"func": func, "payload": payload,
+                          "selftest": bool(allow_selftest)}).encode() + b"\n"
 
     is_win = sys.platform == "win32"
     # Ensure the child can import `meshpool` no matter what cwd it inherits.
@@ -289,6 +291,16 @@ def _worker_main() -> int:
         req = json.loads(raw)
         func = req["func"]
         payload = req.get("payload") or {}
+        # The selftest branches below bypass validate_payload() and can steer the
+        # child's own egress policy, which is exactly what a test needs and exactly
+        # what a caller must never be able to ask for. `func` and `payload` come
+        # from the work unit and are therefore attacker-controlled, so the switch
+        # that unlocks them is a run_sandboxed() keyword argument instead: it is set
+        # at the Python call site by test code, and a submitted unit has no way to
+        # spell it. Without it a selftest name is just an unknown function.
+        selftest_ok = bool(req.get("selftest"))
+        if func in (SELFTEST_ALLOC, SELFTEST_CONNECT) and not selftest_ok:
+            raise ValueError(f"unknown function: {func}")
         if func == SELFTEST_ALLOC:
             # Only reachable through run_sandboxed() — never via the batch engine.
             mb = int(payload.get("mb", 64))
@@ -303,11 +315,24 @@ def _worker_main() -> int:
             import socket as _socket
             host = str(payload.get("host", "127.0.0.1"))
             port = int(payload.get("port", 0))
+            whitelist = [(str(h), int(p)) for h, p in payload.get("whitelist", [])]
+            install_egress_hook(EgressPolicy(
+                whitelist=whitelist, allow_all=bool(payload.get("allow_all", False))))
+            original_calls: list[tuple[str, int]] = []
+            if payload.get("fake_original_connect"):
+                from ..common import egress as _egress
+
+                def _fake_connect(_sock, address) -> None:
+                    original_calls.append((str(address[0]), int(address[1])))
+                    return None
+
+                _egress._ORIGINAL_CONNECT = _fake_connect  # type: ignore[attr-defined]
             t0 = time.perf_counter()
             # "nonce" is echoed back so the caller can distinguish "the child ran and
             # was refused" from "the child never ran", which otherwise look identical.
             outcome = {"attempted": True, "nonce": payload.get("nonce"),
-                       "connected": False, "denied": False, "error": None}
+                       "connected": False, "denied": False, "error": None,
+                       "original_connect_calls": 0}
             try:
                 conn = _socket.create_connection((host, port), timeout=3.0)
             except Exception as exc:  # noqa: BLE001
@@ -322,6 +347,7 @@ def _worker_main() -> int:
             else:
                 outcome["connected"] = True
                 conn.close()
+            outcome["original_connect_calls"] = len(original_calls)
             compute_ms = (time.perf_counter() - t0) * 1000.0
             result = outcome
         else:

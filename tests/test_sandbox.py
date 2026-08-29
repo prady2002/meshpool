@@ -6,12 +6,13 @@ denied rather than allowed to monopolise the machine.
 """
 from __future__ import annotations
 
+import socket
 import time
 
 import pytest
 
 from meshpool.agent.sandbox import (
-    SELFTEST_ALLOC, SandboxError, SandboxLimits, run_sandboxed,
+    SELFTEST_ALLOC, SELFTEST_CONNECT, SandboxError, SandboxLimits, run_sandboxed,
 )
 from meshpool.batch.functions import run_function, validate_payload
 
@@ -36,8 +37,9 @@ def test_memory_cap_is_enforced():
     # on POSIX), while a small allocation under the cap succeeds.
     with pytest.raises(SandboxError):
         run_sandboxed(SELFTEST_ALLOC, {"mb": 1024},
-                      SandboxLimits(memory_mb=128, wall_clock_s=20))
-    ok = run_sandboxed(SELFTEST_ALLOC, {"mb": 8}, SandboxLimits(memory_mb=256))
+                      SandboxLimits(memory_mb=128, wall_clock_s=20), allow_selftest=True)
+    ok = run_sandboxed(SELFTEST_ALLOC, {"mb": 8}, SandboxLimits(memory_mb=256),
+                       allow_selftest=True)
     assert ok["allocated_mb"] == 8
 
 
@@ -58,6 +60,66 @@ def test_output_size_cap():
     # proving the donor is protected from a unit returning a huge blob.
     with pytest.raises(SandboxError, match="output cap"):
         run_sandboxed("square", {"x": 3}, SandboxLimits(max_output_bytes=1))
+
+
+def test_sandbox_egress_positive_control_reaches_allowed_destination():
+    result = run_sandboxed(SELFTEST_CONNECT, {
+        "host": "93.184.216.34",
+        "port": 443,
+        "whitelist": [["93.184.216.34", 443]],
+        "fake_original_connect": True,
+    }, allow_selftest=True)
+    assert result["attempted"] is True
+    assert result["connected"] is True
+    assert result["original_connect_calls"] == 1
+
+
+def test_sandbox_egress_blocks_private_destination_before_connecting():
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    try:
+        result = run_sandboxed(SELFTEST_CONNECT, {
+            "host": "127.0.0.1",
+            "port": port,
+            "allow_all": True,
+        }, allow_selftest=True)
+        assert result["attempted"] is True
+        assert result["connected"] is False
+        assert result["denied"] is True
+    finally:
+        listener.close()
+
+
+def test_sandbox_egress_blocks_hard_port_before_connecting():
+    result = run_sandboxed(SELFTEST_CONNECT, {
+        "host": "93.184.216.34",
+        "port": 25,
+        "allow_all": True,
+        "fake_original_connect": True,
+    }, allow_selftest=True)
+    assert result["attempted"] is True
+    assert result["connected"] is False
+    assert result["denied"] is True
+    assert result["original_connect_calls"] == 0
+
+
+def test_selftest_functions_are_unreachable_from_a_submitted_unit():
+    """A work unit must not be able to name a selftest function.
+
+    `func` and `payload` arrive from the unit and are passed straight into
+    run_sandboxed() by the runtime, while the selftest branches deliberately skip
+    validate_payload() and can steer the child's own egress policy. If a unit
+    could name them, `allow_all` would switch off the node's egress filter -- the
+    one thing standing between a donated PC and a botnet. The switch that unlocks
+    them is therefore a Python keyword argument set at the call site, which a
+    submitted unit has no way to spell.
+    """
+    for name in (SELFTEST_ALLOC, SELFTEST_CONNECT):
+        with pytest.raises(SandboxError, match="unknown function"):
+            run_sandboxed(name, {"mb": 1, "host": "93.184.216.34",
+                                 "port": 443, "allow_all": True})
 
 
 def test_validate_payload_allows_legitimate_jobs():
