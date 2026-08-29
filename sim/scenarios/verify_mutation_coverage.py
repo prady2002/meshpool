@@ -523,10 +523,13 @@ MUTATIONS = [
             "maximum of any set satisfies by definition -- so every deployment always "
             "contains a straggler and the pool rotates forever, paying a KV rebuild "
             "each time to swap one node for another drawn from the same population. "
-            "This is what an absolute threshold degenerates into, and it is invisible "
-            "to every check that only looks at a healthy mesh or at a single slow "
-            "node: those still pass. Only the uniformly-slow check can see it, which "
-            "is precisely why that check exists."
+            "Caught by the ABSOLUTE rotation count on a healthy mesh (check 1b), and "
+            "only there. The uniformly-slow check measures a DELTA across its own "
+            "window and is blind to this: the degenerate threshold does its rotating "
+            "earlier, in ordinary healthy traffic, and then stops by itself once "
+            "spares_remaining falls below 1 -- so the delta is 0 and a mesh that has "
+            "already burned its spares looks healthy. That is also why the healthy "
+            "window has to come first and has to be generous."
         ),
     },
     {
@@ -548,8 +551,8 @@ MUTATIONS = [
     {
         "id": "pulled-weights-are-never-verified",
         "path": "meshpool/agent/daemon.py",
-        "old": b"        if hashlib.sha256(raw).hexdigest() == blob_id:\n            return raw",
-        "new": b"        if raw is not None:\n            return raw",
+        "old": b"        if hashlib.sha256(raw).hexdigest() == blob_id:\n            if accepted_sources is not None:",
+        "new": b"        if raw is not None:\n            if accepted_sources is not None:",
         "cmd": [sys.executable, "sim/scenarios/verify_weight_swarm_coldstart.py"],
         "why": (
             "Takes the first peer at its word. This is the most dangerous mutation in "

@@ -52,7 +52,16 @@ STALL_MS = 120.0
 # Healthy requests driven before asserting that nothing rotated. Each request is
 # MAX_TOKENS traversals, so this is thousands of opportunities for a degenerate
 # threshold to fire -- and STRAGGLER_STREAK is only 4.
-HEALTHY_DRIVE = 15
+#
+# This has to be generous, and it has to be EARLY. Rotation self-terminates once
+# spares_remaining drops below 1, so by the time the later sections have spent the
+# spares a degenerate threshold has nothing left to rotate to and looks healthy
+# again. This window is the only place the degeneracy is observable. At 15 it was
+# too small: under the mutation meta-gate's load the 4-request streak had not
+# formed yet, the mutant rotated a few requests later instead, and the mutation
+# survived. The loop below exits the moment a rotation appears, so a broken build
+# pays only as long as it takes to misbehave; only a correct build pays in full.
+HEALTHY_DRIVE = 40
 MAX_TOKENS = 24
 PROMPT = "the "
 
@@ -155,10 +164,15 @@ def main() -> int:
         # 3.0 -> 1.0 mutation survived the whole gate until this check existed.
         #
         # An ABSOLUTE count on a healthy mesh is the only formulation that sees it.
-        for _ in range(HEALTHY_DRIVE):
+        for i in range(HEALTHY_DRIVE):
             _complete(cp, model_id)
-        rot_healthy = _view(cp, model_id).get("straggler_rotations") or 0
-        print(f"  {HEALTHY_DRIVE + 5} healthy requests served; "
+            rot_healthy = _view(cp, model_id).get("straggler_rotations") or 0
+            if rot_healthy:
+                print(f"  rotation appeared after {i + 1} healthy request(s)")
+                break
+        else:
+            rot_healthy = _view(cp, model_id).get("straggler_rotations") or 0
+        print(f"  up to {HEALTHY_DRIVE + 5} healthy requests served; "
               f"straggler_rotations={rot_healthy}")
         if rot_healthy:
             _fail(f"{rot_healthy} straggler rotation(s) on a mesh where nothing was "
