@@ -42,6 +42,8 @@ class Scope(StrEnum):
     JOBS_WRITE = "jobs:write"
     DEPLOYMENTS_READ = "deployments:read"
     DEPLOYMENTS_WRITE = "deployments:write"
+    FUNCTIONS_READ = "functions:read"
+    FUNCTIONS_WRITE = "functions:write"
     MODELS_READ = "models:read"
     MODELS_WRITE = "models:write"
     BLOBS_READ = "blobs:read"
@@ -74,6 +76,8 @@ _SCOPE_DESCRIPTIONS: dict[str, str] = {
     "jobs:write": "Submit batch jobs to the cluster.",
     "deployments:read": "View hosted app deployments and their logs.",
     "deployments:write": "Create and remove hosted app deployments.",
+    "functions:read": "View deployed serverless functions and their invocations.",
+    "functions:write": "Deploy, update, and remove serverless functions.",
     "models:read": "View deployed inference models.",
     "models:write": "Deploy, upload, and remove inference models.",
     "blobs:read": "Download objects from the pooled blob store.",
