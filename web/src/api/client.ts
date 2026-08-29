@@ -1,4 +1,4 @@
-﻿import type {
+import type {
   AuthResponse,
   AvailableModelsResponse,
   BatchJob,
@@ -9,6 +9,9 @@
   ChatRequest,
   ChatStreamEvent,
   ClusterResponse,
+  CapabilityTokenCreate,
+  CapabilityTokenMinted,
+  CapabilityTokensResponse,
   DeployModelRequest,
   Deployment,
   DeploymentsResponse,
@@ -199,6 +202,22 @@ export class ApiClient {
   }
   setSpendCap(cap: number | null) { return this.request<SpendCapStatus>('/api/v1/account/spend-cap', { method: 'PUT', headers: jsonHeaders, body: JSON.stringify({ cap }) }) }
   resetSpendCap() { return this.request<SpendCapStatus>('/api/v1/account/spend-cap/reset', { method: 'POST' }) }
+
+  async getCapabilityTokens() {
+    return (await this.request<CapabilityTokensResponse>('/api/v1/tokens')).tokens
+  }
+  createCapabilityToken(body: CapabilityTokenCreate) {
+    return this.request<CapabilityTokenMinted>('/api/v1/tokens', {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    })
+  }
+  revokeCapabilityToken(id: string) {
+    return this.request<{ revoked: boolean; id: string }>(`/api/v1/tokens/${id}`, {
+      method: 'DELETE',
+    })
+  }
 
   /**
    * Stream a chat completion, yielding one NDJSON frame at a time.

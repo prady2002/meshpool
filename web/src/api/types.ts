@@ -1,4 +1,4 @@
-﻿export type NodeStatus = 'online' | 'draining' | 'offline'
+export type NodeStatus = 'online' | 'draining' | 'offline'
 
 export interface Node {
   id: string
@@ -322,6 +322,33 @@ export interface SpendCapStatus {
   remaining: number | null
   enforced: boolean
   exceeded: boolean
+}
+
+export interface CapabilityToken {
+  id: string
+  label: string
+  scopes: string[]
+  expires_at_ms: number
+  created_ms: number
+  last_used_ms: number | null
+  spend_cap: number | null
+  spent: number
+}
+
+export interface CapabilityTokenCreate {
+  label: string
+  scopes: string[]
+  expires_in_seconds: number
+  spend_cap?: number
+}
+
+export interface CapabilityTokenMinted extends CapabilityToken {
+  owner: string
+  token: string
+}
+
+export interface CapabilityTokensResponse {
+  tokens: CapabilityToken[]
 }
 
 export interface EventMessage {
