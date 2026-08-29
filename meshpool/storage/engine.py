@@ -991,7 +991,15 @@ class StorageManager:
     async def _reconcile(self) -> None:
         live_by_id = {n.id: n for n in self.registry.online()}
         live = set(live_by_id)
-        for meta in self.store.list_blobs():
+        for snapshot in self.store.list_blobs():
+            # Re-read rather than trusting the listing. This loop awaits (replication,
+            # EC repair), and `note_replica()` -- the path that records a node as
+            # holding a weight group -- is synchronous and takes no lock, so it lands
+            # in the middle of those awaits. Writing back a meta object captured
+            # before them silently deletes every holder recorded since.
+            meta = self.store.get_blob(snapshot.id)
+            if meta is None:
+                continue            # deleted while this pass was in flight
             if meta.chunks:
                 if self._is_ec(meta):
                     # EC leaf: check shard health and trigger repair at threshold
@@ -1030,21 +1038,35 @@ class StorageManager:
                                          "status": agg})
                 continue
             placed = [nid for nid in meta.replicas if nid in live]
-            changed = len(placed) != len(meta.replicas)
+            added: list[str] = []
             # re-replicate an under-replicated object (as long as a live copy survives)
             if 0 < len(placed) < meta.replication_desired:
                 for node in self._pick_nodes(
                         meta.replication_desired - len(placed), exclude=set(placed)):
                     if await self._replicate_to(node.id, meta.id, placed, live_by_id):
                         placed.append(node.id)
-                        changed = True
-            if changed:
-                meta.replicas = placed
-                meta.status = self._status(len(placed), meta.replication_desired)
-                self.store.put_blob(meta)
+                        added.append(node.id)
+            # `placed` was derived from a read taken BEFORE the awaits above. A node
+            # that pulled a weight group during them called note_replica(), which is
+            # synchronous and lock-free, so its record is present in the store but
+            # absent from `placed`. Writing `placed` back would erase it -- and that is
+            # not a cosmetic loss: the pool then believes fewer machines hold the group
+            # than really do, so it re-sends bytes that are already on disk and routes
+            # every future joiner back to the original holders. The swarm stops growing
+            # precisely when churn makes growth matter. Re-read and merge instead:
+            # drop what is dead, keep what others recorded, add what we just placed.
+            cur = self.store.get_blob(meta.id)
+            if cur is None:
+                continue
+            final = [nid for nid in cur.replicas if nid in live]
+            final += [nid for nid in added if nid not in final]
+            if final != cur.replicas:
+                cur.replicas = final
+                cur.status = self._status(len(final), cur.replication_desired)
+                self.store.put_blob(cur)
                 self.events.publish("blob_health",
-                                    {"id": meta.id, "replicas": len(placed),
-                                     "desired": meta.replication_desired})
+                                    {"id": cur.id, "replicas": len(final),
+                                     "desired": cur.replication_desired})
 
     async def run_loop(self, interval: float = 3.0) -> None:
         while True:

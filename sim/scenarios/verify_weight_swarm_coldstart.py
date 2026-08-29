@@ -127,6 +127,35 @@ def wait_reform(cp: str, mid: str, gone: str, timeout: float = 180) -> tuple[dic
     return live, time.perf_counter() - t0
 
 
+def _await_redundancy(cp: str, mid: str, timeout: float = 150.0) -> dict:
+    """Poll until residency restoration settles, then return the durability snapshot.
+
+    ``wait_reform`` returns as soon as the deployment can SERVE again -- status
+    ``ready`` with the departed machine out of the stage list. Putting the *second*
+    copy of each layer group back is separate background work that continues past
+    that point, so sampling durability at the instant of readiness races it.
+
+    That race had a real cost. Inside the mutation meta-gate, which runs dozens of
+    mutation trials and saturates the machine, the background restoration lost the
+    race and check 9 failed on UNMUTATED code. A guard that fails on working code
+    would have failed whatever the mutation did, so it silently converted two
+    mutations' "caught" verdicts into evidence of nothing -- the meta-gate reported
+    them as vacuous rather than caught, which is the only reason this was noticed.
+
+    Polling to convergence is the honest form of the claim: redundancy is restored,
+    not restored within one round trip. If it never converges the check below still
+    fails, and reports the final state.
+    """
+    deadline = time.time() + timeout
+    dur = durability(cp, mid)
+    while time.time() < deadline:
+        dur = durability(cp, mid)
+        if all(len(g["nodes"]) >= 2 for g in dur.get("per_group", [])):
+            break
+        time.sleep(2.0)
+    return dur
+
+
 def agent_url(h: Harness, idx: int) -> str:
     return f"http://{h.host}:{h.agent_ports[idx]}"
 
@@ -514,7 +543,7 @@ def main() -> int:  # noqa: C901 - a gate reads best as one linear narrative
         # why the re-partition path re-runs residency rather than trusting deploy.
         print("\n== 9: after all that churn, the model is still not one machine away "
               "from being lost ==")
-        dur3 = durability(cp, mid)
+        dur3 = _await_redundancy(cp, mid)
         survivors = len(live_indices(cp))
         thin = [(g["blob"][:12], len(g["nodes"])) for g in dur3["per_group"]
                 if len(g["nodes"]) < 2]
