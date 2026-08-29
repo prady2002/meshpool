@@ -332,31 +332,43 @@ class BatchManager:
         async with self._lock:
             tasks = []
             for job in self.jobs.values():
-                if job.status not in ("running", "pending"):
+                if job.status not in ("running", "pending", "paused"):
                     continue
                 # HARD SPEND CAP (plan §6.3). Enforcing caps only at submission
                 # would let one large job overrun the cap without limit, which is
                 # the exact failure caps exist to prevent. Units already running
                 # are left to finish; we simply stop handing out more.
                 if self._capped(job.owner):
-                    # Announce once per job so the console can explain WHY a job
-                    # stalled. A job that silently stops making progress with no
-                    # reason shown is a support ticket waiting to happen.
+                    # The halt must be visible in the job's own status, not only
+                    # in a log line and an event. A caller polling /jobs/{id} sees
+                    # nothing but "running" with units stuck pending, which is
+                    # indistinguishable from a hung scheduler -- so every client
+                    # waits forever for a job that has deliberately stopped.
+                    # "paused" is non-terminal on purpose: raising the cap or
+                    # resetting the window resumes it below.
+                    job.status = "paused"
                     if job.id not in self._capped_announced:
                         self._capped_announced.add(job.id)
                         log.warning("job paused: spend cap reached",
                                     job=job.id, owner=job.owner)
                         self.events.publish("job_spend_capped", {
                             "id": job.id, "owner": job.owner,
+                            "status": job.status,
                             "reason": "spend cap reached — raise the cap or reset "
                                       "the spend window to resume",
                             **job.progress(),
                         })
+                    # A job can be capped after its last in-flight unit finished.
+                    # Nothing else will finalize it then, so check here too.
+                    self._finalize(job)
                     continue
-                if job.id in self._capped_announced:
+                if job.id in self._capped_announced or job.status == "paused":
                     self._capped_announced.discard(job.id)
+                    if job.status == "paused":
+                        job.status = "running"
                     self.events.publish("job_spend_resumed",
-                                        {"id": job.id, "owner": job.owner})
+                                        {"id": job.id, "owner": job.owner,
+                                         "status": job.status})
                 for u in job.units:
                     if u.status is not UnitStatus.PENDING:
                         continue
@@ -776,7 +788,8 @@ class BatchManager:
 
     def _finalize(self, job: BatchJob) -> None:
         prog = job.progress()
-        if prog["done"] + prog["failed"] == prog["total"] and job.status == "running":
+        if (prog["done"] + prog["failed"] == prog["total"]
+                and job.status in ("running", "paused")):
             job.status = "completed" if prog["failed"] == 0 else "completed_with_failures"
             log.info("job finished", job=job.id, status=job.status, **prog)
             self.events.publish("job_finished", {"id": job.id, "status": job.status})

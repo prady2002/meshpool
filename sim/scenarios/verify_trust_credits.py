@@ -73,6 +73,13 @@ def _wait_job(cp: str, job_id: str, stall_timeout: float = 90,
         j = httpx.get(f"{cp}/api/v1/jobs/{job_id}", timeout=10).json()
         if j["status"].startswith("completed"):
             return j
+        if j["status"] == "paused":
+            # Deliberately halted by the hard spend cap, which for the overspend
+            # check below is the expected outcome rather than a fault. A paused
+            # job is distinguishable from a stalled one precisely because the
+            # engine now says so in the status; waiting for it to "finish" would
+            # block until the hard timeout for a job that has correctly stopped.
+            return j
         now = _counts(j)
         if now != last_seen:
             last_seen = now
