@@ -98,6 +98,50 @@ func (c Config) LocalURL() string {
 	return fmt.Sprintf("http://127.0.0.1:%d", c.AgentPort)
 }
 
+// LoadEnvFile loads KEY=VALUE pairs from a config file into the process
+// environment. Blank lines and '#' comments are ignored, an optional leading
+// "export " is tolerated, and matching surrounding quotes are stripped. The
+// format is deliberately the same one systemd's EnvironmentFile= accepts, so
+// the file the installer writes works both for systemd and for a manual
+// `meshd --config` run.
+//
+// Values already present in the environment are NOT overwritten. An operator
+// who sets a variable explicitly when launching the process is being more
+// specific than a file on disk, and silently discarding that override is the
+// kind of surprise that costs an afternoon of debugging.
+func LoadEnvFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	for i, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(strings.TrimSuffix(raw, "\r"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return fmt.Errorf("config: %s line %d: expected KEY=VALUE, got %q", path, i+1, line)
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return fmt.Errorf("config: %s line %d: empty key", path, i+1)
+		}
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') && value[len(value)-1] == value[0] {
+			value = value[1 : len(value)-1]
+		}
+		if _, exists := os.LookupEnv(key); exists {
+			continue
+		}
+		if err := os.Setenv(key, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func envOr(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
 		return v
